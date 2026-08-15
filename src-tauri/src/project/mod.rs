@@ -544,6 +544,43 @@ pub async fn inject_environment_preview(db: &VaultDb, environment_id: i64) -> Re
     Ok(InjectPreview { paths, foreign })
 }
 
+/// Decrypts this environment's vars into a flat key→value map, without
+/// touching any file. The shared core of `inject_environment`'s phase 3 and
+/// the scoped-token fetch route (`api::mod`'s `GET /token/vars`, see
+/// `crate::tokens`), which needs the same values but must never write to
+/// disk on the token holder's behalf.
+pub async fn resolve_environment_values(
+    db: &VaultDb,
+    vault_key: &[u8; 32],
+    environment_id: i64,
+) -> Result<HashMap<String, String>, String> {
+    let vars = db.get_environment_vars(environment_id).await?;
+    if vars.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let raw_items = db.list_items().await?;
+    let mut item_values: HashMap<i64, String> = HashMap::new();
+    for (item_id, _, data, _, _) in &raw_items {
+        let json = crate::crypto::decrypt(vault_key, data)?;
+        let item: crate::vault::VaultItem =
+            serde_json::from_slice(&json).map_err(|e| format!("parse item: {e}"))?;
+        let value = item.value.or(item.password).or(item.content).unwrap_or_default();
+        item_values.insert(*item_id, value);
+    }
+
+    let mut result = HashMap::new();
+    for v in &vars {
+        let value = if let Some(iid) = v.item_id {
+            item_values.get(&iid).cloned().unwrap_or_default()
+        } else {
+            v.literal.clone().unwrap_or_default()
+        };
+        result.insert(v.key.clone(), value);
+    }
+    Ok(result)
+}
+
 /// Decrypt referenced vault items and write KEY=VALUE pairs into every path
 /// configured on this environment, plus `output_path` (if given — added to
 /// the configured set, never replacing it) or, when the environment has no
@@ -602,26 +639,7 @@ pub async fn inject_environment(
     }
 
     // Phase 3 — decrypt, only reachable past the gate above.
-    let raw_items = db.list_items().await?;
-    let mut item_values: HashMap<i64, String> = HashMap::new();
-    for (item_id, _, data, _, _) in &raw_items {
-        let json = crate::crypto::decrypt(vault_key, data)?;
-        let item: crate::vault::VaultItem =
-            serde_json::from_slice(&json).map_err(|e| format!("parse item: {e}"))?;
-        let value = item.value.or(item.password).or(item.content).unwrap_or_default();
-        item_values.insert(*item_id, value);
-    }
-
-    // Build key → value map for this environment
-    let mut inject_map: HashMap<String, String> = HashMap::new();
-    for v in &vars {
-        let value = if let Some(iid) = v.item_id {
-            item_values.get(&iid).cloned().unwrap_or_default()
-        } else {
-            v.literal.clone().unwrap_or_default()
-        };
-        inject_map.insert(v.key.clone(), value);
-    }
+    let inject_map = resolve_environment_values(db, vault_key, environment_id).await?;
 
     // Marker names the project + environment (informational only, never
     // parsed back — see `envfile::marker_line`).

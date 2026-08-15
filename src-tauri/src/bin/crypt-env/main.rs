@@ -49,6 +49,8 @@ enum Cmd {
     Relay(commands::relay::RelayArgs),
     /// Sync new variables from .env.example into .env without overwriting existing values
     Sync(commands::sync::SyncArgs),
+    /// Manage scoped access tokens for headless/CI reads (create, list, revoke)
+    Token(commands::token::TokenArgs),
 }
 
 fn main() {
@@ -70,6 +72,7 @@ fn main() {
         Cmd::Project(args) => commands::project::run(args),
         Cmd::Relay(args) => commands::relay::run(args),
         Cmd::Sync(args) => commands::sync::run(args),
+        Cmd::Token(args) => commands::token::run(args),
     };
     if let Err(e) = result {
         eprintln!("{}", e);

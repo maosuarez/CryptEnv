@@ -70,6 +70,26 @@ pub struct DbEnvironmentVar {
     pub literal: Option<String>,
 }
 
+/// A scoped, non-interactive credential for reading one environment's
+/// values without unlocking the vault interactively (see `crate::tokens`).
+/// `wrapped_key` is `None` for `mode = "session"` tokens — those only work
+/// against an already-unlocked in-memory vault key; it holds the vault key
+/// wrapped under a key derived from the token itself for `mode =
+/// "standalone"` tokens, which can decrypt without a running session.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DbAccessToken {
+    pub id: i64,
+    pub name: String,
+    pub environment_id: i64,
+    pub mode: String,
+    pub token_hash: String,
+    pub wrapped_key: Option<String>,
+    pub created: String,
+    pub expires: Option<String>,
+    pub revoked: Option<String>,
+    pub last_used: Option<String>,
+}
+
 /// One entry in the `env_name_dedup_v1` settings report: a single
 /// case-insensitive-collision rename performed by
 /// `VaultDb::dedupe_project_names_nocase` / `dedupe_environment_names_nocase`
@@ -391,6 +411,22 @@ impl VaultDb {
                 FROM environment_vars ev
                 JOIN environments e ON e.id = ev.environment_id
                 JOIN items i ON i.id = ev.item_id",
+            // Scoped access tokens (see `crate::tokens`): one row per
+            // generated token, always bound to a single environment — never
+            // a whole project — so a compromised token can't enumerate or
+            // read anything outside the one environment it was cut for.
+            "CREATE TABLE IF NOT EXISTS access_tokens (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+                mode           TEXT NOT NULL CHECK(mode IN ('session', 'standalone')),
+                token_hash     TEXT NOT NULL UNIQUE,
+                wrapped_key    TEXT,
+                created        TEXT NOT NULL,
+                expires        TEXT,
+                revoked        TEXT,
+                last_used      TEXT
+            )",
         ];
         for stmt in &migrations {
             sqlx::query(stmt).execute(&self.pool).await.map_err(|e| format!("migration: {e}"))?;
@@ -1595,6 +1631,103 @@ impl VaultDb {
             .await
             .map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+
+    // ─── Access tokens (crate::tokens) ────────────────────────────────────
+
+    /// `token_hash` must already be unique (caller retries on collision, see
+    /// `tokens::create_token`) — `UNIQUE` on the column turns a collision
+    /// into a normal `Err`, not a silently overwritten row.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_access_token(
+        &self,
+        name: &str,
+        environment_id: i64,
+        mode: &str,
+        token_hash: &str,
+        wrapped_key: Option<&str>,
+        expires: Option<&str>,
+    ) -> Result<i64, String> {
+        let now = now_ts();
+        let res = sqlx::query(
+            "INSERT INTO access_tokens (name, environment_id, mode, token_hash, wrapped_key, created, expires) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )
+        .bind(name)
+        .bind(environment_id)
+        .bind(mode)
+        .bind(token_hash)
+        .bind(wrapped_key)
+        .bind(&now)
+        .bind(expires)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Lists tokens across every environment — the Settings/CLI token
+    /// manager, not the auth path (that's `get_access_token_by_hash`).
+    pub async fn list_access_tokens(&self) -> Result<Vec<DbAccessToken>, String> {
+        let rows = sqlx::query(
+            "SELECT id, name, environment_id, mode, token_hash, wrapped_key, created, expires, revoked, last_used \
+             FROM access_tokens ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Self::row_to_access_token).collect())
+    }
+
+    /// Auth-path lookup: O(1) by the SHA-256 hash of the presented token.
+    /// Safe without a salt — the input token is 256 bits of random data, not
+    /// a guessable password, so there's no offline-dictionary risk to guard
+    /// against by salting this particular hash.
+    pub async fn get_access_token_by_hash(&self, token_hash: &str) -> Result<Option<DbAccessToken>, String> {
+        let row = sqlx::query(
+            "SELECT id, name, environment_id, mode, token_hash, wrapped_key, created, expires, revoked, last_used \
+             FROM access_tokens WHERE token_hash = ?1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(row.map(Self::row_to_access_token))
+    }
+
+    fn row_to_access_token(r: sqlx::sqlite::SqliteRow) -> DbAccessToken {
+        DbAccessToken {
+            id: r.get(0),
+            name: r.get(1),
+            environment_id: r.get(2),
+            mode: r.get(3),
+            token_hash: r.get(4),
+            wrapped_key: r.get(5),
+            created: r.get(6),
+            expires: r.get(7),
+            revoked: r.get(8),
+            last_used: r.get(9),
+        }
+    }
+
+    pub async fn revoke_access_token(&self, id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE access_tokens SET revoked = ?1 WHERE id = ?2 AND revoked IS NULL")
+            .bind(now_ts())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn touch_access_token(&self, id: i64) -> Result<(), String> {
+        sqlx::query("UPDATE access_tokens SET last_used = ?1 WHERE id = ?2")
+            .bind(now_ts())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

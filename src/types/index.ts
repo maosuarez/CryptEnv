@@ -129,6 +129,27 @@ export interface GlobalToggleResult {
   forked:  VaultItem[];
 }
 
+export type TokenMode = 'session' | 'standalone';
+
+/** A scoped access token, bound to one environment — for headless/CI reads
+ *  without the interactive unlock flow. Never carries the token value
+ *  itself; that's only returned once, by `tokens_create`. */
+export interface TokenSummary {
+  id:            number;
+  name:          string;
+  environmentId: number;
+  mode:          TokenMode;
+  created:       string;
+  expires?:      string | null;
+  revoked?:      string | null;
+  lastUsed?:     string | null;
+}
+
+export interface CreatedToken {
+  id:    number;
+  token: string;
+}
+
 export interface ContextMenuItemDef {
   label?:   string;
   icon?:    string;

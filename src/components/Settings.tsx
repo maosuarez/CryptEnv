@@ -5,7 +5,7 @@ import { ImportModal } from './ImportModal';
 import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
 import { useVaultStore } from '../store';
-import type { IconName } from '../types';
+import type { IconName, Project, TokenSummary, CreatedToken } from '../types';
 
 function Row({ icon, label, children }: { icon: IconName; label: string; children: React.ReactNode }) {
   return (
@@ -254,6 +254,15 @@ export function Settings() {
   const [mcpTokenVisible, setMcpTokenVisible] = useState(false);
   const [generatingMcp,   setGeneratingMcp]   = useState(false);
 
+  const [accessTokens,     setAccessTokens]     = useState<TokenSummary[]>([]);
+  const [tokenProjects,    setTokenProjects]    = useState<Project[]>([]);
+  const [newTokenName,     setNewTokenName]     = useState('');
+  const [newTokenEnvId,    setNewTokenEnvId]    = useState<number | null>(null);
+  const [newTokenStandalone, setNewTokenStandalone] = useState(false);
+  const [creatingToken,    setCreatingToken]    = useState(false);
+  const [justCreated,      setJustCreated]      = useState<CreatedToken | null>(null);
+  const [createdVisible,   setCreatedVisible]   = useState(false);
+
   const [changePwOpen, setChangePwOpen] = useState(false);
   const [currentPw,    setCurrentPw]    = useState('');
   const [newPw,        setNewPw]        = useState('');
@@ -314,6 +323,9 @@ export function Settings() {
       .then((t) => setMcpToken(t))
       .catch(() => {});
 
+    invoke<TokenSummary[]>('tokens_list').then(setAccessTokens).catch(() => {});
+    invoke<Project[]>('project_list').then(setTokenProjects).catch(() => {});
+
     invoke<string>('biometric_check').then((status) => {
       if (status === 'available') {
         setBioAvailable(true);
@@ -348,6 +360,39 @@ export function Settings() {
       showToast('Failed to generate token');
     } finally {
       setGeneratingMcp(false);
+    }
+  };
+
+  const handleCreateToken = async () => {
+    if (!newTokenName.trim() || newTokenEnvId == null) return;
+    setCreatingToken(true);
+    try {
+      const created = await invoke<CreatedToken>('tokens_create', {
+        input: {
+          name: newTokenName.trim(),
+          environmentId: newTokenEnvId,
+          mode: newTokenStandalone ? 'standalone' : 'session',
+        },
+      });
+      setJustCreated(created);
+      setCreatedVisible(true);
+      setNewTokenName('');
+      const list = await invoke<TokenSummary[]>('tokens_list');
+      setAccessTokens(list);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to create token');
+    } finally {
+      setCreatingToken(false);
+    }
+  };
+
+  const handleRevokeToken = async (id: number) => {
+    try {
+      await invoke('tokens_revoke', { id });
+      setAccessTokens((list) => list.filter((t) => t.id !== id));
+      showToast('Token revoked');
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to revoke token');
     }
   };
 
@@ -627,6 +672,101 @@ export function Settings() {
             >
               <Icon name="copy" size={13} />
             </button>
+          </div>
+        )}
+
+        <Sec title="ACCESS TOKENS" />
+        <div className="text-[11px] text-tx3 font-ui leading-relaxed mb-3">
+          Scoped credentials for headless reads (CI, autonomous agents) — each token is bound to one environment and can never list or read anything outside it. Session-bound tokens only work while the vault is unlocked; standalone tokens can decrypt on their own.
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <input
+            type="text"
+            placeholder="Token name"
+            value={newTokenName}
+            onChange={(e) => setNewTokenName(e.target.value)}
+            className="h-9 flex-1 min-w-[140px] bg-raised border border-bd2 text-tx rounded-[3px] px-2.5 text-[13px] font-ui outline-none focus:border-accent transition-colors"
+          />
+          <select
+            value={newTokenEnvId ?? ''}
+            onChange={(e) => setNewTokenEnvId(e.target.value ? Number(e.target.value) : null)}
+            className="h-9 bg-raised border border-bd2 text-tx rounded-[3px] px-2 text-[13px] font-ui cursor-pointer outline-none focus:border-accent transition-colors"
+          >
+            <option value="">Select environment…</option>
+            {tokenProjects.map((p) => (
+              <optgroup key={p.id} label={p.name}>
+                {p.environments.map((e) => (
+                  <option key={e.id} value={e.id}>{e.name}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          <label className="flex items-center gap-1.5 text-[12px] text-tx2 font-ui cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={newTokenStandalone}
+              onChange={(e) => setNewTokenStandalone(e.target.checked)}
+            />
+            Standalone
+          </label>
+          <button
+            onClick={handleCreateToken}
+            disabled={creatingToken || !newTokenName.trim() || newTokenEnvId == null}
+            className="h-9 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors disabled:opacity-40"
+          >
+            {creatingToken ? '…' : 'CREATE'}
+          </button>
+        </div>
+
+        {justCreated && (
+          <div className="mb-3 px-3 py-2.5 bg-raised border border-bd rounded-[3px] flex items-center gap-2">
+            <code className="flex-1 text-[11px] font-mono text-tx2 truncate select-all">
+              {createdVisible ? justCreated.token : '••••••••••••••••••••••••••••••••'}
+            </code>
+            <button
+              onClick={() => setCreatedVisible((v) => !v)}
+              className="text-tx3 hover:text-tx transition-colors shrink-0"
+              title={createdVisible ? 'Hide' : 'Show'}
+              aria-label={createdVisible ? 'Hide token' : 'Show token'}
+            >
+              <Icon name={createdVisible ? 'eyeOff' : 'eye'} size={13} />
+            </button>
+            <button
+              onClick={() => { navigator.clipboard.writeText(justCreated.token); showToast('Token copied'); }}
+              className="text-tx3 hover:text-tx transition-colors shrink-0"
+              title="Copy"
+              aria-label="Copy token"
+            >
+              <Icon name="copy" size={13} />
+            </button>
+          </div>
+        )}
+        {justCreated && (
+          <div className="text-[11px] text-tx3 font-ui mb-4 -mt-2">
+            Shown once — store it now, it cannot be recovered later.
+          </div>
+        )}
+
+        {accessTokens.length > 0 && (
+          <div className="mb-6">
+            {accessTokens.map((t) => (
+              <div key={t.id} className="flex items-center gap-3 min-h-[36px] py-1.5 border-b border-bd">
+                <span className="flex-1 text-[12px] font-ui text-tx truncate">{t.name}</span>
+                <span className="text-[10px] font-mono text-tx3 uppercase tracking-[0.06em]">{t.mode}</span>
+                <span className={['text-[10px] font-mono uppercase tracking-[0.06em]', t.revoked ? 'text-tx3' : 'text-accent'].join(' ')}>
+                  {t.revoked ? 'revoked' : 'active'}
+                </span>
+                {!t.revoked && (
+                  <button
+                    onClick={() => handleRevokeToken(t.id)}
+                    className="text-tx3 hover:text-danger transition-colors shrink-0 text-[11px] font-ui font-semibold tracking-[0.06em]"
+                  >
+                    REVOKE
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         )}
 

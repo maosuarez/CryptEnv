@@ -14,4 +14,5 @@ pub mod search;
 pub mod set;
 pub mod share;
 pub mod sync;
+pub mod token;
 pub mod tui;

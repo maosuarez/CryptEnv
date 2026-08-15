@@ -24,6 +24,7 @@ use crate::share::{ShareState, ShareSessionState};
 use crate::share::relay;
 use crate::share::package::PlainItem;
 use crate::tls;
+use crate::tokens;
 use crate::vault::{SharedState, VaultItem};
 
 // ─── Estado compartido de la API ──────────────────────────────────────────────
@@ -2530,6 +2531,143 @@ async fn handle_inject_environment(
     }
 }
 
+// ─── /tokens (management: create, list, revoke) ────────────────────────────
+//
+// Unlike `/token/vars` below, managing tokens is a vault-owner operation —
+// gated by the normal full-session `verify_token`, same as `/projects` or
+// `/items`.
+
+async fn handle_create_token(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(body): Json<tokens::CreateTokenInput>,
+) -> impl IntoResponse {
+    if let Err(code) = verify_token(&headers, &state).await {
+        let (msg, err_code) = match code {
+            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
+            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
+            _ => ("internal error", "INTERNAL_ERROR"),
+        };
+        return err_json(code, msg, err_code).into_response();
+    }
+
+    let vault = state.vault.lock().await;
+    let vault_key: [u8; 32] = match vault.key.as_ref() {
+        Some(k) => **k,
+        None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
+    };
+
+    match tokens::create_token(&vault.db, &vault_key, body).await {
+        Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
+        Err(e) if e == "environment not found" => {
+            err_json(StatusCode::NOT_FOUND, &e, "NOT_FOUND").into_response()
+        }
+        Err(e) => err_json(StatusCode::UNPROCESSABLE_ENTITY, &e, "VALIDATION_ERROR").into_response(),
+    }
+}
+
+async fn handle_list_tokens(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(code) = verify_token(&headers, &state).await {
+        let (msg, err_code) = match code {
+            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
+            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
+            _ => ("internal error", "INTERNAL_ERROR"),
+        };
+        return err_json(code, msg, err_code).into_response();
+    }
+
+    let vault = state.vault.lock().await;
+    match tokens::list_tokens(&vault.db).await {
+        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+    }
+}
+
+async fn handle_revoke_token(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if let Err(code) = verify_token(&headers, &state).await {
+        let (msg, err_code) = match code {
+            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
+            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
+            _ => ("internal error", "INTERNAL_ERROR"),
+        };
+        return err_json(code, msg, err_code).into_response();
+    }
+
+    let vault = state.vault.lock().await;
+    match tokens::revoke_token(&vault.db, id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+    }
+}
+
+// ─── /token/vars ────────────────────────────────────────────────────────────
+//
+// Auth for this route is deliberately NOT `verify_token`: a scoped access
+// token (`crate::tokens`) is a different, narrower principal than the
+// full-vault session/MCP tokens `verify_token` checks. It never sees this
+// endpoint's sibling routes — no `/items`, no `/projects`, nothing that
+// could enumerate the vault — only the single environment it was cut for.
+
+#[derive(Serialize)]
+struct TokenVarsResponse {
+    #[serde(rename = "environmentId")]
+    environment_id: i64,
+    vars: HashMap<String, String>,
+}
+
+async fn handle_token_vars(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> impl IntoResponse {
+    let provided = match headers.get("x-access-token").and_then(|v| v.to_str().ok()) {
+        Some(t) => t.to_string(),
+        None => {
+            return err_json(StatusCode::UNAUTHORIZED, "missing X-Access-Token header", "UNAUTHORIZED")
+                .into_response()
+        }
+    };
+
+    let vault = state.vault.lock().await;
+    // Captured before `authenticate` so a `session`-mode token can be
+    // checked against it — a `standalone`-mode token ignores this and
+    // unwraps its own key instead (see `tokens::authenticate`).
+    let session_key: Option<[u8; 32]> = vault.key.as_ref().map(|k| **k);
+
+    let (token_row, env_key) = match tokens::authenticate(&vault.db, &provided, session_key.as_ref()).await {
+        Ok(v) => v,
+        Err(tokens::TokenAuthError::NotFound) => {
+            return err_json(StatusCode::UNAUTHORIZED, "invalid token", "UNAUTHORIZED").into_response()
+        }
+        Err(tokens::TokenAuthError::Revoked) => {
+            return err_json(StatusCode::UNAUTHORIZED, "token revoked", "UNAUTHORIZED").into_response()
+        }
+        Err(tokens::TokenAuthError::Expired) => {
+            return err_json(StatusCode::UNAUTHORIZED, "token expired", "UNAUTHORIZED").into_response()
+        }
+        Err(tokens::TokenAuthError::SessionRequired) => {
+            return err_json(
+                StatusCode::FORBIDDEN,
+                "this token requires an unlocked vault (session-bound mode)",
+                "VAULT_LOCKED",
+            )
+            .into_response()
+        }
+        Err(tokens::TokenAuthError::Corrupt(e)) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response()
+        }
+    };
+
+    match project::resolve_environment_values(&vault.db, &env_key, token_row.environment_id).await {
+        Ok(vars) => (
+            StatusCode::OK,
+            Json(TokenVarsResponse { environment_id: token_row.environment_id, vars }),
+        )
+            .into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+    }
+}
+
 // ─── /environments/:id/example ────────────────────────────────────────────────
 //
 // Generates a `.env`-shaped file listing an environment's variable KEYS with
@@ -3410,6 +3548,10 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/environments/:id", delete(handle_delete_environment))
         .route("/environments/:id/inject", post(handle_inject_environment))
         .route("/environments/:id/example", post(handle_environment_example))
+        .route("/tokens", post(handle_create_token))
+        .route("/tokens", get(handle_list_tokens))
+        .route("/tokens/:id", delete(handle_revoke_token))
+        .route("/token/vars", get(handle_token_vars))
         .route("/relay/send", post(handle_relay_send))
         .route("/relay/receive", post(handle_relay_receive))
         .route("/projects/:id/relay/send", post(handle_project_relay_send))

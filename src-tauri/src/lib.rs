@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod project;
 pub mod share;
 pub mod tls;
+pub mod tokens;
 pub mod vault;
 pub mod wsl;
 
@@ -39,6 +40,7 @@ use project::{
     project_preview_delete, project_save,
 };
 use project::relay_commands::{project_relay_receive, project_relay_send};
+use tokens::{tokens_create, tokens_list, tokens_revoke};
 use wsl::{wsl_distro_home, wsl_list_distros};
 
 struct PendingUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
@@ -235,6 +237,9 @@ pub fn run() {
             app_is_first_run,
             app_complete_setup,
             app_generate_mcp_config,
+            tokens_create,
+            tokens_list,
+            tokens_revoke,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
