@@ -1,9 +1,12 @@
 # crypt-env
 
+> **Source of Truth**: OpenSpec (`openspec/`) is the definitive, authoritative source of truth for all system requirements, capability specifications, change proposals, and architectural decisions. See `openspec/config.yaml` for global rules and context, `openspec/specs/` for baseline capability specifications, and `openspec/changes/` for proposed/in-flight delta changes. This document (`context.md`) serves as a technical architecture overview and historical reference.
+
 ## Description
 Personal productivity vault for developers. Centralizes credentials, API keys, tokens, passwords, links, commands, and notes in a local desktop app accessible by hotkey (Ctrl+Alt+Z). Secrets are stored encrypted locally. Includes CLI, local REST API, and MCP server for integration with external tools.
 
 ## Stack
+- **Specification & Planning**: OpenSpec (Spec-Driven Development) in `openspec/`
 - **Frontend**: React 19 + TypeScript + Vite + Tailwind CSS + Framer Motion
 - **Backend (Rust)**: Tauri 2.0, Axum (local REST), Tokio
 - **Database**: SQLite with `libsqlite3-sys` bundled (no SQLCipher; see Decision #1)
@@ -17,6 +20,10 @@ Personal productivity vault for developers. Centralizes credentials, API keys, t
 ## Architecture
 ```
 crypt-env/
+├── openspec/                     # OpenSpec Single Source of Truth (specs, changes, config)
+│   ├── config.yaml               # SDD rules, context, and operational guidance
+│   ├── specs/                    # Baseline living capability specifications
+│   └── changes/                  # Active and archived delta change plans
 ├── src/                          # React frontend
 │   ├── components/               # UI components by screen (includes ProjectManager, GlobalSecrets, ShareModal, itemFields/)
 │   ├── store/                    # Global state with Zustand (includes projectStore)

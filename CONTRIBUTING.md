@@ -71,7 +71,30 @@ cd src-tauri && cargo test
 
 # Build production binary
 pnpm tauri build
+
+# OpenSpec operations
+openspec doctor
+openspec list --json
+openspec new change <name>
+openspec status --change <name>
 ```
+
+---
+
+## Spec-Driven Development (SDD) — OpenSpec
+
+All non-trivial features, architectural refactors, and behavioral modifications must follow **Spec-Driven Development** using [OpenSpec](https://github.com/maosuarez/crypt-env/tree/main/openspec).
+
+**OpenSpec is the Single Source of Truth:**
+- System requirements and living capabilities are defined in `openspec/specs/<capability>/spec.md`.
+- Change proposals, delta specs, architecture designs, and implementation task breakdowns live in `openspec/changes/<change-name>/`.
+- Global development rules, constraints, and quality gates are defined in `openspec/config.yaml`.
+
+### Typical Workflow for Contributors & Agents:
+1. **Explore**: Clarify requirements and explore codebase boundaries (`openspec-explore`).
+2. **Propose**: Create a change with `openspec new change <name>` (or `/opsx-propose`), writing `proposal.md`, delta `specs/`, `design.md`, and `tasks.md`.
+3. **Apply**: Implement code strictly against the task list (`openspec-apply-change`).
+4. **Archive**: Sync delta specs to living specs and archive completed changes (`openspec-archive-change`).
 
 ---
 
@@ -79,6 +102,10 @@ pnpm tauri build
 
 ```
 crypt-env/
+├── openspec/               # OpenSpec Single Source of Truth (specs, changes, config.yaml)
+│   ├── config.yaml         # SDD rules, quality gates, and operational guidance
+│   ├── specs/              # Baseline living capability specifications
+│   └── changes/            # Active and archived delta change plans
 ├── src/                    # React + TypeScript frontend
 │   ├── components/         # One folder per screen/feature
 │   ├── store/              # Zustand state management
@@ -94,8 +121,8 @@ crypt-env/
 │   │   └── mcp/            # MCP server
 │   ├── Cargo.toml
 │   └── tauri.conf.json
-├── CLAUDE.md               # Instructions for Claude Code agent
-├── context.md              # Full technical context and decisions
+├── AGENTS.md               # Developer and AI agent rules & workflow
+├── context.md              # Technical context and architecture reference
 └── README.md
 ```
 

@@ -1,0 +1,62 @@
+schema: spec-driven
+
+# Project context
+# Shown to AI when creating and evaluating planning artifacts.
+context: |
+  Project: CryptEnv — Local-first, encrypted productivity vault and secrets manager for developers.
+  
+  Tech Stack:
+    - Backend: Rust, Tauri 2.0, Axum (local REST on 127.0.0.1:47821), Tokio, SQLite (libsqlite3-sys bundled), argon2, aes-gcm, subtle
+    - Frontend: React 19, TypeScript, Vite, Tailwind CSS, Framer Motion, Zustand (global state), TanStack Query
+    - Interfaces: Desktop GUI (decorationless with custom WindowChrome titlebar), CLI (binary `crypt-env`), interactive TUI (`crypt-env tui` with ratatui), MCP server (`crypt-env-mcp` over stdio), REST API
+  
+  Critical Security Rules:
+    - Secret values MUST NEVER appear in plaintext in logs, error messages, or API responses.
+    - Master password and derived master keys exist ONLY in volatile memory during an unlocked session and MUST be zeroized on drop / lock.
+    - The MCP server does not return secret values; it injects them as environment variables.
+    - The local REST API only listens on 127.0.0.1:47821 and requires token authentication.
+    - Use constant-time comparisons (`subtle::ConstantTimeEq`) for token and authentication checks to prevent timing attacks.
+  
+  Engineering Conventions:
+    - Rust: Error handling strictly with Result and strongly typed custom errors. `unwrap()` and `expect()` are forbidden in production code.
+    - Decoupled modules: `db` does not know about `api`, `vault` orchestrates both.
+    - Tauri commands follow the naming pattern: `module_action` (e.g., `vault_get_items`, `project_save`).
+    - Frontend: Communication with Rust exclusively via Tauri `invoke()` — never `fetch()` to localhost from React.
+    - Styling: Pure Tailwind CSS utility classes and semantic tokens in `src/index.css` (no inline styles or CSS modules).
+    - Commits: Conventional Commits (`feat`, `fix`, `security`, `docs`, `refactor`, `test`).
+
+# Per-artifact rules
+rules:
+  proposal:
+    - Clearly state the problem, proposed solution, and user value.
+    - Always include an explicit "Non-Goals" section to prevent scope creep.
+    - Explicitly assess security implications (especially if touching crypto, api, vault, or file I/O).
+    - Keep proposals concise and focused on single feature or fix boundaries.
+  specs:
+    - Express requirements using RFC 2119 keywords (MUST, MUST NOT, SHOULD, MAY).
+    - Provide structured user scenarios and clear acceptance criteria.
+    - Define error handling behavior, boundary conditions, and edge cases.
+    - For security-sensitive capabilities, define explicit invariants and security constraints.
+  design:
+    - Document architectural decisions, data flow diagrams, and module boundaries.
+    - Include a mandatory "Security & Threat Model" section for any secret or IPC handling.
+    - Explicitly define database migrations, schema diffs, or API contract modifications.
+    - Document trade-offs, rejected alternatives, and cross-platform implications (Windows/Linux/macOS).
+  tasks:
+    - Break implementation into small, atomic, testable steps (1-2 hours each).
+    - Sequence backend changes (db/crypto/vault/api) before frontend UI integration.
+    - Include explicit testing and verification steps (e.g., `cargo check`, `cargo test`, UI tests).
+
+# Per-operation guidance
+operations:
+  apply:
+    guidance:
+      - Always verify Rust compilation (`cd src-tauri && cargo check`) after backend changes.
+      - Preserve documentation integrity and all existing non-related comments.
+      - Enforce zeroization and verify no plaintext secrets are emitted in debug logs or errors.
+      - Test affected features thoroughly and write unit tests for critical business logic.
+  archive:
+    guidance:
+      - Ensure all delta specifications are synced to `openspec/specs/`.
+      - Verify no temporary debug code or unreferenced artifacts remain.
+      - Summarize the change outcome and ensure backward compatibility with existing databases.
