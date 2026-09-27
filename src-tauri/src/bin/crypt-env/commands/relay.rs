@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-use crate::client::{authenticated_post, CliError, API_BASE};
+use crate::client::{authenticated_post, CliError};
 use crate::commands::scope;
 
 // ─── CLI argument structs ─────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ fn run_send(items_str: String) -> Result<(), CliError> {
     }
 
     let body = serde_json::json!({ "item_ids": item_ids });
-    let resp = authenticated_post(&format!("{API_BASE}/relay/send"), &body)?;
+    let resp = authenticated_post(&format!("{base}/relay/send", base = crate::client::api_base()), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -93,7 +93,7 @@ fn run_receive(code: String, passphrase: String, project: Option<String>, env: O
     let resolved_scope = scope::resolve(project.as_deref(), env.as_deref(), false)?;
 
     let body = serde_json::json!({ "code": code, "passphrase": passphrase });
-    let url = resolved_scope.append_query(&format!("{API_BASE}/relay/receive"));
+    let url = resolved_scope.append_query(&format!("{base}/relay/receive", base = crate::client::api_base()));
     let resp = authenticated_post(&url, &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {

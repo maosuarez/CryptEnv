@@ -14,8 +14,91 @@ use serde::{Deserialize, Serialize};
 /// Archivos .env temporales pendientes de limpieza del ciclo anterior.
 static TEMP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-const API_BASE: &str = "https://127.0.0.1:47821";
+/// Built-in REST base URL, used when `CRYPTENV_API_URL` is unset or empty.
+const DEFAULT_API_BASE: &str = "https://127.0.0.1:47821";
 const MCP_VERSION: &str = "2024-11-05";
+
+/// Process-wide resolved REST base URL. Set once from `main` so every request
+/// targets the same endpoint.
+static API_BASE_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Mirrors `crypt-env`'s endpoint resolution (there is no shared crate between
+/// the two binaries — keep in sync): `CRYPTENV_API_URL` overrides the default
+/// when set and non-empty; the value must be an absolute `http`/`https` URL; a
+/// non-loopback host prints one stderr warning.
+fn resolve_api_base() -> Result<String, String> {
+    resolve_api_base_from(std::env::var("CRYPTENV_API_URL").ok().as_deref())
+}
+
+/// Pure resolver over the raw `CRYPTENV_API_URL` value; prints the non-loopback
+/// warning as a side effect so the caller stays a one-liner.
+fn resolve_api_base_from(raw: Option<&str>) -> Result<String, String> {
+    match raw {
+        Some(v) if !v.trim().is_empty() => {
+            let trimmed = v.trim();
+            let host = http_url_host(trimmed).ok_or_else(|| {
+                "CRYPTENV_API_URL must be an absolute http:// or https:// URL".to_string()
+            })?;
+            if !host_is_loopback(&host) {
+                eprintln!(
+                    "[crypt-env-mcp] warning: CRYPTENV_API_URL host '{host}' is not a loopback \
+                     address; the vault is expected to be reachable only over localhost"
+                );
+            }
+            Ok(trimmed.trim_end_matches('/').to_string())
+        }
+        _ => Ok(DEFAULT_API_BASE.to_string()),
+    }
+}
+
+/// Returns the resolved REST base URL. Falls back to [`DEFAULT_API_BASE`] when
+/// `main` did not prime the cache (e.g. in unit tests).
+fn api_base() -> &'static str {
+    API_BASE_CACHE
+        .get_or_init(|| resolve_api_base().unwrap_or_else(|_| DEFAULT_API_BASE.to_string()))
+        .as_str()
+}
+
+/// Lowercased host of `s` when it is an absolute `http`/`https` URL with a
+/// non-empty host; otherwise `None`.
+fn http_url_host(s: &str) -> Option<String> {
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if host_port.is_empty() {
+        return None;
+    }
+    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let end = after_bracket.find(']')?;
+        &after_bracket[..end]
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// True when `host` is a loopback address: `localhost`, `::1`, or `127.0.0.0/8`.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
+}
 
 // ─── Token ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +161,17 @@ fn read_mcp_token() -> Result<String, String> {
 // ─── TLS-aware HTTP client ────────────────────────────────────────────────────
 
 /// Returns the path to the self-signed cert written by the Tauri app.
+///
+/// A non-empty `CRYPTENV_CERT_PATH` short-circuits the platform probing (mirrors
+/// `crypt-env`; see `design.md` D3), so a WSL client can reference the Windows
+/// cert on `/mnt/c` without copying it.
 fn tls_cert_path() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("CRYPTENV_CERT_PATH") {
+        if !explicit.trim().is_empty() {
+            return Some(std::path::PathBuf::from(explicit.trim()));
+        }
+    }
+
     #[cfg(target_os = "windows")]
     if let Ok(appdata) = std::env::var("APPDATA") {
         return Some(
@@ -684,7 +777,7 @@ fn tool_definitions() -> serde_json::Value {
 
 fn vault_get(path: &str, token: &str) -> Result<reqwest::blocking::Response, String> {
     mcp_http_client()
-        .get(format!("{API_BASE}{path}"))
+        .get(format!("{}{path}", api_base()))
         .header("X-Vault-Token", token)
         .send()
         .map_err(|e| {
@@ -702,7 +795,7 @@ fn vault_post(
     body: &serde_json::Value,
 ) -> Result<reqwest::blocking::Response, String> {
     mcp_http_client()
-        .post(format!("{API_BASE}{path}"))
+        .post(format!("{}{path}", api_base()))
         .header("X-Vault-Token", token)
         .json(body)
         .send()
@@ -721,7 +814,7 @@ fn vault_put(
     body: &serde_json::Value,
 ) -> Result<reqwest::blocking::Response, String> {
     mcp_http_client()
-        .put(format!("{API_BASE}{path}"))
+        .put(format!("{}{path}", api_base()))
         .header("X-Vault-Token", token)
         .json(body)
         .send()
@@ -736,7 +829,7 @@ fn vault_put(
 
 fn vault_delete(path: &str, token: &str) -> Result<reqwest::blocking::Response, String> {
     mcp_http_client()
-        .delete(format!("{API_BASE}{path}"))
+        .delete(format!("{}{path}", api_base()))
         .header("X-Vault-Token", token)
         .send()
         .map_err(|e| {
@@ -1322,7 +1415,7 @@ fn tool_fill_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
 
 fn tool_doctor(_args: &serde_json::Value, _token: &str) -> serde_json::Value {
     let resp = match mcp_http_client_timeout(std::time::Duration::from_secs(3))
-        .get(format!("{API_BASE}/health"))
+        .get(format!("{}/health", api_base()))
         .send()
     {
         Ok(r) => r,
@@ -1638,7 +1731,7 @@ fn tool_share_confirm(args: &serde_json::Value, token: &str) -> serde_json::Valu
 
 fn tool_share_cancel(token: &str) -> serde_json::Value {
     let resp = match mcp_http_client()
-        .delete(format!("{API_BASE}/share/session"))
+        .delete(format!("{}/share/session", api_base()))
         .header("X-Vault-Token", token)
         .send()
         .map_err(|e| e.to_string())
@@ -3066,6 +3159,18 @@ fn writeln_json(stdout: &std::io::Stdout, val: &impl Serialize) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Resolve the REST endpoint once, before any request. A malformed
+    // `CRYPTENV_API_URL` is fatal here rather than at first use.
+    match resolve_api_base() {
+        Ok(base) => {
+            let _ = API_BASE_CACHE.set(base);
+        }
+        Err(e) => {
+            eprintln!("[crypt-env-mcp] {e}");
+            std::process::exit(1);
+        }
+    }
+
     let token = match read_mcp_token() {
         Ok(t) => t,
         Err(e) => {
@@ -3373,6 +3478,46 @@ mod tests {
         )
         .expect("environment_id should win when both keys are present");
         assert_eq!(resolved, ResolvedEnvironment { id: 7, via_deprecated_id: false });
+    }
+
+    // ─── Endpoint resolution mirror (cli-remote-endpoint-config task 5.1) ──
+
+    #[test]
+    fn mcp_resolve_api_base_defaults_when_unset_or_empty() {
+        assert_eq!(resolve_api_base_from(None).unwrap(), DEFAULT_API_BASE);
+        assert_eq!(resolve_api_base_from(Some("  ")).unwrap(), DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn mcp_resolve_api_base_honors_override_and_trims_trailing_slash() {
+        assert_eq!(
+            resolve_api_base_from(Some("https://127.0.0.1:47821/")).unwrap(),
+            "https://127.0.0.1:47821"
+        );
+    }
+
+    #[test]
+    fn mcp_resolve_api_base_rejects_malformed_values() {
+        for raw in ["not-a-url", "ftp://127.0.0.1", "127.0.0.1:47821"] {
+            assert!(resolve_api_base_from(Some(raw)).is_err(), "{raw} should be rejected");
+        }
+    }
+
+    #[test]
+    fn mcp_host_is_loopback_matches_cli_semantics() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("::1"));
+        assert!(!host_is_loopback("vault.example.com"));
+        assert!(!host_is_loopback("0.0.0.0"));
+    }
+
+    #[test]
+    fn mcp_env_var_smoke_sets_process_endpoint() {
+        // `CRYPTENV_API_URL` set → the resolver returns it verbatim (minus a
+        // trailing slash); this is the value `api_base()` would cache in `main`.
+        let resolved = resolve_api_base_from(Some("https://127.0.0.1:59999")).unwrap();
+        assert_eq!(resolved, "https://127.0.0.1:59999");
     }
 
     /// Test 5 (plan §1): missing scope names the canonical key in the error and

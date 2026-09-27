@@ -39,7 +39,7 @@ use project::{
     project_preview_delete, project_save,
 };
 use project::relay_commands::{project_relay_receive, project_relay_send};
-use wsl::{wsl_distro_home, wsl_list_distros};
+use wsl::{wsl_configure_client, wsl_detect, wsl_distro_home, wsl_list_distros, wsl_remove_client};
 
 struct PendingUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
 
@@ -50,7 +50,10 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, Strin
         Ok(Some(update)) => {
             let version = update.version.clone();
             let pending = app.state::<PendingUpdate>();
-            *pending.0.lock().unwrap() = Some(update);
+            *pending
+                .0
+                .lock()
+                .map_err(|_| "update state unavailable".to_string())? = Some(update);
             Ok(Some(version))
         }
         Ok(None) => Ok(None),
@@ -61,7 +64,11 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, Strin
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     let pending = app.state::<PendingUpdate>();
-    let update = pending.0.lock().unwrap().take()
+    let update = pending
+        .0
+        .lock()
+        .map_err(|_| "update state unavailable".to_string())?
+        .take()
         .ok_or_else(|| "No update available — run check first".to_string())?;
     update
         .download_and_install(|_, _| {}, || {})
@@ -227,6 +234,9 @@ pub fn run() {
             environment_inject,
             wsl_list_distros,
             wsl_distro_home,
+            wsl_detect,
+            wsl_configure_client,
+            wsl_remove_client,
             environment_inject_preview,
             project_relay_send,
             project_relay_receive,

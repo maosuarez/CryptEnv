@@ -34,7 +34,7 @@ pub fn run(args: ListArgs) -> Result<(), CliError> {
     let resolved_scope = scope::resolve(args.project.as_deref(), args.env.as_deref(), false)?;
     let url = resolved_scope.append_query(&format!(
         "{}/commands?include_global={}",
-        client::API_BASE,
+        client::api_base(),
         client::urlencod(&args.scope_globals)
     ));
     let resp = client::authenticated_get(&url)?;

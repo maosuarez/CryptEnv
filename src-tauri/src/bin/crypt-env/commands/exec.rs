@@ -28,7 +28,7 @@ pub struct ExecArgs {
 
 pub fn run(args: ExecArgs) -> Result<(), CliError> {
     let resolved_scope = scope::resolve(args.project.as_deref(), args.env.as_deref(), false)?;
-    let url = resolved_scope.append_query(&format!("{}/commands", client::API_BASE));
+    let url = resolved_scope.append_query(&format!("{}/commands", client::api_base()));
     let resp = client::authenticated_get(&url)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {

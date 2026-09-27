@@ -56,7 +56,7 @@ pub fn run(args: MemoryArgs) -> Result<(), CliError> {
     });
 
     let resp = client::authenticated_post(
-        &format!("{}/items", client::API_BASE),
+        &format!("{}/items", client::api_base()),
         &body,
     )?;
 

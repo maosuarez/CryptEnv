@@ -2,7 +2,7 @@ use clap::Args;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::client::{self, CliError, API_BASE};
+use crate::client::{self, CliError};
 use crate::commands::scope::{self, ResolvedScope};
 
 #[derive(Args)]
@@ -51,7 +51,7 @@ pub fn run(args: FillArgs) -> Result<(), CliError> {
         "overwrite": args.force,
     });
 
-    let url = resolved_scope.append_query(&format!("{API_BASE}/fill"));
+    let url = resolved_scope.append_query(&format!("{base}/fill", base = crate::client::api_base()));
     let resp = client::authenticated_post(&url, &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -157,7 +157,7 @@ struct ProjectLookup {
 /// Reads the resolved environment's variable keys straight from `GET
 /// /projects` — used only to build the "nothing specified" default template.
 fn environment_var_keys(resolved_scope: &ResolvedScope) -> Result<Vec<String>, CliError> {
-    let resp = client::authenticated_get(&format!("{API_BASE}/projects"))?;
+    let resp = client::authenticated_get(&format!("{base}/projects", base = crate::client::api_base()))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
     }

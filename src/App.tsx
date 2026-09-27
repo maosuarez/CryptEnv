@@ -12,7 +12,9 @@ import { ContextMenu } from './components/ui/ContextMenu';
 import { Toast } from './components/ui/Toast';
 import { PlaceholderModal } from './components/ui/PlaceholderModal';
 import { SetupWizard } from './components/SetupWizard';
+import { UpdateNotice } from './components/ui/UpdateNotice';
 import { useVaultStore } from './store';
+import { useUpdateStore } from './store/updateStore';
 import { useAutoLock } from './hooks/useAutoLock';
 import type { Screen } from './types';
 
@@ -33,6 +35,7 @@ export default function App() {
   const toast          = useVaultStore((s) => s.toast);
   const placeholder    = useVaultStore((s) => s.placeholder);
   const setPlaceholder = useVaultStore((s) => s.setPlaceholder);
+  const checkForUpdate = useUpdateStore((s) => s.checkOnce);
 
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   const prevScreenRef = useRef<Screen>(screen);
@@ -45,7 +48,9 @@ export default function App() {
         .then((isFirst) => { if (isFirst) setShowSetupWizard(true); })
         .catch(() => {});
     }
-  }, [screen]);
+    // First unlock of this launch → background update check (no-op afterwards).
+    if (prev === 'lock' && screen !== 'lock') checkForUpdate();
+  }, [screen, checkForUpdate]);
 
   return (
     <div className="flex flex-col w-full h-full bg-bg overflow-hidden">
@@ -68,6 +73,7 @@ export default function App() {
       </div>
 
       {/* Global overlays */}
+      <UpdateNotice />
       {menu && <ContextMenu {...menu} onClose={closeMenu} />}
       {toast && <Toast msg={toast.type === 'error' ? toast.msg : `✓ ${toast.msg}`} type={toast.type} />}
       {placeholder && placeholder.type === 'command' && (

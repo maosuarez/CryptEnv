@@ -2,6 +2,8 @@
 
 This guide explains how to compile the three CryptEnv binaries and distribute them on GitHub for Windows, macOS, and Linux.
 
+For cutting a public release (signing, tagging, updater verification) see [release.md](release.md).
+
 CryptEnv produces three separate outputs:
 
 1. **Desktop App** (`tauri-crypt-env.exe` / `.app` / `.deb`) — the GUI vault with hotkey support
@@ -110,6 +112,23 @@ This launches a development server with hot reload. The Rust backend and React f
 ```bash
 pnpm tauri build
 ```
+
+**Windows installer with the CLI bundled** (what the release workflow runs):
+
+```powershell
+pnpm tauri:build:windows
+```
+
+`scripts/prepare-windows-bundle.mjs` builds `crypt-env` / `crypt-env-mcp` from the same revision, stages them as Tauri sidecars in `src-tauri/binaries/`, fails if `crypt-env --version` differs from the GUI version, and stages the static WSL helper at `src-tauri/resources/wsl/crypt-env-setup`; the build then merges `src-tauri/tauri.windows-bundle.conf.json`. The helper is a Linux binary, so build it from WSL first (the repo is shared over `\\wsl.localhost`):
+
+```bash
+cd src-tauri
+rustup target add x86_64-unknown-linux-musl
+cargo build --release -p crypt-env-setup --target x86_64-unknown-linux-musl
+mkdir -p resources/wsl && cp "${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/crypt-env-setup" resources/wsl/
+```
+
+(or point `CRYPTENV_WSL_HELPER` at an existing build). Plain `pnpm tauri build` / `pnpm tauri dev` and the macOS/Linux bundles are unaffected.
 
 **Build output locations:**
 
@@ -492,6 +511,8 @@ After building and distributing the binaries, users can install them as command-
 
 ### Windows
 
+The NSIS installer already installs `crypt-env.exe` and `crypt-env-mcp.exe` next to the GUI and adds that folder to your user `PATH` — open a new terminal and run `crypt-env --version`. The manual steps below are only needed if you want the CLI without the GUI.
+
 1. Download `crypt-env.exe` and `crypt-env-mcp.exe` from the GitHub Release
 2. Add them to `%PATH%`:
 
@@ -584,6 +605,7 @@ Before publishing a release:
 - [ ] Update version in `src-tauri/Cargo.toml` and `src/package.json` if needed
 - [ ] Test the build on each platform locally (or via Actions)
 - [ ] Verify CLI and MCP binaries work (`--help` and `--version`)
+- [ ] Windows: after installing the NSIS build, a new terminal's `crypt-env --version` equals the GUI version (also asserted at build time by `scripts/prepare-windows-bundle.mjs`), and uninstall removes the `PATH` entry
 - [ ] Generate SHA256 checksums for all artifacts
 - [ ] Create a GitHub Release with checksums in the description
 - [ ] Test that users can download, unblock (Windows), and run the binaries

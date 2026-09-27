@@ -39,7 +39,7 @@ pub fn run(args: CmdArgs) -> Result<(), CliError> {
 }
 
 fn list_commands(resolved_scope: &ResolvedScope) -> Result<(), CliError> {
-    let url = resolved_scope.append_query(&format!("{}/commands", client::API_BASE));
+    let url = resolved_scope.append_query(&format!("{}/commands", client::api_base()));
     let resp = client::authenticated_get(&url)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -72,7 +72,7 @@ fn list_commands(resolved_scope: &ResolvedScope) -> Result<(), CliError> {
 }
 
 fn command_info(name: &str, resolved_scope: &ResolvedScope) -> Result<(), CliError> {
-    let url = resolved_scope.append_query(&format!("{}/commands", client::API_BASE));
+    let url = resolved_scope.append_query(&format!("{}/commands", client::api_base()));
     let resp = client::authenticated_get(&url)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -92,7 +92,7 @@ fn command_info(name: &str, resolved_scope: &ResolvedScope) -> Result<(), CliErr
         None => return Err(CliError::NotFound(name.to_string())),
     };
 
-    let url2 = format!("{}/commands/{}", client::API_BASE, cmd_id);
+    let url2 = format!("{}/commands/{}", client::api_base(), cmd_id);
     let resp2 = client::authenticated_get(&url2)?;
 
     if resp2.status() == reqwest::StatusCode::NOT_FOUND {
@@ -118,7 +118,7 @@ fn command_info(name: &str, resolved_scope: &ResolvedScope) -> Result<(), CliErr
 }
 
 fn run_command(name: &str, vars: &[String], resolved_scope: &ResolvedScope) -> Result<(), CliError> {
-    let url = resolved_scope.append_query(&format!("{}/commands", client::API_BASE));
+    let url = resolved_scope.append_query(&format!("{}/commands", client::api_base()));
     let resp = client::authenticated_get(&url)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {

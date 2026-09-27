@@ -28,6 +28,12 @@ src-tauri/target/
 
 # Claude Code local configuration
 .claude/
+
+# Unpatched security findings — local only, never commit (public repo).
+# Un-ignore each plan once its vulnerability is actually fixed and released.
+docs/security-findings-local.md
+docs/plans/sec-*.md
+docs/plans/issue-17-item-endpoints-unscoped.md
 CLAUDE.local.md
 
 # Environment
@@ -48,3 +54,7 @@ vault.key
 
 # Added by commit-orchestrator
 /src-tauri/gen/
+
+# Windows bundle inputs staged by scripts/prepare-windows-bundle.mjs
+/src-tauri/binaries/
+/src-tauri/resources/wsl/

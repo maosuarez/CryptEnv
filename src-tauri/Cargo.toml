@@ -6,6 +6,9 @@ authors = ["maosuarez"]
 edition = "2021"
 default-run = "tauri-crypt-env"
 
+[workspace]
+members = [".", "crates/crypt-env-setup"]
+
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
@@ -18,6 +21,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+
+# Shared `setup wsl` shell-configuration contract (CLI + WSL helper + GUI report type)
+crypt-env-setup = { path = "crates/crypt-env-setup" }
 
 # Tauri plugins
 tauri-plugin-opener = "2"

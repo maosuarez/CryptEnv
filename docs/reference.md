@@ -419,3 +419,42 @@ MCP server is single-threaded with a blocking I/O loop (`stdin.lock().lines()`) 
 `TEMP_FILES` cleanup in `crypt_env_generate_env` is best-effort (called at start of next call) — if the MCP process exits before another call, temp .env files are abandoned on disk.
 
 MCP config management tools (`crypt_env_add/update/delete_mcp_server`) do not validate the `command` field for path traversal or injection — a crafted command string could write an adversarial entry to the Claude config files.
+
+---
+
+## Tauri commands — WSL Integration (Windows only)
+
+Invoked by the Settings → WSL Integration panel via `invoke()`. On every non-Windows build they return `{ "kind": "unsupported" }` immediately, spawning nothing and touching no files. `wsl.exe` is always driven with argument vectors — the distro name is a discrete argument, never interpolated into a shell string. See [`wsl-windows.md`](wsl-windows.md#gui-route-settings--wsl-integration).
+
+| Command | Args | Returns | Side effects |
+|---------|------|---------|--------------|
+| `wsl_detect` | — | `WslStatus` | None (read-only). Runs `wsl --list --quiet`, then per distro `whoami` and a fixed `test`/`grep` probe; reads `%UserProfile%\.wslconfig`. |
+| `wsl_configure_client` | `distro: string` | `WslActionReport` | Re-validates `distro` against a fresh `wsl --list`, then runs the bundled `crypt-env-setup` helper inside it (copied to `/tmp`, deleted afterwards). Writes only `~/.config/cryptenv/env.sh`, the rc marker block, and the one-time `.cryptenv.bak`. |
+| `wsl_remove_client` | `distro: string` | `WslActionReport` | Same validation; runs the helper with `--remove`. No-op when nothing is installed. |
+
+```ts
+interface WslStatus {
+  available: boolean;                 // at least one distro detected
+  distros: { name: string; defaultUser: string | null; configured: boolean }[];
+  mirrored: boolean;                  // [wsl2] networkingMode=mirrored in .wslconfig
+}
+
+// cryptenv_setup::ActionReport — also the helper's stdout JSON (snake_case).
+interface WslActionReport {
+  env_file: string;                   // ~/.config/cryptenv/env.sh
+  env_file_changed: boolean;          // configure: (re)written · remove: deleted
+  rc_files: string[];                 // rc files modified by this run
+  backups: string[];                  // one-time backups created by this run
+  marker_added: boolean;              // configure: block inserted somewhere
+  marker_removed: boolean;            // remove: block deleted somewhere
+}
+
+// Rejection payload
+type WslError =
+  | { kind: 'unsupported' }           // not Windows
+  | { kind: 'notAvailable' }          // wsl.exe missing
+  | { kind: 'unknownDistro'; message: string }
+  | { kind: 'tooling'; message: string };  // wsl.exe / helper failure, garbled output
+```
+
+Neither command reads, logs, or passes any secret value; reports contain only paths and booleans.

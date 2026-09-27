@@ -488,7 +488,7 @@ fn handle_confirm(app: &mut App, code: KeyCode) {
             let action = app.confirm_action.clone();
             match action {
                 ConfirmAction::DeleteItem(id) => {
-                    let url = format!("{}/items/{}", client::API_BASE, id);
+                    let url = format!("{}/items/{}", client::api_base(), id);
                     match client::authenticated_delete(&url) {
                         Ok(_) => {
                             app.items.retain(|i| i.id != id);

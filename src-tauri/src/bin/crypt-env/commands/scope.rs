@@ -29,7 +29,7 @@
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::client::{self, CliError, API_BASE};
+use crate::client::{self, CliError};
 
 pub const CONFIG_FILE_NAME: &str = "crypt-env.json";
 
@@ -116,7 +116,7 @@ struct EnvLookup {
 }
 
 fn fetch_projects() -> Result<Vec<ProjectLookup>, CliError> {
-    let resp = client::authenticated_get(&format!("{API_BASE}/projects"))?;
+    let resp = client::authenticated_get(&format!("{base}/projects", base = crate::client::api_base()))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
     }
@@ -171,7 +171,7 @@ fn default_environment_for(project_name: &str, allow_create: bool) -> Result<Str
         "template": "",
         "categories": [],
     });
-    let resp = client::authenticated_post(&format!("{API_BASE}/projects"), &body)?;
+    let resp = client::authenticated_post(&format!("{base}/projects", base = crate::client::api_base()), &body)?;
 
     // A concurrent invocation may have created the same (case-insensitive)
     // name first — the server enforces a unique constraint and reports
