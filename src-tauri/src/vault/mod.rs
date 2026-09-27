@@ -555,7 +555,7 @@ async fn populate_default_environment(
             description: None,
             command: None,
             shell: None,
-            categories: None,
+            categories: Some(vec![]),
             notes: None,
             content: None,
             created: now.clone(),

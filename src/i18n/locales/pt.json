@@ -47,7 +47,7 @@
     "add": "ADICIONAR",
     "save": "SALVAR CATEGORIAS",
     "deleteTitle": "Excluir \"{name}\"?",
-    "deleteBody": "Esta tag será removida de todos os {n} itens que a usam."
+    "deleteBody": "Esta categoria será removida de todos os {n} itens que a usam."
   },
   "common": {
     "back": "Voltar",
@@ -220,9 +220,9 @@
     "new": "NOVO",
     "newProject": "NOVO PROJETO",
     "searchPlaceholder": "Pesquisar por nome ou descrição…",
-    "filterTitle": "Filtrar por tag / linguagem",
-    "filterHeader": "FILTRAR POR TAG / LINGUAGEM",
-    "noTags": "Nenhuma tag ainda",
+    "filterTitle": "Filtrar por categoria",
+    "filterHeader": "FILTRAR POR CATEGORIA",
+    "noCategories": "Nenhuma categoria ainda",
     "clearFilter": "Limpar filtro",
     "emptyTitle": "Nenhum projeto ainda.",
     "emptyHint": "Agrupe ambientes (production, local, test…) em um projeto.",
@@ -236,8 +236,8 @@
     "name": "NOME",
     "description": "DESCRIÇÃO",
     "descriptionPlaceholder": "Notas opcionais",
-    "tags": "TAGS",
-    "tagsHint": "linguagem, stack, o que quiser",
+    "categories": "CATEGORIAS",
+    "categoriesHint": "categorias do cofre: linguagem, stack, o que quiser",
     "template": "MODELO",
     "change": "ALTERAR",
     "environmentsHeader": "// AMBIENTES",
@@ -387,7 +387,9 @@
       "production": "Produção",
       "local": "Local",
       "test": "Teste",
-      "staging": "Staging"
+      "staging": "Staging",
+      "custom": "Personalizado…",
+      "default": "Padrão"
     }
   },
   "receive": {
@@ -575,6 +577,10 @@
       "sqlCopied": "SQL copiado",
       "required": "A URL e a Anon Key são obrigatórias",
       "saved": "Configurações do relay salvas"
+    },
+    "hotkey": {
+      "reset": "REDEFINIR PADRÃO",
+      "needsModifier": "Inclua Ctrl, Alt ou Cmd mais uma tecla"
     }
   },
   "setup": {
@@ -709,8 +715,8 @@
     "copyFilled": "COPIAR COMANDO PREENCHIDO",
     "noCategoriesHint": "Sem categorias — clique abaixo para adicionar",
     "removeTag": "Remover {name}",
-    "newTagPlaceholder": "Nova tag…",
-    "addTag": "+ TAG"
+    "newTagPlaceholder": "Nova categoria…",
+    "addTag": "+ CATEGORIA"
   },
   "update": {
     "available": "Atualização disponível: v{version}",

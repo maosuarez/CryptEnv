@@ -47,7 +47,7 @@
     "add": "AGREGAR",
     "save": "GUARDAR CATEGORÍAS",
     "deleteTitle": "¿Eliminar \"{name}\"?",
-    "deleteBody": "Esta etiqueta se quitará de los {n} elementos que la usan."
+    "deleteBody": "Esta categoría se quitará de los {n} elementos que la usan."
   },
   "common": {
     "back": "Atrás",
@@ -220,9 +220,9 @@
     "new": "NUEVO",
     "newProject": "NUEVO PROYECTO",
     "searchPlaceholder": "Buscar por nombre o descripción…",
-    "filterTitle": "Filtrar por etiqueta / lenguaje",
-    "filterHeader": "FILTRAR POR ETIQUETA / LENGUAJE",
-    "noTags": "Aún no hay etiquetas",
+    "filterTitle": "Filtrar por categoría",
+    "filterHeader": "FILTRAR POR CATEGORÍA",
+    "noCategories": "Aún no hay categorías",
     "clearFilter": "Limpiar filtro",
     "emptyTitle": "Aún no hay proyectos.",
     "emptyHint": "Agrupa entornos (production, local, test…) en un proyecto.",
@@ -236,8 +236,8 @@
     "name": "NOMBRE",
     "description": "DESCRIPCIÓN",
     "descriptionPlaceholder": "Notas opcionales",
-    "tags": "ETIQUETAS",
-    "tagsHint": "lenguaje, stack, lo que sea",
+    "categories": "CATEGORÍAS",
+    "categoriesHint": "categorías del vault: lenguaje, stack, lo que sea",
     "template": "PLANTILLA",
     "change": "CAMBIAR",
     "environmentsHeader": "// ENTORNOS",
@@ -387,7 +387,9 @@
       "production": "Producción",
       "local": "Local",
       "test": "Pruebas",
-      "staging": "Staging"
+      "staging": "Staging",
+      "custom": "Personalizado…",
+      "default": "Predeterminado"
     }
   },
   "receive": {
@@ -575,6 +577,10 @@
       "sqlCopied": "SQL copiado",
       "required": "Se requieren la URL y la Anon Key",
       "saved": "Configuración del relay guardada"
+    },
+    "hotkey": {
+      "reset": "RESTABLECER",
+      "needsModifier": "Incluye Ctrl, Alt o Cmd más una tecla"
     }
   },
   "setup": {
@@ -709,8 +715,8 @@
     "copyFilled": "COPIAR COMANDO COMPLETO",
     "noCategoriesHint": "Sin categorías — haz clic abajo para agregar",
     "removeTag": "Quitar {name}",
-    "newTagPlaceholder": "Nueva etiqueta…",
-    "addTag": "+ ETIQUETA"
+    "newTagPlaceholder": "Nueva categoría…",
+    "addTag": "+ CATEGORÍA"
   },
   "update": {
     "available": "Actualización disponible: v{version}",

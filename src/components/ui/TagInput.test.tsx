@@ -10,14 +10,14 @@ afterEach(cleanup);
 describe('TagInput inline creation', () => {
   it('hides the creation input without onCreate', () => {
     render(<TagInput selected={[]} categories={CATS} onChange={() => {}} />);
-    expect(screen.queryByLabelText('New tag…')).toBeNull();
+    expect(screen.queryByLabelText('New category…')).toBeNull();
   });
 
   it('calls onCreate with the trimmed new name on Enter', async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
     const onChange = vi.fn();
     render(<TagInput selected={[]} categories={[]} onChange={onChange} onCreate={onCreate} />);
-    const input = screen.getByLabelText('New tag…') as HTMLInputElement;
+    const input = screen.getByLabelText('New category…') as HTMLInputElement;
     fireEvent.change(input, { target: { value: '  Rust  ' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(onCreate).toHaveBeenCalledWith('Rust'));
@@ -29,8 +29,8 @@ describe('TagInput inline creation', () => {
     const onCreate = vi.fn();
     const onChange = vi.fn();
     render(<TagInput selected={[]} categories={CATS} onChange={onChange} onCreate={onCreate} />);
-    fireEvent.change(screen.getByLabelText('New tag…'), { target: { value: 'python' } });
-    fireEvent.click(screen.getByText('+ TAG'));
+    fireEvent.change(screen.getByLabelText('New category…'), { target: { value: 'python' } });
+    fireEvent.click(screen.getByText('+ CATEGORY'));
     expect(onCreate).not.toHaveBeenCalled();
     expect(onChange).toHaveBeenCalledWith(['Python']);
   });
@@ -38,9 +38,9 @@ describe('TagInput inline creation', () => {
   it('keeps the draft when creation fails', async () => {
     const onCreate = vi.fn().mockRejectedValue(new Error('boom'));
     render(<TagInput selected={[]} categories={[]} onChange={() => {}} onCreate={onCreate} />);
-    const input = screen.getByLabelText('New tag…') as HTMLInputElement;
+    const input = screen.getByLabelText('New category…') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'Go' } });
-    fireEvent.click(screen.getByText('+ TAG'));
+    fireEvent.click(screen.getByText('+ CATEGORY'));
     await waitFor(() => expect(onCreate).toHaveBeenCalled());
     expect(input.value).toBe('Go');
   });

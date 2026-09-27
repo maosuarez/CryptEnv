@@ -107,14 +107,14 @@ export function GlobalSecrets() {
   const filtered = useMemo(() => {
     return items.filter((it) => {
       if (typeF !== 'all' && it.type !== typeF) return false;
-      if (catF.size > 0 && !it.categories.some((c) => catF.has(c))) return false;
+      if (catF.size > 0 && !(it.categories ?? []).some((c) => catF.has(c))) return false;
       const q = query.toLowerCase();
       if (!q) return true;
       const name = (('name' in it ? it.name : 'title' in it ? it.title : '') as string).toLowerCase();
       const val  = (('value' in it ? it.value : 'url' in it ? it.url : 'command' in it ? it.command : 'content' in it ? it.content : '') as string).toLowerCase();
       const desc = (it.notes ?? ('description' in it ? (it as any).description : '')).toLowerCase();
       const user = (('username' in it ? it.username : '') as string).toLowerCase();
-      return name.includes(q) || val.includes(q) || desc.includes(q) || user.includes(q) || it.categories.join(' ').toLowerCase().includes(q);
+      return name.includes(q) || val.includes(q) || desc.includes(q) || user.includes(q) || (it.categories ?? []).join(' ').toLowerCase().includes(q);
     });
   }, [items, typeF, catF, query]);
 

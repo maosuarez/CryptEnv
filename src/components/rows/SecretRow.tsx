@@ -19,9 +19,11 @@ interface Props {
 
 const BADGE_VISIBLE_MAX = 2;
 
-export function CatBadges({ names, cats }: { names: string[]; cats: Category[] }) {
+// `names` may be missing on items saved without categories by older builds.
+export function CatBadges({ names: rawNames, cats }: { names?: string[] | null; cats: Category[] }) {
   const [expanded, setExpanded] = useState(false);
   const { t } = useTranslation();
+  const names = rawNames ?? [];
 
   if (names.length === 0) return null;
 
@@ -142,7 +144,7 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
         <span className="flex-1 text-[13px] font-semibold font-mono text-tx overflow-hidden text-ellipsis whitespace-nowrap">
           {item.name}
         </span>
-        <CatBadges names={item.categories} cats={cats} />
+        <CatBadges names={item.categories ?? []} cats={cats} />
       </div>
       {/* Value row */}
       <div className="flex items-center gap-2 pl-5">

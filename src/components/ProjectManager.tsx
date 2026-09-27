@@ -16,7 +16,7 @@ import type {
 } from '../types';
 import {
   TEMPLATE_GROUPS, TEMPLATE_PLACEHOLDER, getTemplate, isValidEnvKey, mergeTemplateVars, normalizeEnvKey,
-  searchTemplates, templateCategories, templateLabels, templateString, type MergedVar,
+  searchTemplates, templateLabels, templateString, type MergedVar,
 } from '../data/projectTemplates';
 import { CAT_COLORS_PRESET } from '../store';
 
@@ -49,12 +49,46 @@ function reportError(e: unknown) {
 // can't).
 const ENV_PRESETS = ['production', 'local', 'test', 'staging'] as const;
 
-function EnvPresetOptions({ id }: { id: string }) {
+const CUSTOM_ENV = '__custom__';
+
+// Preset picker showing localized labels; "Custom…" reveals a free-text
+// field. Whatever is typed is lowercased so the stored name (and the
+// `.env.<name>` inject target) is always canonical lowercase ASCII.
+function EnvNameField({
+  value, onChange, allowDefault = false, className = '',
+}: { value: string; onChange: (v: string) => void; allowDefault?: boolean; className?: string }) {
   const { t } = useTranslation();
+  const isPreset = (ENV_PRESETS as readonly string[]).includes(value) || (allowDefault && value === '');
+  const [custom, setCustom] = useState(!isPreset);
+  const selectValue = custom ? CUSTOM_ENV : value;
   return (
-    <datalist id={id}>
-      {ENV_PRESETS.map((n) => <option key={n} value={n} label={t(`projects.envPresets.${n}`)} />)}
-    </datalist>
+    <div className={`flex items-center gap-2 ${className}`}>
+      <select
+        value={selectValue}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === CUSTOM_ENV) { setCustom(true); if (isPreset) onChange(''); return; }
+          setCustom(false);
+          onChange(v);
+        }}
+        aria-label={t('projects.environmentHeader')}
+        className="bg-raised border border-bd2 text-tx rounded-[3px] px-2 py-[7px] text-[12px] font-ui cursor-pointer outline-none focus:border-accent-d transition-colors"
+      >
+        {allowDefault && <option value="">{t('projects.envPresets.default')}</option>}
+        {ENV_PRESETS.map((n) => <option key={n} value={n}>{t(`projects.envPresets.${n}`)}</option>)}
+        <option value={CUSTOM_ENV}>{t('projects.envPresets.custom')}</option>
+      </select>
+      {custom && (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value.toLowerCase())}
+          placeholder="my-env"
+          autoFocus
+          className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
+        />
+      )}
+      <span className="text-[10px] font-mono text-tx3 truncate">.env.{value.trim() || (allowDefault ? 'default' : '…')}</span>
+    </div>
   );
 }
 
@@ -1083,12 +1117,12 @@ export function ProjectManager() {
   };
 
   // Re-picking templates rebuilds the variable list from scratch (edits are
-  // discarded) but only ever adds categories, never drops user-picked ones.
+  // discarded). Templates seed variables only — categories stay user-curated,
+  // so picking templates never creates vault categories.
   const handleTemplateSelect = (ids: string[]) => {
     setProjTemplateIds(ids);
     setProjTemplate(templateString(ids));
     setTemplateVars(toReviewVars(mergeTemplateVars(ids)));
-    setProjCategories((cur) => [...cur, ...templateCategories(ids).filter((c) => !cur.includes(c))]);
     setTemplateModal(false);
     setMode('project');
   };
@@ -1134,7 +1168,7 @@ export function ProjectManager() {
         description: projDescription || undefined,
         template:    templateString(projTemplateIds),
         categories:  projCategories,
-        initialEnvironment: projInitialEnv.trim() || undefined,
+        initialEnvironment: projInitialEnv.trim().toLowerCase() || undefined,
         vars:        templateVars.map((v) => ({ key: v.key, value: v.value })),
       });
       await refreshVaultItems();
@@ -1151,6 +1185,15 @@ export function ProjectManager() {
       setSaving(false);
     }
   };
+
+  // Save is only offered while name / description / categories differ from
+  // the persisted project.
+  const projectDirty = !!selectedProject && !isCreatingProj && (
+    projName.trim() !== selectedProject.name ||
+    projDescription.trim() !== (selectedProject.description ?? '') ||
+    projCategories.length !== selectedProject.categories.length ||
+    projCategories.some((c) => !selectedProject.categories.includes(c))
+  );
 
   const handleSaveProject = async () => {
     if (!isValidProjectName(projName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.projectNameRule') }), 'error'); return; }
@@ -1312,7 +1355,7 @@ export function ProjectManager() {
       await saveEnvironment({
         id:        selectedEnv?.id,
         projectId: selectedProject.id,
-        name:      envName.trim(),
+        name:      envName.trim().toLowerCase(),
         isDefault: envIsDefault,
         paths:     envPaths,
         vars:      envVars,
@@ -1412,7 +1455,7 @@ export function ProjectManager() {
                     {t('projects.filterHeader')}
                   </div>
                   {cats.length === 0 ? (
-                    <div className="px-3 py-2 text-xs text-tx3 italic">{t('projects.noTags')}</div>
+                    <div className="px-3 py-2 text-xs text-tx3 italic">{t('projects.noCategories')}</div>
                   ) : (
                     cats.map((cat) => {
                       const active = tagFilter.has(cat.name);
@@ -1540,25 +1583,9 @@ export function ProjectManager() {
               />
             </div>
             <div className="mb-3">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
+              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.categories')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.categoriesHint')}</span></div>
               <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
             </div>
-            <div className="mb-4">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.template')}</div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono text-tx2 bg-raised border border-bd2 rounded-[3px] px-2 py-[3px] truncate">
-                  {templateLabels(projTemplate).join(' · ')}
-                </span>
-                <button
-                  onClick={handleSaveProject}
-                  disabled={saving || !isValidProjectName(projName.trim())}
-                  className="ml-auto text-[10px] font-ui font-bold text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[3px] hover:text-tx transition-colors disabled:opacity-40"
-                >
-                  {t('common.save')}
-                </button>
-              </div>
-            </div>
-
             <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-2 pb-1.5 border-b border-bd flex items-center justify-between">
               <span>{t('projects.environmentsHeader')}</span>
               <button
@@ -1583,6 +1610,15 @@ export function ProjectManager() {
           <div className="px-4 py-3 border-t border-bd bg-bg shrink-0">
             <div className="flex items-center gap-2">
               <div className="flex-1" />
+              {projectDirty && (
+                <button
+                  onClick={handleSaveProject}
+                  disabled={saving || !isValidProjectName(projName.trim())}
+                  className="px-3 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent text-[#020504] border-none hover:opacity-90 transition-opacity disabled:opacity-40"
+                >
+                  {t('common.save')}
+                </button>
+              )}
               <button
                 onClick={() => setConfirmDelProj(true)}
                 className="px-3 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx3 hover:text-danger hover:border-danger transition-colors"
@@ -1642,7 +1678,7 @@ export function ProjectManager() {
                   />
                 </div>
                 <div className="mb-3">
-                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.categories')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.categoriesHint')}</span></div>
                   <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
                 </div>
                 <div className="mb-3">
@@ -1665,14 +1701,7 @@ export function ProjectManager() {
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
                     {t('projects.initialEnvironment')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.initialEnvironmentHint')}</span>
                   </div>
-                  <input
-                    value={projInitialEnv}
-                    onChange={(e) => setProjInitialEnv(e.target.value)}
-                    placeholder="default"
-                    list="env-presets-initial"
-                    className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
-                  />
-                  <EnvPresetOptions id="env-presets-initial" />
+                  <EnvNameField value={projInitialEnv} onChange={setProjInitialEnv} allowDefault />
                   {!initialEnvValid && (
                     <div className="text-[10px] font-mono text-danger mt-1">{t('projects.envNameRule')}</div>
                   )}
@@ -1689,14 +1718,7 @@ export function ProjectManager() {
                 </div>
 
                 <div className="mb-3 flex items-center gap-2">
-                  <input
-                    value={envName}
-                    onChange={(e) => setEnvName(e.target.value)}
-                    placeholder="production"
-                    list="env-presets"
-                    className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[13px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
-                  />
-                  <EnvPresetOptions id="env-presets" />
+                  <EnvNameField key={selectedEnv?.id ?? 'new'} value={envName} onChange={setEnvName} className="flex-1 min-w-0" />
                   <label className="flex items-center gap-1.5 text-[10px] font-mono text-tx3 shrink-0 cursor-pointer select-none">
                     <input
                       type="checkbox"

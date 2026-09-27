@@ -18,7 +18,7 @@ export function CategoryManager() {
   const [confirmDel, setConfirmDel] = useState<Category | null>(null);
   const [saved,      setSaved]      = useState(false);
 
-  const catCount = (name: string) => items.filter((it) => it.categories.includes(name)).length;
+  const catCount = (name: string) => items.filter((it) => (it.categories ?? []).includes(name)).length;
 
   const addCat = () => {
     const n = newName.trim();

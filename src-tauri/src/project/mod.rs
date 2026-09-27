@@ -289,7 +289,7 @@ pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, Stri
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .unwrap_or("default")
-        .to_string();
+        .to_ascii_lowercase();
     // Validate before any write so a bad name can't leave an env-less project.
     if is_new {
         validate_environment_name(&initial_env)?;
@@ -352,6 +352,9 @@ async fn ensure_no_case_collision(
 /// when that item is global. A local item can never silently gain a second
 /// owner through this path; the caller must mark it global first.
 pub async fn save_environment(db: &VaultDb, input: EnvironmentInput) -> Result<i64, String> {
+    // Canonical form is lowercase ASCII: the name becomes the `.env.<name>`
+    // filename and frameworks look it up case-sensitively.
+    let input = EnvironmentInput { name: input.name.to_ascii_lowercase(), ..input };
     // Order matters: reject a structurally invalid name (issue #7) before
     // spending a query on the collision check (issue #12).
     validate_environment_name(&input.name)?;
@@ -527,7 +530,7 @@ async fn resolve_and_inspect(
             // `api::mod`; issue #8 moved the resolution in here, so the
             // containment check has to live here too rather than at the
             // former call site.
-            let target = crate::fsguard::resolve_within(dir.as_str(), &format!(".env.{}", env.name))
+            let target = crate::fsguard::resolve_within(dir.as_str(), &format!(".env.{}", env.name.to_ascii_lowercase()))
                 .map_err(|e| format!("output_dir: {e}"))?;
             resolved.push((target.to_string_lossy().into_owned(), PathOrigin::CallerSupplied));
         }
@@ -1314,5 +1317,17 @@ mod tests {
         let vars = db.get_environment_vars(env_id).await.unwrap();
         assert_eq!(vars.len(), 1, "second save must replace, not append to, the var set");
         assert_eq!(vars[0].key, "B");
+    }
+
+    #[tokio::test]
+    async fn save_environment_stores_lowercase_name() {
+        let (_dir, db) = test_db().await;
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: "Production".to_string(), is_default: true,
+            paths: vec![], vars: vec![],
+        }).await.unwrap();
+        let env = db.get_environment(env_id).await.unwrap().unwrap();
+        assert_eq!(env.name, "production");
     }
 }

@@ -47,7 +47,7 @@
     "add": "ADD",
     "save": "SAVE CATEGORIES",
     "deleteTitle": "Delete \"{name}\"?",
-    "deleteBody": "This tag will be removed from all {n} items that use it."
+    "deleteBody": "This category will be removed from all {n} items that use it."
   },
   "common": {
     "back": "Back",
@@ -220,9 +220,9 @@
     "new": "NEW",
     "newProject": "NEW PROJECT",
     "searchPlaceholder": "Search project name or description…",
-    "filterTitle": "Filter by tag / language",
-    "filterHeader": "FILTER BY TAG / LANGUAGE",
-    "noTags": "No tags yet",
+    "filterTitle": "Filter by category",
+    "filterHeader": "FILTER BY CATEGORY",
+    "noCategories": "No categories yet",
     "clearFilter": "Clear filter",
     "emptyTitle": "No projects yet.",
     "emptyHint": "Group environments (production, local, test…) for a project.",
@@ -236,8 +236,8 @@
     "name": "NAME",
     "description": "DESCRIPTION",
     "descriptionPlaceholder": "Optional notes",
-    "tags": "TAGS",
-    "tagsHint": "language, stack, anything",
+    "categories": "CATEGORIES",
+    "categoriesHint": "vault categories: language, stack, anything",
     "template": "TEMPLATE",
     "change": "CHANGE",
     "environmentsHeader": "// ENVIRONMENTS",
@@ -387,7 +387,9 @@
       "production": "Production",
       "local": "Local",
       "test": "Test",
-      "staging": "Staging"
+      "staging": "Staging",
+      "custom": "Custom…",
+      "default": "Default"
     }
   },
   "receive": {
@@ -575,6 +577,10 @@
       "sqlCopied": "SQL copied",
       "required": "Both URL and Anon Key are required",
       "saved": "Relay settings saved"
+    },
+    "hotkey": {
+      "reset": "RESET TO DEFAULT",
+      "needsModifier": "Include Ctrl, Alt or Cmd plus a key"
     }
   },
   "setup": {
@@ -709,8 +715,8 @@
     "copyFilled": "COPY FILLED COMMAND",
     "noCategoriesHint": "No categories — click below to add",
     "removeTag": "Remove {name}",
-    "newTagPlaceholder": "New tag…",
-    "addTag": "+ TAG"
+    "newTagPlaceholder": "New category…",
+    "addTag": "+ CATEGORY"
   },
   "update": {
     "available": "Update available: v{version}",
