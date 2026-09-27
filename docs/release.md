@@ -8,24 +8,24 @@ How to cut a CryptEnv release so the in-app updater picks it up. Releases are bu
 2. If `version` there is newer, the app shows the update notice after the first unlock (or on **Settings → Check for updates**).
 3. INSTALL downloads the platform artifact and verifies it against the minisign `pubkey` embedded in the installed app. Signature mismatch → install refused.
 
-The embedded pubkey has been unchanged since v0.7.1, so every install from 0.7.1 onwards trusts the same key.
+The signing key was rotated in v1.0.2 (the original private key was lost). Installs from v1.0.2 onwards trust key ID `B6ED23EC84C1565B`; older installs trust the retired key and can never auto-update.
 
 ## 1. Before tagging
 
-- [ ] **Signing key matches the pubkey.** Installed apps only trust the `pubkey` in `tauri.conf.json` (key ID `91783FAD8C9A3FFD`). A different key in the `TAURI_SIGNING_PRIVATE_KEY` secret still builds and signs fine, but every client rejects the update. The release workflow now blocks this (see §3). To check a key locally before uploading it:
+- [ ] **Signing key matches the pubkey.** Installed apps only trust the `pubkey` in `tauri.conf.json` (key ID `B6ED23EC84C1565B`). A different key in the `TAURI_SIGNING_PRIVATE_KEY` secret still builds and signs fine, but every client rejects the update. The release workflow now blocks this (see §3). To check a key locally before uploading it:
 
   ```bash
   echo test > /tmp/probe.bin
-  pnpm tauri signer sign -f path/to/crypt-env.key -p "" /tmp/probe.bin
+  pnpm tauri signer sign -f ~/.tauri/cryptenv-updater.key -p "" /tmp/probe.bin
   node scripts/verify-updater-sig.mjs /tmp/probe.bin
   # OK   /tmp/probe.bin                                 → this key matches
-  # FAIL ... signed with key XXXX, but ... trusts 91783FAD8C9A3FFD → wrong key
+  # FAIL ... signed with key XXXX, but ... trusts B6ED23EC84C1565B → wrong key
   ```
 
   Then upload it (value = the key file content as-is, no password):
 
   ```bash
-  gh secret set TAURI_SIGNING_PRIVATE_KEY < path/to/crypt-env.key
+  gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/cryptenv-updater.key
   ```
 
   If the private key is lost, installed clients can never auto-update again. Keep an offline backup. Rotating to a new key means shipping one release manually (download + install) that embeds the new pubkey.
@@ -70,4 +70,4 @@ git push origin vX.Y.Z
 ## Known limitations
 
 - `latest.json` has entries only for `windows-x86_64`, `darwin-aarch64` and `linux-x86_64` (AppImage). Intel Macs and `.deb` installs don't auto-update; they need a manual download.
-- Releases up to and including v1.0.1 published a `latest.json` with empty signatures. Those clients can update once a correctly signed release is **Latest**, but only through **Settings → Check for updates**. The automatic notice starts with v1.0.2.
+- v1.0.1 and earlier embed the retired pubkey and never received valid signatures, so they can't update in-app. Users need to download and install v1.0.2 once; from v1.0.2 on, updates and the startup notice work automatically.
