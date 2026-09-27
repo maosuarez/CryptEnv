@@ -13,14 +13,57 @@ on:
 permissions:
   contents: write
 
+env:
+  # Tag push → the pushed tag; manual run → the `tag` input. Every job builds and
+  # publishes this ref, never the branch the workflow was dispatched from.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
+  # ─── WSL helper (static musl, bundled into the Windows installer) ────────────
+  build-wsl-helper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build crypt-env-setup
+        working-directory: src-tauri
+        run: cargo build --release -p crypt-env-setup --target x86_64-unknown-linux-musl
+
+      - name: Verify the helper is statically linked
+        working-directory: src-tauri
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/crypt-env-setup
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv -e 'not a dynamic executable' -e 'statically linked' -e 'linux-vdso'; then
+            echo "::error::crypt-env-setup is dynamically linked"; ldd "$BIN"; exit 1
+          fi
+
+      - name: Upload WSL helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-helper
+          if-no-files-found: error
+          path: src-tauri/target/x86_64-unknown-linux-musl/release/crypt-env-setup
+
   # ─── Windows ──────────────────────────────────────────────────────────────────
   build-windows:
+    needs: [build-wsl-helper]
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -45,11 +88,21 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
-      - name: Build Tauri app
+      - name: Download WSL helper
+        uses: actions/download-artifact@v4
+        with:
+          name: wsl-helper
+          path: wsl-helper
+
+      # Stages crypt-env / crypt-env-mcp as sidecars + the WSL helper as a
+      # resource, asserts the bundled CLI version equals the GUI version, then
+      # builds with tauri.windows-bundle.conf.json merged in.
+      - name: Build Tauri app (with CLI sidecars + WSL helper)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-        run: pnpm tauri build
+          CRYPTENV_WSL_HELPER: wsl-helper/crypt-env-setup
+        run: pnpm tauri:build:windows
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -69,6 +122,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -118,6 +173,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -179,6 +236,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download Windows artifacts
         uses: actions/download-artifact@v4
@@ -221,8 +280,8 @@ jobs:
 
       - name: Generate latest.json for updater
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
+          VERSION="${RELEASE_TAG#v}"
+          TAG="${RELEASE_TAG}"
           REPO="maosuarez/crypt-env"
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -277,10 +336,27 @@ jobs:
           print('All platform signatures present.')
           "
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      # The build signs with whatever TAURI_SIGNING_PRIVATE_KEY holds. Installed
+      # apps only accept the pubkey in tauri.conf.json, so a mismatched secret
+      # would publish updates every client rejects. Fail here instead.
+      - name: Verify updater signatures match tauri.conf.json pubkey
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          node scripts/verify-updater-sig.mjs \
+            "release/CryptEnv_${VERSION}_x64-setup.exe" \
+            "release/CryptEnv.app.tar.gz" \
+            "release/CryptEnv_${VERSION}_amd64.AppImage"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "CryptEnv ${{ github.ref_name }}"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "CryptEnv ${{ env.RELEASE_TAG }}"
           generate_release_notes: true
           body: |
             ## Installation
@@ -322,4 +398,4 @@ jobs:
             The main CryptEnv app must be running and unlocked. Generate an MCP token in **Settings → Integrations**.
           files: release/*
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
