@@ -1,6 +1,6 @@
 [package]
 name = "crypt-env-setup"
-version = "1.0.2"
+version = "1.0.3"
 description = "Shared `setup wsl` shell-configuration contract for the CryptEnv CLI"
 authors = ["maosuarez"]
 edition = "2021"

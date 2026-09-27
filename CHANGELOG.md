@@ -9,8 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.0.3] - 2026-09-27
+
 ### Added
 
+- **Managed `crypt-env` launcher shim for WSL**:
+  - The WSL configuration operation installs a managed launcher (`crypt-env`) inside configured distributions that forwards commands to the Windows-installed CLI binary with transparent exit code propagation, argument forwarding, and stdin/stdout streaming.
+  - Automatically isolates WSL-side client environment variables (`CRYPTENV_API_URL`, `CRYPTENV_CERT_PATH`, `CRYPTENV_TOKEN_PATH`) so the launcher targets the host vault correctly.
+  - Non-destructive PATH management: appends the launcher directory to `PATH` with lower precedence than any native Linux client.
+  - Works with standard WSL2 NAT networking without requiring mirrored networking (`networkingMode=mirrored`).
+  - Added launcher status reporting and reconfigure flow to Settings -> WSL Integration.
+- **Synced OpenSpec capability specifications**:
+  - Main capability specs synced into `openspec/specs/` (`cli`, `desktop-packaging`, `app-updater`, `wsl-integration`).
+  - Archived completed changes (`cli-remote-endpoint-config`, `windows-installer-cli-and-wsl-panel`, `startup-update-notice`, `wsl-crypt-env-shim`).
 - **Share a whole project via relay** (issue #4) — one send + one receive now carries a project's structure (environments, `isDefault`) *and* the decrypted values of every item they reference, for however many environments are selected, in a single encrypted relay round-trip. Previously the same outcome took an export-template + relay-send-per-environment workaround.
   - **Protocol**: `ProjectBundle`/`EnvironmentBundle`/`ProjectBundleVar` in `share/relay.rs` (`kind: "project"`, `version: 1`, checked on decrypt). Items are deduped by name and hoisted to the bundle root, so an item linked into 3 environments produces one bundled item, not three. Never carries `paths` (machine-specific, dropped) or a `literal` value field.
   - **REST**: `POST /projects/:id/relay/send` (body `{environment_ids}`), `POST /projects/relay/receive` (body `{code, passphrase, project_name_override?}`).
