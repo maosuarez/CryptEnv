@@ -165,5 +165,17 @@ export interface WslStatus {
   mirrored:  boolean;
 }
 
+/** Mirrors `cryptenv_setup::ActionReport` (snake_case — shared with the WSL helper's JSON). */
 export interface WslActionReport {
   env_file:         string;
+  env_file_changed: boolean;
+  rc_files:         string[];
+  backups:          string[];
+  marker_added:     boolean;
+  marker_removed:   boolean;
+}
+
+export interface WslError {
+  kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling';
+  message?: string;
+}
