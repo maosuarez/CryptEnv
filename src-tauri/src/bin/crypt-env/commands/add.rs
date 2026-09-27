@@ -135,7 +135,7 @@ pub fn run(args: AddArgs) -> Result<(), CliError> {
         }
     }
 
-    let base_items_url = resolved_scope.append_query(&format!("{}/items", client::api_base()?));
+    let base_items_url = resolved_scope.append_query(&format!("{}/items", client::api_base()));
 
     for (key, value) in &pairs {
         let items_url = if declined_keys.contains(key) {
