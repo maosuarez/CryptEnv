@@ -177,7 +177,8 @@
     "verifying": "VERIFICANDO…",
     "windowsHello": "DESBLOQUEAR CON WINDOWS HELLO",
     "keyDerivation": "derivación de clave",
-    "localOnly": "solo local"
+    "localOnly": "solo local",
+    "sessionLocked": "Bóveda bloqueada — desbloquéala para continuar"
   },
   "projectShare": {
     "titleSend": "COMPARTIR PROYECTO",
@@ -280,10 +281,25 @@
     },
     "confirmDeleteEverywhere": "\"{name}\" se usa en {n} proyectos ({names}). ¿Eliminarlo en todas partes?",
     "templateModal": {
-      "header": "// SELECCIONAR PLANTILLA",
+      "header": "// SELECCIONAR PLANTILLAS",
       "generic": "Genérica",
       "varsCount": "{n} vars",
-      "empty": "vacía"
+      "searchPlaceholder": "Buscar stacks: postgres, openai, spring…",
+      "selectedCount": "{n} seleccionadas",
+      "clear": "LIMPIAR",
+      "noResults": "// ninguna plantilla coincide",
+      "continue": "CONTINUAR",
+      "continueEmpty": "CONTINUAR VACÍO",
+      "groups": {
+        "runtime": "Runtimes y frameworks",
+        "database": "Bases de datos",
+        "cache": "Cachés y colas",
+        "ai": "APIs de IA",
+        "cloud": "Nube y DevOps",
+        "auth": "Autenticación",
+        "payments": "Pagos y mensajería",
+        "observability": "Observabilidad"
+      }
     },
     "deleteModal": {
       "title": "¿Eliminar \"{name}\"?",
@@ -328,7 +344,11 @@
       "keyPlaceholderImport": "KEY_NAME (por defecto, el nombre del elemento)",
       "back": "ATRÁS",
       "add": "AGREGAR",
-      "newHeader": "NUEVA VARIABLE"
+      "newHeader": "NUEVA VARIABLE",
+      "keyBadge": "VAR. ENTORNO",
+      "keyRequired": "obligatorio",
+      "keyPlaceholder": "KEY_NAME — ej. DATABASE_URL",
+      "keyHelp": "Se exporta como KEY_NAME=valor para todo tipo de ítem (secreto, credencial, comando, nota, enlace). Los campos de abajo son el valor."
     },
     "envCard": {
       "default": "predeterminado",
@@ -341,6 +361,27 @@
     },
     "card": {
       "noEnvironments": "aún sin entornos"
+    },
+    "review": {
+      "header": "VARIABLES ({n})",
+      "add": "AÑADIR",
+      "empty": "Sin variables — el entorno por defecto empezará vacío.",
+      "custom": "Personalizadas",
+      "reveal": "Mostrar valor",
+      "hide": "Ocultar valor",
+      "remove": "Eliminar variable",
+      "alsoIn": "también en {names}",
+      "invalidKey": "la clave debe cumplir [A-Z_][A-Z0-9_]*",
+      "duplicateKey": "clave duplicada",
+      "placeholderNote": "Cada variable se guarda como un secreto cifrado. Los valores vacíos se guardan como {placeholder}."
+    },
+    "initialEnvironment": "ENTORNO INICIAL",
+    "initialEnvironmentHint": "vacío = default",
+    "envPresets": {
+      "production": "Producción",
+      "local": "Local",
+      "test": "Pruebas",
+      "staging": "Staging"
     }
   },
   "receive": {
@@ -661,7 +702,9 @@
     "copiedBang": "¡COPIADO!",
     "copyFilled": "COPIAR COMANDO COMPLETO",
     "noCategoriesHint": "Sin categorías — haz clic abajo para agregar",
-    "removeTag": "Quitar {name}"
+    "removeTag": "Quitar {name}",
+    "newTagPlaceholder": "Nueva etiqueta…",
+    "addTag": "+ ETIQUETA"
   },
   "update": {
     "available": "Actualización disponible: v{version}",

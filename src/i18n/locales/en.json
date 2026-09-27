@@ -177,7 +177,8 @@
     "verifying": "VERIFYING…",
     "windowsHello": "UNLOCK WITH WINDOWS HELLO",
     "keyDerivation": "key derivation",
-    "localOnly": "local only"
+    "localOnly": "local only",
+    "sessionLocked": "Vault locked — unlock to continue"
   },
   "projectShare": {
     "titleSend": "SHARE PROJECT",
@@ -280,10 +281,25 @@
     },
     "confirmDeleteEverywhere": "\"{name}\" is used by {n} projects ({names}). Delete it everywhere?",
     "templateModal": {
-      "header": "// SELECT TEMPLATE",
+      "header": "// SELECT TEMPLATES",
       "generic": "Generic",
       "varsCount": "{n} vars",
-      "empty": "empty"
+      "searchPlaceholder": "Search stacks: postgres, openai, spring…",
+      "selectedCount": "{n} selected",
+      "clear": "CLEAR",
+      "noResults": "// no templates match",
+      "continue": "CONTINUE",
+      "continueEmpty": "CONTINUE EMPTY",
+      "groups": {
+        "runtime": "Runtimes & frameworks",
+        "database": "Databases",
+        "cache": "Caches & queues",
+        "ai": "AI APIs",
+        "cloud": "Cloud & DevOps",
+        "auth": "Auth",
+        "payments": "Payments & messaging",
+        "observability": "Observability"
+      }
     },
     "deleteModal": {
       "title": "Delete \"{name}\"?",
@@ -328,7 +344,11 @@
       "keyPlaceholderImport": "KEY_NAME (defaults to item name)",
       "back": "BACK",
       "add": "ADD",
-      "newHeader": "NEW VARIABLE"
+      "newHeader": "NEW VARIABLE",
+      "keyBadge": "ENV VAR",
+      "keyRequired": "required",
+      "keyPlaceholder": "KEY_NAME — e.g. DATABASE_URL",
+      "keyHelp": "Exported as KEY_NAME=value for every item type (secret, credential, command, note, link). The fields below are the value."
     },
     "envCard": {
       "default": "default",
@@ -341,6 +361,27 @@
     },
     "card": {
       "noEnvironments": "no environments yet"
+    },
+    "review": {
+      "header": "VARIABLES ({n})",
+      "add": "ADD",
+      "empty": "No variables — the default environment will start empty.",
+      "custom": "Custom",
+      "reveal": "Reveal value",
+      "hide": "Hide value",
+      "remove": "Remove variable",
+      "alsoIn": "also in {names}",
+      "invalidKey": "key must match [A-Z_][A-Z0-9_]*",
+      "duplicateKey": "duplicate key",
+      "placeholderNote": "Each variable becomes an encrypted secret. Empty values are stored as {placeholder}."
+    },
+    "initialEnvironment": "INITIAL ENVIRONMENT",
+    "initialEnvironmentHint": "blank = default",
+    "envPresets": {
+      "production": "Production",
+      "local": "Local",
+      "test": "Test",
+      "staging": "Staging"
     }
   },
   "receive": {
@@ -661,7 +702,9 @@
     "copiedBang": "COPIED!",
     "copyFilled": "COPY FILLED COMMAND",
     "noCategoriesHint": "No categories — click below to add",
-    "removeTag": "Remove {name}"
+    "removeTag": "Remove {name}",
+    "newTagPlaceholder": "New tag…",
+    "addTag": "+ TAG"
   },
   "update": {
     "available": "Update available: v{version}",
