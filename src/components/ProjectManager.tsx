@@ -8,7 +8,7 @@ import { useVaultStore, isVaultLockedError } from '../store';
 import { useProjectStore } from '../store/projectStore';
 import { useTranslation } from '../i18n';
 import {
-  ItemTypePicker, ItemTypeFields, emptyItemFields, validateItemFields,
+  ItemTypePicker, ItemTypeFields, emptyItemFields, validateItemFields, itemNameKey, Label, F,
   type ItemFieldsState,
 } from './itemFields/ItemTypeFields';
 import type {
@@ -506,7 +506,7 @@ function VarRow({
 
 // ─── AddVarPanel (create a project-scoped typed item, or import a global one) ──
 
-function AddVarPanel({
+export function AddVarPanel({
   project,
   globalItems,
   onAdded,
@@ -529,17 +529,55 @@ function AddVarPanel({
   const [showVal, setShowVal] = useState(false);
   const [saving, setSaving] = useState(false);
   const [importId, setImportId] = useState<number | null>(globalItems[0]?.id ?? null);
+  // 'new' mode: the vault name follows the KEY until edited by hand; picking a
+  // matching global secret links it instead of creating a new item.
+  const [nameTouched, setNameTouched] = useState(false);
+  const [linkedId, setLinkedId] = useState<number | null>(null);
+
+  const nameKey   = itemNameKey(type);
+  const vaultName = fields[nameKey];
+  const linked    = linkedId == null ? undefined : globalItems.find((i) => i.id === linkedId);
+  const matches   = useMemo(() => {
+    const q = vaultName.trim().toLowerCase();
+    if (!q || linked) return [];
+    return globalItems.filter((i) => i.name.toLowerCase().includes(q)).slice(0, 5);
+  }, [globalItems, vaultName, linked]);
+
+  const handleKeyChange = (v: string) => {
+    setKey(v);
+    if (!nameTouched && !linked) { set(nameKey, v); clearError(nameKey); }
+  };
+
+  const handleTypeChange = (ty: ItemType) => {
+    const carried = vaultName;
+    setType(ty);
+    setErrors({});
+    setFields((f) => ({ ...f, [itemNameKey(ty)]: carried }));
+  };
+
+  const pickExisting = (item: { id: number; name: string }) => {
+    setLinkedId(item.id);
+    if (!key.trim()) setKey(item.name);
+    setErrors({});
+  };
 
   const set = (k: keyof ItemFieldsState, v: string) => setFields((f) => ({ ...f, [k]: v }));
   const clearError = (k: string) => setErrors((r) => ({ ...r, [k]: '' }));
 
   const handleCreate = async () => {
     if (!key.trim()) { showToast(t('projects.toast.keyRequired'), 'error'); return; }
+    if (linked) {
+      onAdded({ id: -Date.now(), key: key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, ''), itemId: linked.id });
+      return;
+    }
     const e = validateItemFields(type, fields);
     if (Object.keys(e).length) { setErrors(e); return; }
     setSaving(true);
     try {
       const item = await createProjectItem(project.id, { ...fields, type, categories: [], isGlobal: false } as Omit<VaultItem, 'id' | 'created'>);
+      // The var row resolves its item from the vault store — refresh before
+      // linking, or the new row renders as "item missing" until a reload.
+      await refreshVaultItems();
       onAdded({ id: -Date.now(), key: key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, ''), itemId: item.id });
     } catch (err) {
       reportError(err);
@@ -622,22 +660,61 @@ function AddVarPanel({
         <input
           id="add-var-key"
           value={key}
-          onChange={(e) => setKey(e.target.value)}
+          onChange={(e) => handleKeyChange(e.target.value)}
           placeholder={t('projects.addVar.keyPlaceholder')}
           className="w-full bg-bg border border-accent-d text-tx font-mono text-[13px] font-semibold rounded-[3px] px-2 py-[6px] outline-none focus:border-accent"
         />
         <div className="text-[10px] text-tx3 font-mono mt-1">{t('projects.addVar.keyHelp')}</div>
       </div>
-      <ItemTypePicker type={type} onSelect={(ty) => { setType(ty); setErrors({}); }} />
-      <ItemTypeFields
-        type={type}
-        form={fields}
-        errors={errors}
-        showVal={showVal}
-        setShowVal={setShowVal}
-        set={set}
-        clearError={clearError}
-      />
+      <F>
+        <Label label={t('projects.addVar.vaultNameLabel')} err={errors[nameKey]} />
+        {linked ? (
+          <div className="flex items-center gap-2 border border-accent-d bg-accent-b rounded-[3px] px-[10px] py-2">
+            <Icon name="shield" size={11} />
+            <span className="flex-1 min-w-0 text-[12px] font-mono text-accent truncate">{linked.name}</span>
+            <button onClick={() => setLinkedId(null)} className="text-[10px] font-ui text-tx3 hover:text-tx transition-colors shrink-0">
+              {t('projects.addVar.unlinkExisting')}
+            </button>
+          </div>
+        ) : (
+          <input
+            value={vaultName}
+            onChange={(e) => { set(nameKey, e.target.value); setNameTouched(true); clearError(nameKey); }}
+            placeholder={t('projects.addVar.vaultNamePlaceholder')}
+            className={`w-full px-[10px] py-2 text-[12px] font-mono bg-raised border rounded-[3px] text-tx placeholder:text-tx3 outline-none focus:border-accent-d ${errors[nameKey] ? 'border-danger' : 'border-bd2'}`}
+          />
+        )}
+        <div className="text-[10px] text-tx3 font-mono mt-1">
+          {linked ? t('projects.addVar.linkedExisting') : t('projects.addVar.vaultNameHelp')}
+        </div>
+        {matches.length > 0 && (
+          <div className="mt-1.5 border border-bd2 rounded-[3px] bg-bg">
+            <div className="text-[9px] font-mono tracking-[0.1em] text-tx3 px-2 pt-1.5 pb-1">{t('projects.addVar.matchesHeader')}</div>
+            {matches.map((m) => (
+              <button key={m.id} onClick={() => pickExisting(m)}
+                className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-[11px] font-mono text-tx2 hover:bg-raised hover:text-accent transition-colors">
+                <Icon name="shield" size={10} />
+                <span className="truncate">{m.name}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </F>
+      {!linked && (
+        <>
+          <ItemTypePicker type={type} onSelect={handleTypeChange} />
+          <ItemTypeFields
+            type={type}
+            form={fields}
+            errors={errors}
+            showVal={showVal}
+            setShowVal={setShowVal}
+            set={set}
+            clearError={clearError}
+            hideName
+          />
+        </>
+      )}
       <div className="flex gap-2 mt-1">
         <button onClick={() => setMode('choose')} className="flex-1 py-2 rounded-[3px] text-[11px] font-ui text-tx2 border border-bd2 hover:text-tx transition-colors">
           {t('projects.addVar.back')}

@@ -345,10 +345,16 @@
       "back": "VOLTAR",
       "add": "ADICIONAR",
       "newHeader": "NOVA VARIÁVEL",
-      "keyBadge": "VAR. AMBIENTE",
+      "keyBadge": "NOME NO .env",
       "keyRequired": "obrigatório",
       "keyPlaceholder": "KEY_NAME — ex. DATABASE_URL",
-      "keyHelp": "Exportada como KEY_NAME=valor para todo tipo de item (segredo, credencial, comando, nota, link). Os campos abaixo são o valor."
+      "keyHelp": "Assim aparece no arquivo .env: KEY_NAME=valor. Os campos abaixo são o valor.",
+      "vaultNameLabel": "NOME NO COFRE",
+      "vaultNameHelp": "Como o item é salvo no cofre (segredos globais, CLI, busca). Digite para encontrar um segredo global existente e reutilizá-lo.",
+      "vaultNamePlaceholder": "ex. OpenAI — produção",
+      "matchesHeader": "SEGREDOS GLOBAIS EXISTENTES",
+      "linkedExisting": "Vinculando segredo global existente",
+      "unlinkExisting": "criar um novo"
     },
     "envCard": {
       "default": "padrão",

@@ -345,10 +345,16 @@
       "back": "ATRÁS",
       "add": "AGREGAR",
       "newHeader": "NUEVA VARIABLE",
-      "keyBadge": "VAR. ENTORNO",
+      "keyBadge": "NOMBRE EN .env",
       "keyRequired": "obligatorio",
       "keyPlaceholder": "KEY_NAME — ej. DATABASE_URL",
-      "keyHelp": "Se exporta como KEY_NAME=valor para todo tipo de ítem (secreto, credencial, comando, nota, enlace). Los campos de abajo son el valor."
+      "keyHelp": "Así aparece en el archivo .env: KEY_NAME=valor. Los campos de abajo son el valor.",
+      "vaultNameLabel": "NOMBRE EN LA BÓVEDA",
+      "vaultNameHelp": "Cómo se guarda el elemento en la bóveda (secretos globales, CLI, búsqueda). Escribe para buscar un secreto global existente y reutilizarlo.",
+      "vaultNamePlaceholder": "p. ej. OpenAI — producción",
+      "matchesHeader": "SECRETOS GLOBALES EXISTENTES",
+      "linkedExisting": "Vinculando secreto global existente",
+      "unlinkExisting": "crear uno nuevo"
     },
     "envCard": {
       "default": "predeterminado",

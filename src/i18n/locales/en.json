@@ -345,10 +345,16 @@
       "back": "BACK",
       "add": "ADD",
       "newHeader": "NEW VARIABLE",
-      "keyBadge": "ENV VAR",
+      "keyBadge": "NAME IN .env",
       "keyRequired": "required",
       "keyPlaceholder": "KEY_NAME — e.g. DATABASE_URL",
-      "keyHelp": "Exported as KEY_NAME=value for every item type (secret, credential, command, note, link). The fields below are the value."
+      "keyHelp": "How it appears in the .env file: KEY_NAME=value. The fields below are the value.",
+      "vaultNameLabel": "NAME IN THE VAULT",
+      "vaultNameHelp": "How the item is stored in the vault (global secrets, CLI, search). Type to find an existing global secret and reuse it.",
+      "vaultNamePlaceholder": "e.g. OpenAI — production",
+      "matchesHeader": "EXISTING GLOBAL SECRETS",
+      "linkedExisting": "Linking existing global secret",
+      "unlinkExisting": "create a new one instead"
     },
     "envCard": {
       "default": "default",

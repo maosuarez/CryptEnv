@@ -38,6 +38,10 @@ export interface ItemFieldsState {
   content:     string;
 }
 
+/** The field that holds an item's display name: `title` for links/notes, `name` otherwise. */
+export const itemNameKey = (type: ItemType): 'name' | 'title' =>
+  type === 'link' || type === 'note' ? 'title' : 'name';
+
 export const emptyItemFields = (): ItemFieldsState => ({
   name: '', value: '', url: '', username: '', password: '',
   title: '', description: '', command: '', shell: 'bash', content: '',
@@ -107,6 +111,7 @@ export function ItemTypeFields({
   setShowVal,
   set,
   clearError,
+  hideName = false,
 }: {
   type:       ItemType;
   form:       ItemFieldsState;
@@ -115,16 +120,20 @@ export function ItemTypeFields({
   setShowVal: (fn: (v: boolean) => boolean) => void;
   set:        (k: keyof ItemFieldsState, v: string) => void;
   clearError: (k: string) => void;
+  /** Skip the name/title input when the caller renders its own (see `itemNameKey`). */
+  hideName?:  boolean;
 }) {
   const { t } = useTranslation();
   if (type === 'secret') {
     return (
       <>
+        {!hideName && (
         <F>
           <Label label={t('itemFields.name')} err={errors.name} />
           <input value={form.name} onChange={(e) => { set('name', e.target.value); clearError('name'); }}
             placeholder={t('itemFields.phSecretName')} className={`${iBase(errors.name)} font-mono tracking-[0.04em]`} />
         </F>
+        )}
         <F>
           <Label label={t('itemFields.value')} err={errors.value} />
           <div className={`flex items-center border rounded-[3px] bg-raised ${errors.value ? 'border-danger' : 'border-bd2'}`}>
@@ -143,9 +152,9 @@ export function ItemTypeFields({
   if (type === 'credential') {
     return (
       <>
-        <F><Label label={t('itemFields.siteName')} err={errors.name} />
+        {!hideName && <F><Label label={t('itemFields.siteName')} err={errors.name} />
           <input value={form.name} onChange={(e) => { set('name', e.target.value); clearError('name'); }}
-            placeholder={t('itemFields.phSite')} className={iBase(errors.name)} /></F>
+            placeholder={t('itemFields.phSite')} className={iBase(errors.name)} /></F>}
         <F><Label label={t('itemFields.url')} />
           <input value={form.url} onChange={(e) => set('url', e.target.value)} placeholder="https://"
             className={`${iBase()} font-mono text-[11px]`} /></F>
@@ -167,9 +176,9 @@ export function ItemTypeFields({
   if (type === 'link') {
     return (
       <>
-        <F><Label label={t('itemFields.title')} err={errors.title} />
+        {!hideName && <F><Label label={t('itemFields.title')} err={errors.title} />
           <input value={form.title} onChange={(e) => { set('title', e.target.value); clearError('title'); }}
-            placeholder={t('itemFields.phLinkTitle')} className={iBase(errors.title)} /></F>
+            placeholder={t('itemFields.phLinkTitle')} className={iBase(errors.title)} /></F>}
         <F><Label label={t('itemFields.url')} err={errors.url} />
           <input value={form.url} onChange={(e) => { set('url', e.target.value); clearError('url'); }}
             placeholder="https://" className={`${iBase(errors.url)} font-mono text-[11px]`} /></F>
@@ -183,9 +192,9 @@ export function ItemTypeFields({
   if (type === 'command') {
     return (
       <>
-        <F><Label label={t('itemFields.name')} err={errors.name} />
+        {!hideName && <F><Label label={t('itemFields.name')} err={errors.name} />
           <input value={form.name} onChange={(e) => { set('name', e.target.value); clearError('name'); }}
-            placeholder={t('itemFields.phCommandName')} className={iBase(errors.name)} /></F>
+            placeholder={t('itemFields.phCommandName')} className={iBase(errors.name)} /></F>}
         <F>
           <Label label={t('itemFields.command')} err={errors.command} />
           <div className={`border rounded-[3px] bg-raised px-[10px] py-2 ${errors.command ? 'border-danger' : 'border-bd2'}`}>
@@ -222,9 +231,9 @@ export function ItemTypeFields({
   if (type === 'note') {
     return (
       <>
-        <F><Label label={t('itemFields.title')} err={errors.title} />
+        {!hideName && <F><Label label={t('itemFields.title')} err={errors.title} />
           <input value={form.title} onChange={(e) => { set('title', e.target.value); clearError('title'); }}
-            placeholder={t('itemFields.phNoteTitle')} className={iBase(errors.title)} /></F>
+            placeholder={t('itemFields.phNoteTitle')} className={iBase(errors.title)} /></F>}
         <F>
           <Label label={t('itemFields.content')} err={errors.content} />
           <div className={`border rounded-[3px] bg-raised px-[10px] py-2 ${errors.content ? 'border-danger' : 'border-bd2'}`}>
