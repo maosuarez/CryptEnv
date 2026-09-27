@@ -828,7 +828,7 @@ pub async fn vault_get_settings(
         .db
         .get_setting("hotkey")
         .await?
-        .unwrap_or_else(|| "Ctrl+Alt+Z".into());
+        .unwrap_or_else(|| crate::hotkey::default_hotkey().into());
     Ok(serde_json::json!({
         "autoLockTimeout": timeout.parse::<i64>().unwrap_or(5),
         "hotkey": hotkey
@@ -925,7 +925,13 @@ pub async fn vault_save_settings(
     #[allow(unused_variables)]
     relay_supabase_anon_key: Option<String>,
     state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
+    // Apply the shortcut first so an invalid or OS-conflicting combination is
+    // reported to the user and never persisted.
+    let hotkey = crate::hotkey::normalize_hotkey(&hotkey);
+    crate::hotkey::replace_app_hotkey(&app, &hotkey)?;
+
     let s = state.lock().await;
     s.db
         .set_setting("auto_lock_timeout", &auto_lock_timeout.to_string())
@@ -941,6 +947,17 @@ pub async fn vault_save_settings(
             s.db.set_setting("relay_supabase_anon_key", &key).await?;
         }
     }
+    Ok(())
+}
+
+/// Suppresses the global window-toggle shortcut while Settings records a new
+/// combination, so pressing the current hotkey doesn't hide the window.
+#[tauri::command]
+pub fn vault_pause_hotkey(
+    paused: bool,
+    hotkey_state: State<'_, crate::hotkey::HotkeyState>,
+) -> Result<(), String> {
+    hotkey_state.set_paused(paused);
     Ok(())
 }
 

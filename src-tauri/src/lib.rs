@@ -1,5 +1,4 @@
 use tauri::{Emitter, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 pub mod api;
 pub mod biometric;
@@ -8,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod envfile;
 pub mod fsguard;
+pub mod hotkey;
 pub mod mcp;
 pub mod project;
 pub mod share;
@@ -27,7 +27,7 @@ use vault::{
     vault_is_setup, vault_list, vault_lock, vault_parse_import, vault_save_categories, vault_save_item,
     vault_save_settings, vault_unlock, vault_wipe, vault_create_project_item, vault_set_item_global,
     vault_get_item_owners, vault_list_orphan_items, vault_prune_orphan_items, project_create_from_templates,
-    vault_touch, SharedState, VaultState,
+    vault_pause_hotkey, vault_touch, SharedState, VaultState,
 };
 use vault::share_commands::{
     share_cancel, share_confirm_fingerprint, share_export_file, share_import_file,
@@ -103,6 +103,10 @@ pub fn run() {
             let db = tauri::async_runtime::block_on(db::VaultDb::open(db_path_str))
                 .expect("failed to open vault database");
 
+            let saved_hotkey = tauri::async_runtime::block_on(db.get_setting("hotkey"))
+                .ok()
+                .flatten();
+
             let state: SharedState =
                 std::sync::Arc::new(tokio::sync::Mutex::new(VaultState::new(db)));
             app.manage(state.clone());
@@ -168,22 +172,16 @@ pub fn run() {
                 }
             });
 
-            let handle = app.handle().clone();
-            app.handle()
-                .global_shortcut()
-                .on_shortcut("Ctrl+Alt+Z", move |_app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        if let Some(window) = handle.get_webview_window("main") {
-                            let visible = window.is_visible().unwrap_or(false);
-                            if visible {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-                })?;
+            // Register the persisted hotkey; fall back to the platform default
+            // when unset or when the stored combination can't be registered.
+            app.manage(hotkey::HotkeyState::default());
+            let registered = saved_hotkey
+                .as_deref()
+                .map(|hk| hotkey::register_app_hotkey(app.handle(), hk))
+                .unwrap_or_else(|| Err("unset".into()));
+            if registered.is_err() {
+                hotkey::register_app_hotkey(app.handle(), hotkey::default_hotkey())?;
+            }
 
             Ok(())
         })
@@ -205,6 +203,7 @@ pub fn run() {
             vault_save_categories,
             vault_get_settings,
             vault_save_settings,
+            vault_pause_hotkey,
             vault_change_password,
             vault_wipe,
             vault_generate_mcp_token,
