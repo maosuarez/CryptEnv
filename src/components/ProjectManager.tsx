@@ -6,6 +6,7 @@ import { TagInput } from './ui/TagInput';
 import { ProjectShareModal, type ProjectShareMode } from './ProjectShareModal';
 import { useVaultStore } from '../store';
 import { useProjectStore } from '../store/projectStore';
+import { useTranslation } from '../i18n';
 import {
   ItemTypePicker, ItemTypeFields, emptyItemFields, validateItemFields,
   type ItemFieldsState,
@@ -49,15 +50,9 @@ const ENV_PRESETS = ['production', 'local', 'test', 'staging'];
 // the GUI, HTTP API, CLI, and an imported `.cryptenv-proj` template) — this
 // copy may drift from it over time and that is an accepted risk, not a bug.
 
-const ENV_NAME_RULE =
-  "must be 1-64 chars, start with a letter or digit, and contain only letters, digits, '.', '_' or '-'";
-
 function isValidEnvironmentName(name: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) && !name.endsWith('.') && !name.endsWith('-');
 }
-
-const PROJECT_NAME_RULE =
-  'must not contain \'/\', \'\\\', control characters, \':\', \'<\', \'>\', \'"\', \'|\', \'?\', \'*\', or start/end with \'.\' or whitespace (128 chars max)';
 
 function isValidProjectName(name: string): boolean {
   if (name.trim().length === 0 || name.length > 128) return false;
@@ -75,22 +70,25 @@ function TemplateModal({
   onSelect: (t: ProjectTemplate) => void;
   onClose:  () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
       <div className="w-full max-w-sm bg-surface border border-bd rounded-[4px] p-4">
         <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.09em] mb-3">
-          // SELECT TEMPLATE
+          {t('projects.templateModal.header')}
         </div>
         <div className="grid grid-cols-2 gap-2">
-          {TEMPLATES.map((t) => (
+          {TEMPLATES.map((tpl) => (
             <button
-              key={t.id}
-              onClick={() => onSelect(t.id)}
+              key={tpl.id}
+              onClick={() => onSelect(tpl.id)}
               className="p-3 bg-raised border border-bd2 rounded-[3px] text-left hover:border-accent-d hover:text-accent transition-colors group"
             >
-              <div className="text-[12px] font-semibold text-tx group-hover:text-accent font-ui">{t.label}</div>
+              <div className="text-[12px] font-semibold text-tx group-hover:text-accent font-ui">
+                {tpl.id === 'generic' ? t('projects.templateModal.generic') : tpl.label}
+              </div>
               <div className="text-[10px] text-tx3 font-mono mt-0.5">
-                {t.vars.length > 0 ? `${t.vars.length} vars` : 'empty'}
+                {tpl.vars.length > 0 ? t('projects.templateModal.varsCount', { n: tpl.vars.length }) : t('projects.templateModal.empty')}
               </div>
             </button>
           ))}
@@ -99,7 +97,7 @@ function TemplateModal({
           onClick={onClose}
           className="mt-3 w-full py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
         >
-          CANCEL
+          {t('common.cancel')}
         </button>
       </div>
     </div>
@@ -117,12 +115,13 @@ function DeleteProjectModal({
   onCancel:  () => void;
   onConfirm: () => Promise<void>;
 }) {
+  const { t } = useTranslation();
   const previewDelete = useProjectStore((s) => s.previewDelete);
   const [impact, setImpact]   = useState<ProjectDeleteImpact | null>(null);
   const [typed, setTyped]     = useState('');
   const [deleting, setDeleting] = useState(false);
 
-  const required = `delete ${project.name}`;
+  const required = t('projects.deleteModal.confirmPhrase', { name: project.name });
   const matches = typed.trim().toLowerCase() === required.toLowerCase();
 
   useEffect(() => {
@@ -132,24 +131,24 @@ function DeleteProjectModal({
   return (
     <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
       <div className="w-full max-w-sm bg-surface border border-danger rounded-[4px] p-4">
-        <div className="text-[14px] font-bold text-tx mb-2">Delete "{project.name}"?</div>
+        <div className="text-[14px] font-bold text-tx mb-2">{t('projects.deleteModal.title', { name: project.name })}</div>
 
         {impact ? (
           <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">
-            This removes <strong className="text-tx">{impact.environments}</strong> environment{impact.environments !== 1 ? 's' : ''}
+            {t('projects.deleteModal.removesPrefix')}<strong className="text-tx">{impact.environments}</strong>{t(impact.environments === 1 ? 'projects.deleteModal.envWord_one' : 'projects.deleteModal.envWord_other')}
             {impact.itemsDeleted > 0 && (
-              <> and permanently deletes <strong className="text-danger">{impact.itemsDeleted}</strong> local secret{impact.itemsDeleted !== 1 ? 's' : ''}</>
-            )}.
+              <>{t('projects.deleteModal.deletesPrefix')}<strong className="text-danger">{impact.itemsDeleted}</strong>{t(impact.itemsDeleted === 1 ? 'projects.deleteModal.localWord_one' : 'projects.deleteModal.localWord_other')}</>
+            )}{t('projects.deleteModal.period')}
             {impact.itemsOrphaned > 0 && (
-              <> <strong className="text-accent">{impact.itemsOrphaned}</strong> global secret{impact.itemsOrphaned !== 1 ? 's' : ''} will be preserved (unowned) in Global Secrets.</>
+              <>{' '}<strong className="text-accent">{impact.itemsOrphaned}</strong>{t(impact.itemsOrphaned === 1 ? 'projects.deleteModal.preserved_one' : 'projects.deleteModal.preserved_other')}</>
             )}
           </div>
         ) : (
-          <div className="text-[11px] text-tx3 mb-3 font-mono">Calculating impact…</div>
+          <div className="text-[11px] text-tx3 mb-3 font-mono">{t('projects.deleteModal.calculating')}</div>
         )}
 
         <div className="text-[11px] text-tx3 mb-1">
-          Type <span className="font-mono text-tx">{required}</span> to confirm:
+          {t('projects.deleteModal.typePrefix')}<span className="font-mono text-tx">{required}</span>{t('projects.deleteModal.typeSuffix')}
         </div>
         <input
           value={typed}
@@ -161,14 +160,14 @@ function DeleteProjectModal({
         <div className="flex gap-2">
           <button onClick={onCancel}
             className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
-            CANCEL
+            {t('common.cancel')}
           </button>
           <button
             onClick={async () => { setDeleting(true); try { await onConfirm(); } finally { setDeleting(false); } }}
             disabled={!matches || deleting}
             className="flex-1 py-2 bg-danger border-none rounded-[3px] text-white text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
           >
-            {deleting ? 'DELETING…' : 'DELETE'}
+            {deleting ? t('projects.deleteModal.deleting') : t('common.delete')}
           </button>
         </div>
       </div>
@@ -191,17 +190,19 @@ function InjectConfirmModal({
   onCancel:  () => void;
   onConfirm: () => Promise<void>;
 }) {
+  const { t } = useTranslation();
   const [writing, setWriting] = useState(false);
+  const one = foreign.length === 1;
 
   return (
     <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
       <div className="w-full max-w-sm bg-surface border border-accent-d rounded-[4px] p-4">
         <div className="text-[14px] font-bold text-tx mb-2">
-          Overwrite existing file{foreign.length !== 1 ? 's' : ''}?
+          {t(one ? 'projects.injectModal.title_one' : 'projects.injectModal.title_other')}
         </div>
         <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">
-          The path{foreign.length !== 1 ? 's below are' : ' below is'} not managed by crypt-env.
-          A <span className="font-mono text-tx">.bak</span> copy of the current contents is kept before writing.
+          {t(one ? 'projects.injectModal.notManaged_one' : 'projects.injectModal.notManaged_other')}
+          {' '}{t('projects.injectModal.bakPrefix')}<span className="font-mono text-tx">.bak</span>{t('projects.injectModal.bakSuffix')}
         </div>
         <ul className="mb-3 max-h-32 overflow-y-auto space-y-1">
           {foreign.map((p) => (
@@ -213,14 +214,14 @@ function InjectConfirmModal({
         <div className="flex gap-2">
           <button onClick={onCancel}
             className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
-            CANCEL
+            {t('common.cancel')}
           </button>
           <button
             onClick={async () => { setWriting(true); try { await onConfirm(); } finally { setWriting(false); } }}
             disabled={writing}
             className="flex-1 py-2 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
           >
-            {writing ? 'WRITING…' : 'OVERWRITE'}
+            {writing ? t('projects.injectModal.writing') : t('projects.injectModal.overwrite')}
           </button>
         </div>
       </div>
@@ -250,12 +251,13 @@ function VarRow({
   onUnlink:            () => void;
   onDeleteEverywhere:  () => void;
 }) {
+  const { t } = useTranslation();
   const [reveal, setReveal] = useState(false);
 
   if (!item) {
     return (
       <div className="py-2 border-b border-bd flex items-center gap-2">
-        <span className="flex-1 text-[11px] font-mono text-danger truncate">{v.key} — item missing</span>
+        <span className="flex-1 text-[11px] font-mono text-danger truncate">{v.key} — {t('projects.varRow.itemMissing')}</span>
         <button onClick={onUnlink} className="text-tx3 hover:text-danger transition-colors shrink-0">
           <Icon name="trash" size={13} />
         </button>
@@ -272,7 +274,7 @@ function VarRow({
         </span>
         {item.isGlobal && (
           <span className="text-[9px] font-mono text-accent bg-accent-b border border-accent-d px-1.5 py-[1px] rounded-[2px] shrink-0">
-            global
+            {t('projects.varRow.global')}
           </span>
         )}
       </div>
@@ -283,11 +285,11 @@ function VarRow({
             <Icon name={reveal ? 'eyeOff' : 'eye'} size={12} />
           </button>
         )}
-        <button onClick={onUnlink} title="Remove from this environment"
+        <button onClick={onUnlink} title={t('projects.varRow.unlink')}
           className="text-tx3 hover:text-tx transition-colors shrink-0 opacity-0 group-hover:opacity-100">
           <Icon name="close" size={12} />
         </button>
-        <button onClick={onDeleteEverywhere} title="Delete item everywhere"
+        <button onClick={onDeleteEverywhere} title={t('projects.varRow.deleteEverywhere')}
           className="text-tx3 hover:text-danger transition-colors shrink-0 opacity-0 group-hover:opacity-100">
           <Icon name="trash" size={12} />
         </button>
@@ -309,6 +311,7 @@ function AddVarPanel({
   onAdded:     (v: EnvironmentVar) => void;
   onCancel:    () => void;
 }) {
+  const { t } = useTranslation();
   const showToast        = useVaultStore((s) => s.showToast);
   const createProjectItem = useProjectStore((s) => s.createProjectItem);
 
@@ -325,7 +328,7 @@ function AddVarPanel({
   const clearError = (k: string) => setErrors((r) => ({ ...r, [k]: '' }));
 
   const handleCreate = async () => {
-    if (!key.trim()) { showToast('Key is required', 'error'); return; }
+    if (!key.trim()) { showToast(t('projects.toast.keyRequired'), 'error'); return; }
     const e = validateItemFields(type, fields);
     if (Object.keys(e).length) { setErrors(e); return; }
     setSaving(true);
@@ -340,7 +343,7 @@ function AddVarPanel({
   };
 
   const handleImport = () => {
-    if (importId == null) { showToast('Pick a global secret first', 'error'); return; }
+    if (importId == null) { showToast(t('projects.toast.pickGlobalFirst'), 'error'); return; }
     const found = globalItems.find((i) => i.id === importId);
     const derivedKey = key.trim() || found?.name || '';
     onAdded({ id: -Date.now(), key: derivedKey.toUpperCase().replace(/[^A-Z0-9_]/g, ''), itemId: importId });
@@ -349,20 +352,20 @@ function AddVarPanel({
   if (mode === 'choose') {
     return (
       <div className="border border-bd2 rounded-[3px] p-3 mb-2 bg-raised">
-        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">ADD VARIABLE</div>
+        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">{t('projects.addVar.header')}</div>
         <div className="flex gap-2">
           <button onClick={() => setMode('new')}
             className="flex-1 flex items-center justify-center gap-1 py-2 rounded-[3px] text-[11px] font-bold font-ui text-accent border border-accent-d hover:bg-accent-b transition-colors">
-            <Icon name="plus" size={11} />NEW ITEM
+            <Icon name="plus" size={11} />{t('projects.addVar.newItem')}
           </button>
           <button onClick={() => setMode('import')} disabled={globalItems.length === 0}
-            title={globalItems.length === 0 ? 'No global secrets yet' : undefined}
+            title={globalItems.length === 0 ? t('projects.addVar.noGlobals') : undefined}
             className="flex-1 flex items-center justify-center gap-1 py-2 rounded-[3px] text-[11px] font-bold font-ui text-tx2 border border-bd2 hover:text-tx transition-colors disabled:opacity-40">
-            <Icon name="shield" size={11} />IMPORT GLOBAL
+            <Icon name="shield" size={11} />{t('projects.addVar.importGlobal')}
           </button>
         </div>
         <button onClick={onCancel} className="w-full mt-2 text-[10px] font-ui text-tx3 hover:text-tx transition-colors">
-          cancel
+          {t('projects.addVar.cancel')}
         </button>
       </div>
     );
@@ -371,7 +374,7 @@ function AddVarPanel({
   if (mode === 'import') {
     return (
       <div className="border border-bd2 rounded-[3px] p-3 mb-2 bg-raised">
-        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">IMPORT GLOBAL SECRET</div>
+        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">{t('projects.addVar.importHeader')}</div>
         <div className="mb-2">
           <select
             value={importId ?? ''}
@@ -384,15 +387,15 @@ function AddVarPanel({
         <input
           value={key}
           onChange={(e) => setKey(e.target.value)}
-          placeholder="KEY_NAME (defaults to item name)"
+          placeholder={t('projects.addVar.keyPlaceholderImport')}
           className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-2 py-[6px] outline-none focus:border-accent-d mb-2"
         />
         <div className="flex gap-2">
           <button onClick={() => setMode('choose')} className="flex-1 py-2 rounded-[3px] text-[11px] font-ui text-tx2 border border-bd2 hover:text-tx transition-colors">
-            BACK
+            {t('projects.addVar.back')}
           </button>
           <button onClick={handleImport} className="flex-1 py-2 rounded-[3px] text-[11px] font-bold font-ui text-accent border border-accent-d hover:bg-accent-b transition-colors">
-            ADD
+            {t('projects.addVar.add')}
           </button>
         </div>
       </div>
@@ -402,14 +405,14 @@ function AddVarPanel({
   // mode === 'new'
   return (
     <div className="border border-bd2 rounded-[3px] p-3 mb-2 bg-raised">
-      <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">NEW VARIABLE</div>
+      <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">{t('projects.addVar.newHeader')}</div>
       <input
         value={key}
         onChange={(e) => setKey(e.target.value)}
         placeholder="KEY_NAME"
         className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-2 py-[6px] outline-none focus:border-accent-d mb-2"
       />
-      <ItemTypePicker type={type} onSelect={(t) => { setType(t); setErrors({}); }} />
+      <ItemTypePicker type={type} onSelect={(ty) => { setType(ty); setErrors({}); }} />
       <ItemTypeFields
         type={type}
         form={fields}
@@ -421,10 +424,10 @@ function AddVarPanel({
       />
       <div className="flex gap-2 mt-1">
         <button onClick={() => setMode('choose')} className="flex-1 py-2 rounded-[3px] text-[11px] font-ui text-tx2 border border-bd2 hover:text-tx transition-colors">
-          BACK
+          {t('projects.addVar.back')}
         </button>
         <button onClick={handleCreate} disabled={saving} className="flex-1 py-2 rounded-[3px] text-[11px] font-bold font-ui text-accent border border-accent-d hover:bg-accent-b transition-colors disabled:opacity-40">
-          {saving ? 'SAVING…' : 'ADD'}
+          {saving ? t('common.saving') : t('projects.addVar.add')}
         </button>
       </div>
     </div>
@@ -456,6 +459,7 @@ async function refreshVaultItems() {
 // ─── ProjectCard (list view) ───────────────────────────────────────────────────
 
 function ProjectCard({ project, cats, onOpen }: { project: Project; cats: Category[]; onOpen: () => void }) {
+  const { t } = useTranslation();
   const envNames = project.environments.map((e) => e.name);
   const tagColor = (name: string) => cats.find((c) => c.name === name)?.color;
   return (
@@ -471,7 +475,7 @@ function ProjectCard({ project, cats, onOpen }: { project: Project; cats: Catego
       </div>
       <div className="flex items-center gap-1 mb-1.5 flex-wrap min-h-[18px]">
         {envNames.length === 0 ? (
-          <span className="text-[10px] font-mono text-tx3 italic">no environments yet</span>
+          <span className="text-[10px] font-mono text-tx3 italic">{t('projects.card.noEnvironments')}</span>
         ) : (
           envNames.map((n) => (
             <span key={n} className="text-[10px] font-mono px-1.5 py-[1px] bg-bg border border-bd2 text-tx3 rounded-[2px] truncate">
@@ -505,6 +509,7 @@ function EnvironmentCard({
   onOpen:   () => void;
   onInject: (id: number) => Promise<InjectResult>;
 }) {
+  const { t } = useTranslation();
   const [injectState, setInjectState] = useState<'idle' | 'ok' | 'err'>('idle');
 
   const chips     = env.vars.slice(0, 4);
@@ -539,14 +544,14 @@ function EnvironmentCard({
         <span className="flex-1 text-[13px] font-semibold text-tx font-ui truncate">{env.name}</span>
         {env.isDefault && (
           <span className="text-[9px] font-mono text-accent bg-accent-b border border-accent-d px-1.5 py-[1px] rounded-[2px] uppercase shrink-0">
-            default
+            {t('projects.envCard.default')}
           </span>
         )}
       </div>
 
       <div className="flex items-center gap-1 mb-2 flex-wrap min-h-[18px]">
         {env.vars.length === 0 ? (
-          <span className="text-[10px] font-mono text-tx3 italic">no variables yet</span>
+          <span className="text-[10px] font-mono text-tx3 italic">{t('projects.envCard.noVariables')}</span>
         ) : (
           <>
             {chips.map((v) => (
@@ -561,12 +566,12 @@ function EnvironmentCard({
 
       <div className="flex items-center gap-2">
         <span className="flex-1 text-[10px] font-mono text-tx3 truncate">
-          {firstPath ? truncatePath(firstPath) : <span className="opacity-50">no path configured</span>}
+          {firstPath ? truncatePath(firstPath) : <span className="opacity-50">{t('projects.envCard.noPath')}</span>}
         </span>
         <button
           onClick={handleInjectClick}
           disabled={!canInject || injectState !== 'idle'}
-          title={!canInject ? 'Set a path and add variables first' : undefined}
+          title={!canInject ? t('projects.envCard.injectDisabled') : undefined}
           className={[
             'shrink-0 text-[9px] font-mono font-bold px-2 py-[3px] rounded-[2px] border transition-colors',
             injectState === 'ok'
@@ -578,7 +583,7 @@ function EnvironmentCard({
               : 'border-bd text-tx3 opacity-40 cursor-not-allowed',
           ].join(' ')}
         >
-          {injectState === 'ok' ? '✓ injected' : injectState === 'err' ? '✗ failed' : 'INJECT ▶'}
+          {injectState === 'ok' ? t('projects.envCard.injected') : injectState === 'err' ? t('projects.envCard.failed') : t('projects.envCard.inject')}
         </button>
       </div>
     </button>
@@ -590,6 +595,7 @@ function EnvironmentCard({
 type Mode = 'projects' | 'project' | 'environment';
 
 export function ProjectManager() {
+  const { t } = useTranslation();
   const go             = useVaultStore((s) => s.go);
   const showToast      = useVaultStore((s) => s.showToast);
   const items          = useVaultStore((s) => s.items);
@@ -776,14 +782,14 @@ export function ProjectManager() {
     setTemplateModal(true);
   };
 
-  const handleTemplateSelect = (t: ProjectTemplate) => {
-    setProjTemplate(t);
+  const handleTemplateSelect = (tpl: ProjectTemplate) => {
+    setProjTemplate(tpl);
     setTemplateModal(false);
     setMode('project');
   };
 
   const handleSaveProject = async () => {
-    if (!isValidProjectName(projName.trim())) { showToast(`Name ${PROJECT_NAME_RULE}`, 'error'); return; }
+    if (!isValidProjectName(projName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.projectNameRule') }), 'error'); return; }
     setSaving(true);
     try {
       const id = await saveProject({
@@ -798,7 +804,7 @@ export function ProjectManager() {
         setIsCreatingProj(false);
         openProject(fresh);
       }
-      showToast('Project saved');
+      showToast(t('projects.toast.projectSaved'));
     } catch (e) {
       showToast(String(e), 'error');
     } finally {
@@ -812,14 +818,14 @@ export function ProjectManager() {
     await refreshVaultItems();
     setConfirmDelProj(false);
     goToProjects();
-    showToast('Project deleted');
+    showToast(t('projects.toast.projectDeleted'));
   };
 
   const handleExportProject = async () => {
     if (!selectedProject) return;
     try {
       await invoke('project_export', { projectId: selectedProject.id });
-      showToast('Template saved');
+      showToast(t('projects.toast.templateSaved'));
     } catch (e) {
       if (String(e) !== 'cancelled') showToast(String(e), 'error');
     }
@@ -835,7 +841,7 @@ export function ProjectManager() {
         template:    imported.template,
         categories:  [],
       });
-      showToast(`Imported '${imported.name}' — add environments, paths and variables next`);
+      showToast(t('projects.toast.imported', { name: imported.name }));
       const fresh = useProjectStore.getState().projects.find((p) => p.id === projectId);
       if (fresh) openProject(fresh);
     } catch (e) {
@@ -918,7 +924,7 @@ export function ProjectManager() {
         const owners = await getItemOwners(item.id);
         if (owners.length > 1) {
           const names = owners.map((o) => o.projectName).join(', ');
-          if (!window.confirm(`"${('name' in item ? item.name : (item as any).title) ?? v.key}" is used by ${owners.length} projects (${names}). Delete it everywhere?`)) {
+          if (!window.confirm(t('projects.confirmDeleteEverywhere', { name: ('name' in item ? item.name : (item as any).title) ?? v.key, n: owners.length, names }))) {
             return;
           }
         }
@@ -928,7 +934,7 @@ export function ProjectManager() {
       await invoke('vault_delete_item', { id: v.itemId });
       await refreshVaultItems();
       setEnvVars((prev) => prev.filter((x) => x.itemId !== v.itemId));
-      showToast('Item deleted');
+      showToast(t('projects.toast.itemDeleted'));
     } catch (e) {
       showToast(String(e), 'error');
     }
@@ -936,7 +942,7 @@ export function ProjectManager() {
 
   const handleSaveEnvironment = async () => {
     if (!selectedProject) return;
-    if (!isValidEnvironmentName(envName.trim())) { showToast(`Name ${ENV_NAME_RULE}`, 'error'); return; }
+    if (!isValidEnvironmentName(envName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.envNameRule') }), 'error'); return; }
     setSaving(true);
     try {
       await saveEnvironment({
@@ -949,7 +955,7 @@ export function ProjectManager() {
       });
       await refreshVaultItems();
       backToProject();
-      showToast('Environment saved');
+      showToast(t('projects.toast.environmentSaved'));
     } catch (e) {
       showToast(String(e), 'error');
     } finally {
@@ -962,7 +968,7 @@ export function ProjectManager() {
     try {
       await removeEnvironment(selectedEnv.id);
       backToProject();
-      showToast('Environment deleted');
+      showToast(t('projects.toast.environmentDeleted'));
     } catch (e) {
       showToast(String(e), 'error');
     }
@@ -970,14 +976,14 @@ export function ProjectManager() {
 
   const handleInjectEnvironment = async () => {
     if (!selectedEnv) return;
-    if (envPaths.length === 0) { showToast('Add at least one path before injecting', 'error'); return; }
+    if (envPaths.length === 0) { showToast(t('projects.toast.addPathFirst'), 'error'); return; }
     setInjecting(true);
     try {
       const result = await runInject(selectedEnv.id);
-      const pathLabel = result.paths.length === 1 ? result.paths[0] : `${result.paths.length} paths`;
-      let msg = `Injected ${result.written.length} variable${result.written.length !== 1 ? 's' : ''} → ${pathLabel}`;
+      const pathLabel = result.paths.length === 1 ? result.paths[0] : t('projects.toast.pathsCount', { n: result.paths.length });
+      let msg = t(result.written.length === 1 ? 'projects.toast.injected_one' : 'projects.toast.injected_other', { n: result.written.length, target: pathLabel });
       if (result.unmanagedPaths.length > 0) {
-        msg += ` (warning: ${result.unmanagedPaths.length} unmanaged path${result.unmanagedPaths.length !== 1 ? 's' : ''} written, backup kept)`;
+        msg += t(result.unmanagedPaths.length === 1 ? 'projects.toast.unmanaged_one' : 'projects.toast.unmanaged_other', { n: result.unmanagedPaths.length });
       }
       showToast(msg);
     } catch (e) {
@@ -995,24 +1001,24 @@ export function ProjectManager() {
       {mode === 'projects' && !isCreatingProj && (
         <>
           <div className="px-3.5 py-[9px] border-b border-bd flex items-center gap-[10px] shrink-0">
-            <div className="flex-1 text-[13px] font-semibold text-tx">Projects</div>
+            <div className="flex-1 text-[13px] font-semibold text-tx">{t('projects.title')}</div>
             <button
               onClick={handleImportProject}
               className="text-[11px] font-bold font-ui text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[4px] hover:text-tx transition-colors"
             >
-              LOAD TEMPLATE
+              {t('projects.loadTemplate')}
             </button>
             <button
               onClick={() => setShareModalMode('receive')}
               className="text-[11px] font-bold font-ui text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[4px] hover:text-tx transition-colors whitespace-nowrap"
             >
-              RECEIVE PROJECT
+              {t('projects.receiveProject')}
             </button>
             <button
               onClick={handleNewProject}
               className="flex items-center gap-1 text-[11px] font-bold font-ui text-accent border border-accent-d rounded-[3px] px-2.5 py-[4px] hover:bg-accent-b transition-colors"
             >
-              <Icon name="plus" size={12} />NEW
+              <Icon name="plus" size={12} />{t('projects.new')}
             </button>
           </div>
 
@@ -1022,13 +1028,13 @@ export function ProjectManager() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search project name or description…"
+              placeholder={t('projects.searchPlaceholder')}
               className="flex-1 text-[13px] text-tx font-ui bg-transparent outline-none placeholder:text-tx3"
             />
             <div className="relative">
               <button
                 onClick={() => setTagOpen((v) => !v)}
-                title="Filter by tag / language"
+                title={t('projects.filterTitle')}
                 className={[
                   'flex items-center justify-center w-6 h-6 rounded-[3px] transition',
                   tagFilter.size > 0 ? 'text-accent bg-accent-b hover:opacity-80' : 'text-tx3 hover:text-tx hover:bg-raised',
@@ -1039,10 +1045,10 @@ export function ProjectManager() {
               {tagOpen && (
                 <div className="absolute right-0 top-8 z-50 min-w-[180px] bg-bg border border-bd rounded-[3px] shadow-lg py-1 flex flex-col">
                   <div className="px-3 py-1.5 text-[0.6rem] font-mono text-tx3 tracking-[0.1em] border-b border-bd">
-                    FILTER BY TAG / LANGUAGE
+                    {t('projects.filterHeader')}
                   </div>
                   {cats.length === 0 ? (
-                    <div className="px-3 py-2 text-xs text-tx3 italic">No tags yet</div>
+                    <div className="px-3 py-2 text-xs text-tx3 italic">{t('projects.noTags')}</div>
                   ) : (
                     cats.map((cat) => {
                       const active = tagFilter.has(cat.name);
@@ -1070,7 +1076,7 @@ export function ProjectManager() {
                       <div className="border-t border-bd mt-1" />
                       <button onClick={() => setTagFilter(new Set())}
                         className="flex items-center gap-2 px-3 py-1.5 text-[11px] font-ui text-tx3 hover:text-tx hover:bg-raised transition-colors w-full text-left">
-                        <Icon name="close" size={11} />Clear filter
+                        <Icon name="close" size={11} />{t('projects.clearFilter')}
                       </button>
                     </>
                   )}
@@ -1080,23 +1086,23 @@ export function ProjectManager() {
           </div>
 
           <div className="flex-1 overflow-y-auto bg-surface">
-            {loading && <div className="p-4 text-[11px] text-tx3 font-mono">Loading…</div>}
+            {loading && <div className="p-4 text-[11px] text-tx3 font-mono">{t('common.loading')}</div>}
             {!loading && projects.length === 0 && (
               <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-6">
                 <div className="text-[11px] text-tx3 font-mono leading-[1.8]">
-                  No projects yet.<br />
-                  <span className="text-[10px]">Group environments (production, local, test…) for a project.</span>
+                  {t('projects.emptyTitle')}<br />
+                  <span className="text-[10px]">{t('projects.emptyHint')}</span>
                 </div>
                 <button
                   onClick={handleNewProject}
                   className="flex items-center gap-1 text-[11px] font-bold font-ui text-accent border border-accent-d rounded-[3px] px-3 py-[5px] hover:bg-accent-b transition-colors"
                 >
-                  <Icon name="plus" size={11} />NEW PROJECT
+                  <Icon name="plus" size={11} />{t('projects.newProject')}
                 </button>
               </div>
             )}
             {!loading && projects.length > 0 && filteredProjects.length === 0 && (
-              <div className="py-16 text-center text-tx3 text-sm font-mono">// no projects match</div>
+              <div className="py-16 text-center text-tx3 text-sm font-mono">{t('projects.noMatch')}</div>
             )}
             {filteredProjects.map((p) => (
               <ProjectCard key={p.id} project={p} cats={cats} onOpen={() => openProject(p)} />
@@ -1105,16 +1111,16 @@ export function ProjectManager() {
 
           {/* Footer nav — Projects is now the landing screen */}
           <div className="flex items-center justify-between px-5 h-10 border-t border-bd bg-bg shrink-0">
-            <div className="text-[12px] text-tx2 font-mono">{projects.length} project{projects.length !== 1 ? 's' : ''}</div>
+            <div className="text-[12px] text-tx2 font-mono">{t(projects.length === 1 ? 'projects.projectCount_one' : 'projects.projectCount_other', { n: projects.length })}</div>
             <div className="flex gap-3">
               <button onClick={() => go('vault')} className="flex items-center gap-1.5 text-[13px] font-mono text-tx2 bg-transparent border-none cursor-pointer hover:text-tx transition-colors">
-                <Icon name="shield" size={13} />global secrets
+                <Icon name="shield" size={13} />{t('projects.navGlobalSecrets')}
               </button>
               <button onClick={() => go('categories')} className="flex items-center gap-1.5 text-[13px] font-mono text-tx2 bg-transparent border-none cursor-pointer hover:text-tx transition-colors">
-                <Icon name="tag" size={13} />categories
+                <Icon name="tag" size={13} />{t('projects.navCategories')}
               </button>
               <button onClick={() => go('settings')} className="flex items-center gap-1.5 text-[13px] font-mono text-tx2 bg-transparent border-none cursor-pointer hover:text-tx transition-colors">
-                <Icon name="settings" size={13} />settings
+                <Icon name="settings" size={13} />{t('projects.navSettings')}
               </button>
             </div>
           </div>
@@ -1128,7 +1134,7 @@ export function ProjectManager() {
               onClick={goToProjects}
               className="flex items-center gap-1 text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
             >
-              <Icon name="back" size={13} />projects
+              <Icon name="back" size={13} />{t('projects.navProjects')}
             </button>
             <div className="flex-1 text-[13px] font-semibold text-center text-tx truncate px-1">
               {selectedProject.name}
@@ -1137,19 +1143,19 @@ export function ProjectManager() {
               onClick={() => setShareModalMode('send')}
               className="text-[11px] font-bold font-ui text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[4px] hover:text-tx transition-colors whitespace-nowrap"
             >
-              SHARE PROJECT
+              {t('projects.shareProject')}
             </button>
             <button
               onClick={handleExportProject}
               className="text-[11px] font-bold font-ui text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[4px] hover:text-tx transition-colors whitespace-nowrap"
             >
-              SAVE TEMPLATE
+              {t('projects.saveTemplate')}
             </button>
           </div>
 
           <div className="flex-1 overflow-y-auto px-4 py-3">
             <div className="mb-3">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">NAME</div>
+              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.name')}</div>
               <input
                 value={projName}
                 onChange={(e) => setProjName(e.target.value)}
@@ -1157,24 +1163,24 @@ export function ProjectManager() {
                 className="w-full bg-bg border border-bd2 text-tx font-mono text-[13px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
               />
               {projName.length > 0 && !isValidProjectName(projName.trim()) && (
-                <div className="text-[10px] font-mono text-danger mt-1">{PROJECT_NAME_RULE}</div>
+                <div className="text-[10px] font-mono text-danger mt-1">{t('projects.projectNameRule')}</div>
               )}
             </div>
             <div className="mb-3">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">DESCRIPTION</div>
+              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.description')}</div>
               <input
                 value={projDescription}
                 onChange={(e) => setProjDescription(e.target.value)}
-                placeholder="Optional notes"
+                placeholder={t('projects.descriptionPlaceholder')}
                 className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
               />
             </div>
             <div className="mb-3">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">TAGS <span className="text-tx3 normal-case tracking-normal font-normal">language, stack, anything</span></div>
+              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
               <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} />
             </div>
             <div className="mb-4">
-              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">TEMPLATE</div>
+              <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.template')}</div>
               <div className="flex items-center gap-2">
                 <span className="text-[11px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-[3px] capitalize">
                   {projTemplate}
@@ -1183,31 +1189,31 @@ export function ProjectManager() {
                   onClick={() => setTemplateModal(true)}
                   className="text-[10px] font-ui font-medium text-tx2 border border-bd2 rounded-[3px] px-2 py-[3px] hover:text-tx transition-colors"
                 >
-                  CHANGE
+                  {t('projects.change')}
                 </button>
                 <button
                   onClick={handleSaveProject}
                   disabled={saving || !isValidProjectName(projName.trim())}
                   className="ml-auto text-[10px] font-ui font-bold text-tx2 border border-bd2 rounded-[3px] px-2.5 py-[3px] hover:text-tx transition-colors disabled:opacity-40"
                 >
-                  SAVE
+                  {t('common.save')}
                 </button>
               </div>
             </div>
 
             <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-2 pb-1.5 border-b border-bd flex items-center justify-between">
-              <span>// ENVIRONMENTS</span>
+              <span>{t('projects.environmentsHeader')}</span>
               <button
                 onClick={handleNewEnvironment}
                 className="flex items-center gap-1 text-accent text-[10px] font-ui font-bold hover:opacity-80 transition-opacity"
               >
-                <Icon name="plus" size={10} />ADD
+                <Icon name="plus" size={10} />{t('projects.add')}
               </button>
             </div>
 
             {selectedProject.environments.length === 0 && (
               <div className="text-[11px] text-tx3 font-mono py-2">
-                No environments. Click ADD to create one (e.g. {ENV_PRESETS.join(', ')}).
+                {t('projects.noEnvironments', { presets: ENV_PRESETS.join(', ') })}
               </div>
             )}
 
@@ -1223,7 +1229,7 @@ export function ProjectManager() {
                 onClick={() => setConfirmDelProj(true)}
                 className="px-3 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx3 hover:text-danger hover:border-danger transition-colors"
               >
-                DELETE PROJECT
+                {t('projects.deleteProject')}
               </button>
             </div>
           </div>
@@ -1237,10 +1243,10 @@ export function ProjectManager() {
               onClick={isCreatingProj ? goToProjects : backToProject}
               className="flex items-center gap-1 text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
             >
-              <Icon name="back" size={13} />{isCreatingProj ? 'projects' : selectedProject?.name}
+              <Icon name="back" size={13} />{isCreatingProj ? t('projects.navProjects') : selectedProject?.name}
             </button>
             <div className="flex-1 text-[13px] font-semibold text-center text-tx truncate px-1">
-              {isCreatingProj ? 'New Project' : (isCreatingEnv ? 'New Environment' : (selectedEnv?.name ?? ''))}
+              {isCreatingProj ? t('projects.newProjectTitle') : (isCreatingEnv ? t('projects.newEnvironmentTitle') : (selectedEnv?.name ?? ''))}
             </div>
           </div>
 
@@ -1248,10 +1254,10 @@ export function ProjectManager() {
             {isCreatingProj ? (
               <>
                 <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-3 pb-1.5 border-b border-bd">
-                  // PROJECT
+                  {t('projects.projectHeader')}
                 </div>
                 <div className="mb-3">
-                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">NAME</div>
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.name')}</div>
                   <input
                     value={projName}
                     onChange={(e) => setProjName(e.target.value)}
@@ -1259,24 +1265,24 @@ export function ProjectManager() {
                     className="w-full bg-bg border border-bd2 text-tx font-mono text-[13px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
                   />
                   {projName.length > 0 && !isValidProjectName(projName.trim()) && (
-                    <div className="text-[10px] font-mono text-danger mt-1">{PROJECT_NAME_RULE}</div>
+                    <div className="text-[10px] font-mono text-danger mt-1">{t('projects.projectNameRule')}</div>
                   )}
                 </div>
                 <div className="mb-3">
-                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">DESCRIPTION</div>
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.description')}</div>
                   <input
                     value={projDescription}
                     onChange={(e) => setProjDescription(e.target.value)}
-                    placeholder="Optional notes"
+                    placeholder={t('projects.descriptionPlaceholder')}
                     className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
                   />
                 </div>
                 <div className="mb-3">
-                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">TAGS <span className="text-tx3 normal-case tracking-normal font-normal">language, stack, anything</span></div>
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
                   <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} />
                 </div>
                 <div className="mb-3">
-                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">TEMPLATE</div>
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.template')}</div>
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-[3px] capitalize">
                       {projTemplate}
@@ -1285,18 +1291,18 @@ export function ProjectManager() {
                       onClick={() => setTemplateModal(true)}
                       className="text-[10px] font-ui font-medium text-tx2 border border-bd2 rounded-[3px] px-2 py-[3px] hover:text-tx transition-colors"
                     >
-                      CHANGE
+                      {t('projects.change')}
                     </button>
                   </div>
                 </div>
                 <div className="text-[11px] text-tx3 font-mono py-2">
-                  A default environment is created automatically — you'll add its paths and variables next.
+                  {t('projects.defaultEnvNote')}
                 </div>
               </>
             ) : (
               <>
                 <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-3 pb-1.5 border-b border-bd">
-                  // ENVIRONMENT
+                  {t('projects.environmentHeader')}
                 </div>
 
                 <div className="mb-3 flex items-center gap-2">
@@ -1317,17 +1323,17 @@ export function ProjectManager() {
                       onChange={(e) => setEnvIsDefault(e.target.checked)}
                       className="accent-[var(--color-accent)]"
                     />
-                    default
+                    {t('projects.defaultCheckbox')}
                   </label>
                 </div>
                 {envName.length > 0 && !isValidEnvironmentName(envName.trim()) && (
-                  <div className="text-[10px] font-mono text-danger -mt-2 mb-3">{ENV_NAME_RULE}</div>
+                  <div className="text-[10px] font-mono text-danger -mt-2 mb-3">{t('projects.envNameRule')}</div>
                 )}
 
                 {/* Paths */}
                 <div className="mb-3">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
-                    PATHS <span className="text-tx3 normal-case tracking-normal font-normal">.env file paths for inject</span>
+                    {t('projects.paths')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.pathsHint')}</span>
                   </div>
                   {envPaths.map((p, idx) => (
                     <div key={idx} className="flex items-center gap-1.5 mb-1">
@@ -1350,7 +1356,7 @@ export function ProjectManager() {
                     />
                     <button
                       onClick={handlePickEnvPath}
-                      title="Browse for .env file"
+                      title={t('projects.browseEnv')}
                       className="px-2.5 py-[6px] rounded-[3px] text-[10px] font-bold font-ui text-tx2 border border-bd2 hover:text-tx transition-colors"
                     >
                       <Icon name="external" size={12} />
@@ -1367,7 +1373,7 @@ export function ProjectManager() {
                             }
                           }}
                           disabled={wslBusy}
-                          title="Browse a WSL distro's filesystem for a .env file — starts the distro if it isn't running, which can take a few seconds"
+                          title={t('projects.browseWsl')}
                           className="flex items-center gap-1 px-2.5 py-[6px] rounded-[3px] text-[10px] font-bold font-ui text-tx2 border border-bd2 hover:text-tx transition-colors disabled:opacity-40"
                         >
                           <Icon name="terminal" size={12} />
@@ -1393,7 +1399,7 @@ export function ProjectManager() {
                       disabled={!newPath.trim()}
                       className="px-2.5 py-[6px] rounded-[3px] text-[10px] font-bold font-ui text-accent border border-accent-d hover:bg-accent-b transition-colors disabled:opacity-40"
                     >
-                      ADD
+                      {t('projects.add')}
                     </button>
                   </div>
                 </div>
@@ -1401,13 +1407,13 @@ export function ProjectManager() {
                 {/* Variables */}
                 <div className="mt-4">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-2 pb-1.5 border-b border-bd flex items-center justify-between">
-                    <span>// VARIABLES</span>
+                    <span>{t('projects.variablesHeader')}</span>
                     {!addingVar && (
                       <button
                         onClick={() => setAddingVar(true)}
                         className="flex items-center gap-1 text-accent text-[10px] font-ui font-bold hover:opacity-80 transition-opacity"
                       >
-                        <Icon name="plus" size={10} />ADD
+                        <Icon name="plus" size={10} />{t('projects.add')}
                       </button>
                     )}
                   </div>
@@ -1422,7 +1428,7 @@ export function ProjectManager() {
                   )}
 
                   {envVars.length === 0 && !addingVar && (
-                    <div className="text-[11px] text-tx3 font-mono py-2">No variables. Click ADD.</div>
+                    <div className="text-[11px] text-tx3 font-mono py-2">{t('projects.noVariables')}</div>
                   )}
 
                   {envVars.map((v, idx) => (
@@ -1448,8 +1454,8 @@ export function ProjectManager() {
                   className="flex items-center gap-1.5 px-3 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-accent-d text-accent hover:bg-accent-b transition-colors disabled:opacity-40"
                 >
                   {injecting
-                    ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />INJECTING…</>
-                    : <><Icon name="export" size={11} />INJECT</>}
+                    ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />{t('projects.injecting')}</>
+                    : <><Icon name="export" size={11} />{t('projects.inject')}</>}
                 </button>
               )}
               <div className="flex-1" />
@@ -1458,7 +1464,7 @@ export function ProjectManager() {
                   onClick={() => setConfirmDelEnv(true)}
                   className="px-3 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx3 hover:text-danger hover:border-danger transition-colors"
                 >
-                  DELETE
+                  {t('common.delete')}
                 </button>
               )}
               {confirmDelEnv && (
@@ -1467,13 +1473,13 @@ export function ProjectManager() {
                     onClick={() => setConfirmDelEnv(false)}
                     className="px-3 py-[7px] rounded-[3px] text-[11px] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
                   >
-                    CANCEL
+                    {t('common.cancel')}
                   </button>
                   <button
                     onClick={handleDeleteEnvironment}
                     className="px-3 py-[7px] rounded-[3px] text-[11px] font-bold font-ui cursor-pointer bg-danger border-none text-white hover:opacity-90 transition-opacity"
                   >
-                    CONFIRM DELETE
+                    {t('projects.confirmDelete')}
                   </button>
                 </>
               )}
@@ -1483,8 +1489,8 @@ export function ProjectManager() {
                 className="px-4 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center gap-1.5"
               >
                 {saving
-                  ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />SAVING…</>
-                  : 'SAVE'}
+                  ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('common.saving')}</>
+                  : t('common.save')}
               </button>
             </div>
           </div>

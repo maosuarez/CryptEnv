@@ -6,6 +6,7 @@ import { Icon } from '../ui/Icon';
 import { ContextMenu } from '../ui/ContextMenu';
 import { CatBadges } from './SecretRow';
 import { useVaultStore } from '../../store';
+import { useTranslation } from '../../i18n';
 import type { CommandItem, Category } from '../../types';
 
 interface Props {
@@ -23,23 +24,24 @@ export function CommandRow({ item, cats, selected, onToggle, onShare, onSelect }
   const setEditTarget  = useVaultStore((s) => s.setEditTarget);
   const deleteItem     = useVaultStore((s) => s.deleteItem);
   const setPlaceholder = useVaultStore((s) => s.setPlaceholder);
+  const { t }          = useTranslation();
 
   const hasPlaceholders = /\{\{/.test(item.command);
 
   const kebab = [
-    { icon: 'edit',     label: 'Edit',                   onClick: () => { setEditTarget(item); go('edit'); } },
+    { icon: 'edit',     label: t('common.edit'),onClick: () => { setEditTarget(item); go('edit'); } },
     ...(hasPlaceholders
-      ? [{ icon: 'terminal', label: 'Fill placeholders…', onClick: () => setPlaceholder(item) }]
+      ? [{ icon: 'terminal', label: t('rows.fillPlaceholders'), onClick: () => setPlaceholder(item) }]
       : []),
     { divider: true },
-    { icon: 'trash',    label: 'Delete', danger: true,   onClick: () => deleteItem(item.id) },
+    { icon: 'trash',    label: t('common.deleteLower'), danger: true,   onClick: () => deleteItem(item.id) },
   ];
 
   const truncated = item.command.slice(0, 70) + (item.command.length > 70 ? '…' : '');
 
   const ctxItems = [
-    { icon: 'export', label: 'Share this item',    onClick: () => onShare?.(item.id) },
-    { icon: 'check',  label: 'Select for sharing', onClick: () => onSelect?.(item.id) },
+    { icon: 'export', label: t('rows.shareItem'),    onClick: () => onShare?.(item.id) },
+    { icon: 'check',  label: t('rows.selectForSharing'), onClick: () => onSelect?.(item.id) },
   ];
 
   return (
@@ -92,7 +94,7 @@ export function CommandRow({ item, cats, selected, onToggle, onShare, onSelect }
             {item.description}
           </span>
         )}
-        <CopyBtn value={item.command} label={hasPlaceholders ? 'COPY RAW' : 'COPY'} />
+        <CopyBtn value={item.command} label={hasPlaceholders ? t('rows.copyRaw') : t('rows.copy')} />
         {hasPlaceholders && (
           <button
             onClick={() => setPlaceholder(item)}
@@ -103,7 +105,7 @@ export function CommandRow({ item, cats, selected, onToggle, onShare, onSelect }
             ].join(' ')}
           >
             <Icon name="terminal" size={12} color="oklch(0.72 0.16 68)" />
-            FILL
+            {t('rows.fill')}
           </button>
         )}
       </div>

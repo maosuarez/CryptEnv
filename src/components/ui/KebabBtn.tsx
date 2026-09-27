@@ -1,6 +1,7 @@
 import { useRef } from 'react';
 import { Icon } from './Icon';
 import { useVaultStore } from '../../store';
+import { useTranslation } from '../../i18n';
 import type { ContextMenuItemDef } from '../../types';
 
 interface KebabBtnProps {
@@ -10,6 +11,7 @@ interface KebabBtnProps {
 export function KebabBtn({ menuItems }: KebabBtnProps) {
   const ref = useRef<HTMLButtonElement>(null);
   const openMenu = useVaultStore((s) => s.openMenu);
+  const { t } = useTranslation();
 
   const handle = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -21,6 +23,8 @@ export function KebabBtn({ menuItems }: KebabBtnProps) {
     <button
       ref={ref}
       onClick={handle}
+      aria-label={t('ui.moreActions')}
+      title={t('ui.moreActions')}
       className={[
         'flex items-center shrink-0 rounded-[3px] px-1 py-1',
         'border border-bd bg-transparent text-tx3 cursor-pointer',

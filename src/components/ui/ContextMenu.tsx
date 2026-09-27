@@ -52,7 +52,7 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
               <Icon
                 name={item.icon as any}
                 size={12}
-                color={item.danger ? 'oklch(0.62 0.20 22)' : '#8892a4'}
+                color={item.danger ? 'oklch(0.62 0.20 22)' : 'var(--color-tx2)'}
               />
             )}
             <span className="flex-1">{item.label}</span>

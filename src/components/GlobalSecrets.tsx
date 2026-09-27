@@ -8,23 +8,25 @@ import { CommandRow } from './rows/CommandRow';
 import { NoteRow } from './rows/NoteRow';
 import { ShareModal } from './ShareModal';
 import { useVaultStore } from '../store';
+import { useTranslation, type TKey } from '../i18n';
 import type { ItemType, VaultItem, Category } from '../types';
 
 type TypeFilter = 'all' | ItemType;
 
-const TYPE_PILLS: { id: TypeFilter; label: string; dot?: string }[] = [
-  { id: 'all',        label: 'ALL' },
-  { id: 'secret',     label: 'KEY',  dot: 'oklch(0.70 0.17 162)' },
-  { id: 'credential', label: 'CRED', dot: 'oklch(0.70 0.15 220)' },
-  { id: 'link',       label: 'LINK', dot: 'oklch(0.68 0.15 270)' },
-  { id: 'command',    label: 'CMD',  dot: 'oklch(0.72 0.16 68)'  },
-  { id: 'note',       label: 'NOTE', dot: 'oklch(0.72 0.15 350)' },
+const TYPE_PILLS: { id: TypeFilter; label: TKey; dot?: string }[] = [
+  { id: 'all',        label: 'secrets.pill.all' },
+  { id: 'secret',     label: 'secrets.pill.secret', dot: 'oklch(0.70 0.17 162)' },
+  { id: 'credential', label: 'secrets.pill.credential', dot: 'oklch(0.70 0.15 220)' },
+  { id: 'link',       label: 'secrets.pill.link', dot: 'oklch(0.68 0.15 270)' },
+  { id: 'command',    label: 'secrets.pill.command', dot: 'oklch(0.72 0.16 68)'  },
+  { id: 'note',       label: 'secrets.pill.note', dot: 'oklch(0.72 0.15 350)' },
 ];
 
 export function GlobalSecrets() {
   const allItems = useVaultStore((s) => s.items);
   const cats  = useVaultStore((s) => s.cats);
   const go    = useVaultStore((s) => s.go);
+  const { t } = useTranslation();
 
   // Only secrets explicitly marked global live here — everything else is
   // created and managed inside a project's environments.
@@ -130,9 +132,9 @@ export function GlobalSecrets() {
           onClick={() => go('projects')}
           className="flex items-center gap-1 text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
         >
-          <Icon name="back" size={13} />projects
+          <Icon name="back" size={13} />{t('secrets.backToProjects')}
         </button>
-        <div className="flex-1 text-[13px] font-semibold text-center text-tx">Global Secrets</div>
+        <div className="flex-1 text-[13px] font-semibold text-center text-tx">{t('secrets.title')}</div>
         <span className="text-[11px] text-tx3 font-mono">{items.length}</span>
       </div>
 
@@ -143,12 +145,13 @@ export function GlobalSecrets() {
           ref={ref}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search name, value, URL, user, notes…"
+          placeholder={t('secrets.searchPlaceholder')}
           className="flex-1 text-[13px] text-tx font-ui bg-transparent outline-none placeholder:text-tx3"
         />
         {query && (
           <button
             onClick={() => setQuery('')}
+            aria-label={t('secrets.clearSearch')}
             className="flex items-center justify-center w-6 h-6 rounded-[3px] text-tx3 hover:text-tx hover:bg-raised transition"
           >
             <Icon name="close" size={14} />
@@ -158,7 +161,7 @@ export function GlobalSecrets() {
           <button
             ref={catBtnRef}
             onClick={() => setCatOpen((v) => !v)}
-            title="Filter by category"
+            title={t('secrets.filterByCategory')}
             className={[
               'flex items-center justify-center w-6 h-6 rounded-[3px] transition',
               catF.size > 0
@@ -174,10 +177,10 @@ export function GlobalSecrets() {
               className="absolute right-0 top-8 z-50 min-w-[180px] bg-bg border border-bd rounded-[3px] shadow-lg py-1 flex flex-col"
             >
               <div className="px-3 py-1.5 text-[0.6rem] font-mono text-tx3 tracking-[0.1em] border-b border-bd">
-                FILTER BY CATEGORY
+                {t('secrets.filterByCategoryCaps')}
               </div>
               {cats.length === 0 ? (
-                <div className="px-3 py-2 text-xs text-tx3 italic">No categories</div>
+                <div className="px-3 py-2 text-xs text-tx3 italic">{t('secrets.noCategories')}</div>
               ) : (
                 cats.map((cat) => {
                   const active = catF.has(cat.name);
@@ -220,7 +223,7 @@ export function GlobalSecrets() {
                     className="flex items-center gap-2 px-3 py-1.5 text-[11px] font-ui text-tx3 hover:text-tx hover:bg-raised transition-colors w-full text-left"
                   >
                     <Icon name="close" size={11} />
-                    Clear filter
+                    {t('secrets.clearFilter')}
                   </button>
                 </>
               )}
@@ -230,7 +233,7 @@ export function GlobalSecrets() {
         <button
           onClick={handleReload}
           disabled={reloading}
-          title="Reload vault"
+          title={t('secrets.reload')}
           className="flex items-center justify-center w-6 h-6 rounded-[3px] text-tx3 hover:text-tx hover:bg-raised transition disabled:opacity-50"
         >
           <span className={reloading ? 'animate-spin inline-flex' : 'inline-flex'}>
@@ -265,7 +268,7 @@ export function GlobalSecrets() {
                   {dot && !active && (
                     <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: dot }} />
                   )}
-                  {label}
+                  {t(label)}
                   <span className="text-[0.6rem] opacity-50">{count}</span>
                 </button>
               );
@@ -277,14 +280,14 @@ export function GlobalSecrets() {
           /* Share mode bar */
           <>
             <span className="text-[10px] font-mono text-accent tracking-[0.08em] shrink-0">
-              SELECT ITEMS TO SHARE
+              {t('secrets.selectToShare')}
             </span>
 
             <div className="flex-1" />
 
             {selectedIds.size > 0 && (
               <span className="text-[10px] font-mono text-tx3 shrink-0">
-                {selectedIds.size} selected
+                {t('secrets.selected', { n: selectedIds.size })}
               </span>
             )}
 
@@ -297,7 +300,7 @@ export function GlobalSecrets() {
                 'hover:border-tx3 hover:text-tx transition-all duration-150',
               ].join(' ')}
             >
-              CANCEL
+              {t('common.cancel')}
             </button>
 
             <button
@@ -313,7 +316,7 @@ export function GlobalSecrets() {
               disabled={selectedIds.size === 0}
             >
               <Icon name="export" size={11} color={selectedIds.size > 0 ? '#020504' : 'currentColor'} />
-              {selectedIds.size > 0 ? `SHARE (${selectedIds.size})` : 'SHARE'}
+              {selectedIds.size > 0 ? t('secrets.shareCount', { n: selectedIds.size }) : t('secrets.share')}
             </button>
           </>
         )}
@@ -324,12 +327,12 @@ export function GlobalSecrets() {
         {loading ? (
           <div className="py-16 text-center text-tx3 text-sm font-mono">
             <div className="w-5 h-5 rounded-full border-2 border-bd2 border-t-accent animate-spin-fast mx-auto mb-3" />
-            decrypting vault…
+            {t('secrets.decrypting')}
           </div>
         ) : filtered.length === 0 ? (
           <div className="py-16 text-center text-tx3 text-sm font-mono leading-[1.8]">
-            // no global secrets match<br />
-            <span className="text-[11px]">Mark a secret "global" from any project to see it here</span>
+            // {t('secrets.noMatch')}<br />
+            <span className="text-[11px]">{t('secrets.noMatchHint')}</span>
           </div>
         ) : (
           filtered.map((it) => {
@@ -352,7 +355,7 @@ export function GlobalSecrets() {
 
       {/* Status bar */}
       <div className="flex items-center px-5 h-10 border-t border-bd bg-bg shrink-0">
-        <div className="text-[12px] text-tx2 font-mono">{items.length} global secret{items.length !== 1 ? 's' : ''} · AES-256-GCM</div>
+        <div className="text-[12px] text-tx2 font-mono">{t(items.length === 1 ? 'secrets.count_one' : 'secrets.count_other', { n: items.length })} · AES-256-GCM</div>
       </div>
 
       {/* Share modal overlay */}

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { Icon } from './ui/Icon';
 import { RelayCodeDisplay } from './ui/RelayCodeDisplay';
+import { useTranslation } from '../i18n';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -302,6 +303,7 @@ function Countdown({ seconds }: { seconds: number }) {
 // ---------------------------------------------------------------------------
 
 export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: ShareModalProps) {
+  const { t } = useTranslation();
   const [step, setStep] = useState<Step>('method');
   const [method, setMethod] = useState<Method | null>(null);
   const [lanRole, setLanRole] = useState<LanRole | null>(null);
@@ -382,7 +384,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
           }
         } else if (result.state === 'failed') {
           stopPolling();
-          setFailedError(result.error ?? 'Transfer failed');
+          setFailedError(result.error ?? t('share.transferFailed'));
           setStep('failed');
         } else if (result.state === 'cancelled') {
           stopPolling();
@@ -396,7 +398,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         setStep('failed');
       }
     }, 800);
-  }, [stopPolling, onClose]);
+  }, [stopPolling, onClose, t]);
 
   // ------------------------------------------------------------------
   // Action handlers
@@ -532,13 +534,13 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
             ].join(' ')}
           >
             <div className="flex items-center gap-2 mb-2">
-              <Icon name="globe" size={15} color={method === 'lan' ? 'oklch(0.70 0.17 162)' : '#6b7899'} />
+              <Icon name="globe" size={15} color={method === 'lan' ? 'oklch(0.70 0.17 162)' : 'var(--color-tx3)'} />
               <span className={['text-[12px] font-bold tracking-wider font-ui', method === 'lan' ? 'text-accent' : 'text-tx'].join(' ')}>
                 LAN
               </span>
             </div>
-            <div className="text-[11px] text-tx2 leading-[1.5]">Share on local network</div>
-            <div className="text-[10px] text-tx3 mt-1 font-mono">peer-to-peer · end-to-end encrypted</div>
+            <div className="text-[11px] text-tx2 leading-[1.5]">{t('share.method.lanDesc')}</div>
+            <div className="text-[10px] text-tx3 mt-1 font-mono">{t('share.method.lanMeta')}</div>
           </button>
 
           {/* File Card */}
@@ -552,13 +554,13 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
             ].join(' ')}
           >
             <div className="flex items-center gap-2 mb-2">
-              <Icon name="export" size={15} color={method === 'file' ? 'oklch(0.70 0.17 162)' : '#6b7899'} />
+              <Icon name="export" size={15} color={method === 'file' ? 'oklch(0.70 0.17 162)' : 'var(--color-tx3)'} />
               <span className={['text-[12px] font-bold tracking-wider font-ui', method === 'file' ? 'text-accent' : 'text-tx'].join(' ')}>
-                FILE
+                {t('share.method.file')}
               </span>
             </div>
-            <div className="text-[11px] text-tx2 leading-[1.5]">Export / Import file</div>
-            <div className="text-[10px] text-tx3 mt-1 font-mono">encrypted package · passphrase</div>
+            <div className="text-[11px] text-tx2 leading-[1.5]">{t('share.method.fileDesc')}</div>
+            <div className="text-[10px] text-tx3 mt-1 font-mono">{t('share.method.fileMeta')}</div>
           </button>
         </div>
 
@@ -573,12 +575,12 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
           ].join(' ')}
         >
           <div className="flex items-center gap-3">
-            <Icon name="shield" size={15} color={method === 'internet' ? 'oklch(0.70 0.17 162)' : '#6b7899'} />
+            <Icon name="shield" size={15} color={method === 'internet' ? 'oklch(0.70 0.17 162)' : 'var(--color-tx3)'} />
             <div className="flex-1">
               <span className={['text-[12px] font-bold tracking-wider font-ui', method === 'internet' ? 'text-accent' : 'text-tx'].join(' ')}>
-                INTERNET
+                {t('share.method.internet')}
               </span>
-              <span className="text-[10px] text-tx3 font-mono ml-3">relay · burn-after-read · 24h TTL</span>
+              <span className="text-[10px] text-tx3 font-mono ml-3">{t('share.method.internetMeta')}</span>
             </div>
           </div>
         </button>
@@ -587,7 +589,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <div className="flex items-center gap-2 mb-4">
           <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
           <span className="text-[11px] text-tx2 font-mono">
-            Sharing <span className="text-accent font-bold">{selectedIds.length}</span> item{selectedIds.length !== 1 ? 's' : ''}
+            {t('share.sharing')} <span className="text-accent font-bold">{selectedIds.length}</span> {t(selectedIds.length === 1 ? 'share.itemWord_one' : 'share.itemWord_other')}
           </span>
         </div>
 
@@ -595,7 +597,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         {method === 'lan' && (
           <BtnPrimary onClick={handleLanSend} className="w-full">
             <Icon name="export" size={12} color="#020504" />
-            SEND VIA LAN
+            {t('share.sendViaLan')}
           </BtnPrimary>
         )}
 
@@ -603,7 +605,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         {method === 'file' && (
           <BtnPrimary onClick={() => setStep('file-export')} className="w-full">
             <Icon name="export" size={12} color="#020504" />
-            EXPORT FILE
+            {t('share.exportFile')}
           </BtnPrimary>
         )}
 
@@ -612,11 +614,11 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
           <div className="flex gap-2">
             <BtnPrimary onClick={() => setStep('internet-send')} className="flex-1" disabled={selectedIds.length === 0}>
               <Icon name="export" size={12} color="#020504" />
-              SEND
+              {t('share.send')}
             </BtnPrimary>
             <BtnSecondary onClick={() => setStep('internet-receive')} className="flex-1">
               <Icon name="back" size={12} />
-              RECEIVE
+              {t('share.receive')}
             </BtnSecondary>
           </div>
         )}
@@ -629,18 +631,18 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderLanSend() {
     return (
       <>
-        <Breadcrumb path="LAN  /  SEND" />
-        <SectionLabel>Waiting for peer</SectionLabel>
+        <Breadcrumb path={t('share.crumb.lanSend')} />
+        <SectionLabel>{t('share.waitingForPeer')}</SectionLabel>
         <div className="flex items-center gap-2 text-[11px] text-tx3 font-mono mb-1">
           <Spinner />
-          <span>Listening for incoming connection…</span>
+          <span>{t('share.listening')}</span>
         </div>
         <PairingCodeDisplay code={pairingCode} />
         <div className="text-center text-[11px] text-tx3 font-mono mb-1">
-          Share this code with the recipient
+          {t('share.shareCode')}
         </div>
         <div className="flex items-center justify-center gap-1.5 mb-4">
-          <span className="text-[11px] text-tx3 font-mono">Connection timeout:</span>
+          <span className="text-[11px] text-tx3 font-mono">{t('share.connectionTimeout')}</span>
           <Countdown seconds={300} />
         </div>
         {sessionNote && (
@@ -650,7 +652,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         )}
         <Divider />
         <div className="flex justify-end">
-          <BtnSecondary onClick={handleCancel}>CANCEL</BtnSecondary>
+          <BtnSecondary onClick={handleCancel}>{t('common.cancel')}</BtnSecondary>
         </div>
       </>
     );
@@ -662,8 +664,8 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
 
     return (
       <>
-        <Breadcrumb path="LAN  /  RECEIVE" />
-        <SectionLabel>Enter pairing code</SectionLabel>
+        <Breadcrumb path={t('share.crumb.lanReceive')} />
+        <SectionLabel>{t('share.enterPairingCode')}</SectionLabel>
         <PairingCodeInput
           value={inputCode}
           onChange={setInputCode}
@@ -672,19 +674,19 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         {isConnecting && (
           <div className="flex items-center justify-center gap-2 text-[11px] text-tx3 font-mono mb-2">
             <Spinner />
-            <span>Connecting…</span>
+            <span>{t('share.connecting')}</span>
           </div>
         )}
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>BACK</BtnSecondary>
+          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>{t('share.back')}</BtnSecondary>
           <BtnPrimary
             onClick={handleReceiveSubmit}
             disabled={inputCode.length < 6 || isLoading || isConnecting}
           >
             {isLoading ? <Spinner /> : null}
-            CONNECT
+            {t('share.connect')}
           </BtnPrimary>
         </div>
       </>
@@ -694,15 +696,14 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderFingerprint() {
     return (
       <>
-        <Breadcrumb path={`LAN  /  ${lanRole === 'send' ? 'SEND' : 'RECEIVE'}  /  VERIFY`} />
-        <SectionLabel>Verify fingerprint</SectionLabel>
+        <Breadcrumb path={t(lanRole === 'send' ? 'share.crumb.lanSendVerify' : 'share.crumb.lanReceiveVerify')} />
+        <SectionLabel>{t('share.verifyFingerprint')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-3 leading-[1.6]">
-          Confirm that both devices show the same fingerprint before proceeding:
+          {t('share.verifyPrompt')}
         </p>
         <FingerprintDisplay fp={fingerprint} />
         <p className="text-[11px] text-tx3 font-mono mt-2 mb-4 leading-[1.5]">
-          If they match, you are connected to the right device.
-          If they differ, reject immediately.
+          {t('share.verifyHint')}
         </p>
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
@@ -711,14 +712,14 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
             onClick={() => handleFingerprintConfirm(false)}
             disabled={fpConfirming}
           >
-            REJECT
+            {t('share.reject')}
           </BtnDanger>
           <BtnPrimary
             onClick={() => handleFingerprintConfirm(true)}
             disabled={fpConfirming}
           >
             {fpConfirming ? <Spinner /> : <Icon name="check" size={12} color="#020504" />}
-            CONFIRM
+            {t('share.confirm')}
           </BtnPrimary>
         </div>
       </>
@@ -728,25 +729,24 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderFileExport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  EXPORT" />
-        <SectionLabel>Export encrypted file</SectionLabel>
+        <Breadcrumb path={t('share.crumb.fileExport')} />
+        <SectionLabel>{t('share.exportEncrypted')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-4 leading-[1.6]">
-          A native save dialog will open. The file is AES-256-GCM encrypted.
-          A random passphrase will be generated — share it with the recipient via a separate channel.
+          {t('share.exportHint')}
         </p>
         <div className="flex items-center gap-2 mb-4">
           <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
           <span className="text-[11px] text-tx2 font-mono">
-            {selectedIds.length} item{selectedIds.length !== 1 ? 's' : ''} selected for export
+            {t(selectedIds.length === 1 ? 'share.selectedForExport_one' : 'share.selectedForExport_other', { n: selectedIds.length })}
           </span>
         </div>
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>BACK</BtnSecondary>
+          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>{t('share.back')}</BtnSecondary>
           <BtnPrimary onClick={handleFileExport} disabled={exportLoading}>
             {exportLoading ? <Spinner /> : <Icon name="export" size={12} color="#020504" />}
-            SAVE ENCRYPTED FILE
+            {t('share.saveEncrypted')}
           </BtnPrimary>
         </div>
       </>
@@ -756,26 +756,26 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderFileImport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  IMPORT" />
-        <SectionLabel>Import encrypted file</SectionLabel>
+        <Breadcrumb path={t('share.crumb.fileImport')} />
+        <SectionLabel>{t('share.importEncrypted')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-4 leading-[1.6]">
-          Select the encrypted package file, then enter the passphrase you received.
+          {t('share.importHint')}
         </p>
 
         {!importFileReady ? (
           <BtnSecondary onClick={handleFileImportOpen} disabled={importLoading} className="w-full mb-4">
             {importLoading ? <Spinner /> : <Icon name="external" size={12} />}
-            OPEN PACKAGE FILE
+            {t('share.openPackage')}
           </BtnSecondary>
         ) : (
           <>
             <div className="flex items-center gap-2 mb-3">
               <Icon name="check" size={12} color="oklch(0.70 0.17 162)" />
-              <span className="text-[11px] text-accent font-mono">File selected</span>
+              <span className="text-[11px] text-accent font-mono">{t('share.fileSelected')}</span>
             </div>
             <div className="mb-4">
               <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">
-                PASSPHRASE
+                {t('share.passphrase')}
               </label>
               <input
                 type="text"
@@ -797,14 +797,14 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <Divider />
         <div className="flex justify-between">
           <BtnSecondary onClick={() => { setStep('method'); setError(''); setImportFileReady(false); setImportPassphrase(''); }}>
-            BACK
+            {t('share.back')}
           </BtnSecondary>
           <BtnPrimary
             onClick={handleFileImportSubmit}
             disabled={!importFileReady || !importPassphrase || importLoading}
           >
             {importLoading ? <Spinner /> : null}
-            IMPORT
+            {t('share.import')}
           </BtnPrimary>
         </div>
       </>
@@ -814,19 +814,19 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderDoneSend() {
     return (
       <>
-        <Breadcrumb path="LAN  /  SEND  /  DONE" />
+        <Breadcrumb path={t('share.crumb.lanSendDone')} />
         <div className="py-6 text-center">
           <div className="w-10 h-10 rounded-full bg-accent-b border border-accent-d flex items-center justify-center mx-auto mb-4">
             <Icon name="check" size={18} color="oklch(0.70 0.17 162)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx mb-1">Transfer complete</div>
+          <div className="text-[13px] font-semibold text-tx mb-1">{t('share.transferComplete')}</div>
           <div className="text-[12px] text-tx3 font-mono">
-            {sentCount} item{sentCount !== 1 ? 's' : ''} sent successfully
+            {t(sentCount === 1 ? 'share.sentSuccess_one' : 'share.sentSuccess_other', { n: sentCount })}
           </div>
         </div>
         <Divider />
         <div className="flex justify-end">
-          <BtnPrimary onClick={() => { onSendDone?.(); onClose(); }}>CLOSE</BtnPrimary>
+          <BtnPrimary onClick={() => { onSendDone?.(); onClose(); }}>{t('share.close')}</BtnPrimary>
         </div>
       </>
     );
@@ -835,16 +835,16 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderDoneReceive() {
     return (
       <>
-        <Breadcrumb path="LAN  /  RECEIVE  /  DONE" />
+        <Breadcrumb path={t('share.crumb.lanReceiveDone')} />
         <div className="py-4">
           <div className="flex items-center gap-2 mb-3">
             <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
               <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
             </div>
-            <div className="text-[13px] font-semibold text-tx">Transfer complete</div>
+            <div className="text-[13px] font-semibold text-tx">{t('share.transferComplete')}</div>
           </div>
           <div className="text-[11px] text-tx3 font-mono mb-3">
-            {receivedNames.length} item{receivedNames.length !== 1 ? 's' : ''} received:
+            {t(receivedNames.length === 1 ? 'share.receivedList_one' : 'share.receivedList_other', { n: receivedNames.length })}
           </div>
           <div className="bg-raised border border-bd rounded-[3px] divide-y divide-bd max-h-[120px] overflow-y-auto">
             {receivedNames.map((name, i) => (
@@ -859,7 +859,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <div className="flex justify-end">
           <BtnPrimary onClick={handleImportDoneClose}>
             <Icon name="check" size={12} color="#020504" />
-            RELOAD VAULT
+            {t('share.reloadVault')}
           </BtnPrimary>
         </div>
       </>
@@ -869,22 +869,22 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderDoneFileExport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  EXPORT  /  DONE" />
+        <Breadcrumb path={t('share.crumb.fileExportDone')} />
         <div className="flex items-center gap-2 mb-4">
           <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
             <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx">File saved</div>
+          <div className="text-[13px] font-semibold text-tx">{t('share.fileSaved')}</div>
         </div>
 
-        <SectionLabel>Passphrase — share via separate channel</SectionLabel>
+        <SectionLabel>{t('share.passphraseSeparate')}</SectionLabel>
         <div className="bg-raised border border-bd2 rounded-[3px] px-4 py-3 flex items-center gap-3 mb-3">
           <span className="flex-1 font-mono text-[13px] text-accent tracking-[0.05em] select-all break-all">
             {exportPassphrase}
           </span>
           <button
             onClick={handleCopyPassphrase}
-            title="Copy passphrase"
+            title={t('share.copyPassphrase')}
             className={[
               'flex items-center gap-1.5 border rounded-[3px] px-2 py-1',
               'text-[10px] font-mono tracking-wide shrink-0 transition-all duration-150 cursor-pointer',
@@ -894,16 +894,15 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
             ].join(' ')}
           >
             <Icon name={copiedPass ? 'check' : 'copy'} size={11} color={copiedPass ? 'oklch(0.70 0.17 162)' : 'currentColor'} />
-            {copiedPass ? 'COPIED' : 'COPY'}
+            {copiedPass ? t('share.copied') : t('share.copy')}
           </button>
         </div>
         <p className="text-[11px] text-tx3 font-mono leading-[1.5]">
-          The recipient will need this passphrase to decrypt the file.
-          Do not share it in the same channel as the file.
+          {t('share.passphraseNote')}
         </p>
         <Divider />
         <div className="flex justify-end">
-          <BtnPrimary onClick={onClose}>DONE</BtnPrimary>
+          <BtnPrimary onClick={onClose}>{t('share.done')}</BtnPrimary>
         </div>
       </>
     );
@@ -912,15 +911,15 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderDoneFileImport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  IMPORT  /  DONE" />
+        <Breadcrumb path={t('share.crumb.fileImportDone')} />
         <div className="flex items-center gap-2 mb-4">
           <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
             <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx">Import complete</div>
+          <div className="text-[13px] font-semibold text-tx">{t('share.importComplete')}</div>
         </div>
         <div className="text-[11px] text-tx3 font-mono mb-3">
-          {importedNames.length} item{importedNames.length !== 1 ? 's' : ''} imported:
+          {t(importedNames.length === 1 ? 'share.importedList_one' : 'share.importedList_other', { n: importedNames.length })}
         </div>
         <div className="bg-raised border border-bd rounded-[3px] divide-y divide-bd max-h-[120px] overflow-y-auto mb-4">
           {importedNames.map((name, i) => (
@@ -934,7 +933,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <div className="flex justify-end">
           <BtnPrimary onClick={handleImportDoneClose}>
             <Icon name="check" size={12} color="#020504" />
-            RELOAD VAULT
+            {t('share.reloadVault')}
           </BtnPrimary>
         </div>
       </>
@@ -976,29 +975,29 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderInternetSend() {
     return (
       <>
-        <Breadcrumb path="INTERNET  /  SEND" />
-        <SectionLabel>Send via encrypted relay</SectionLabel>
+        <Breadcrumb path={t('share.crumb.internetSend')} />
+        <SectionLabel>{t('share.sendViaRelay')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-3 leading-[1.6]">
-          Items will be encrypted end-to-end and uploaded to the relay. Share the code + passphrase with your teammate.
-          The link is valid for <span className="text-accent font-mono">24 hours</span> and can only be retrieved once.
+          {t('share.relayIntro')}{' '}
+          {t('share.validFor')} <span className="text-accent font-mono">{t('share.hours24')}</span> {t('share.retrievedOnce')}
         </p>
         <div className="bg-raised border border-bd2 rounded-[3px] px-3 py-2 text-[10px] text-tx3 font-mono leading-[1.7] mb-3 flex items-start gap-2">
           <Icon name="shield" size={11} color="currentColor" />
-          <span>All data is end-to-end encrypted with AES-256-GCM before leaving your device. The relay server only stores ciphertext — it cannot read your secrets. Encrypted for 24 hours, burn-after-read.</span>
+          <span>{t('share.relayNotice')}</span>
         </div>
         <div className="flex items-center gap-2 mb-4">
           <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />
           <span className="text-[11px] text-tx2 font-mono">
-            Sending <span className="text-accent font-bold">{selectedIds.length}</span> item{selectedIds.length !== 1 ? 's' : ''}
+            {t('share.sending')} <span className="text-accent font-bold">{selectedIds.length}</span> {t(selectedIds.length === 1 ? 'share.itemWord_one' : 'share.itemWord_other')}
           </span>
         </div>
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>BACK</BtnSecondary>
+          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>{t('share.back')}</BtnSecondary>
           <BtnPrimary onClick={handleRelayRelayLaunch} disabled={relayLoading || selectedIds.length === 0}>
             {relayLoading ? <Spinner /> : <Icon name="shield" size={12} color="#020504" />}
-            {relayLoading ? 'UPLOADING…' : 'UPLOAD & GET CODE'}
+            {relayLoading ? t('share.uploading') : t('share.uploadGetCode')}
           </BtnPrimary>
         </div>
       </>
@@ -1008,14 +1007,14 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderInternetReceive() {
     return (
       <>
-        <Breadcrumb path="INTERNET  /  RECEIVE" />
-        <SectionLabel>Enter relay code + passphrase</SectionLabel>
+        <Breadcrumb path={t('share.crumb.internetReceive')} />
+        <SectionLabel>{t('share.enterRelay')}</SectionLabel>
         <div className="bg-raised border border-bd2 rounded-[3px] px-3 py-2 text-[10px] text-tx3 font-mono leading-[1.7] mb-3 flex items-start gap-2">
           <Icon name="shield" size={11} color="currentColor" />
-          <span>All data is end-to-end encrypted with AES-256-GCM before leaving your device. The relay server only stores ciphertext — it cannot read your secrets. Encrypted for 24 hours, burn-after-read.</span>
+          <span>{t('share.relayNotice')}</span>
         </div>
         <div className="mb-3">
-          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">CODE</label>
+          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">{t('share.code')}</label>
           <input
             type="text"
             value={relayRxCode}
@@ -1026,7 +1025,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
           />
         </div>
         <div className="mb-4">
-          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">PASSPHRASE</label>
+          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">{t('share.passphrase')}</label>
           <input
             type="text"
             value={relayRxPass}
@@ -1039,10 +1038,10 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>BACK</BtnSecondary>
+          <BtnSecondary onClick={() => { setStep('method'); setError(''); }}>{t('share.back')}</BtnSecondary>
           <BtnPrimary onClick={handleRelayReceive} disabled={relayRxLoading || !relayRxCode || !relayRxPass}>
             {relayRxLoading ? <Spinner /> : null}
-            {relayRxLoading ? 'DOWNLOADING…' : 'IMPORT'}
+            {relayRxLoading ? t('share.downloading') : t('share.import')}
           </BtnPrimary>
         </div>
       </>
@@ -1052,21 +1051,21 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderInternetDoneSend() {
     return (
       <>
-        <Breadcrumb path="INTERNET  /  SEND  /  DONE" />
+        <Breadcrumb path={t('share.crumb.internetSendDone')} />
         <div className="flex items-center gap-2 mb-4">
           <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
             <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx">Uploaded successfully</div>
+          <div className="text-[13px] font-semibold text-tx">{t('share.uploaded')}</div>
         </div>
 
-        <SectionLabel>Send BOTH to your teammate via any channel</SectionLabel>
+        <SectionLabel>{t('share.sendBoth')}</SectionLabel>
 
         <RelayCodeDisplay code={relayCode} passphrase={relayPassphrase} />
 
         <Divider />
         <div className="flex justify-end">
-          <BtnPrimary onClick={() => { onSendDone?.(); onClose(); }}>DONE</BtnPrimary>
+          <BtnPrimary onClick={() => { onSendDone?.(); onClose(); }}>{t('share.done')}</BtnPrimary>
         </div>
       </>
     );
@@ -1075,15 +1074,15 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderInternetDoneReceive() {
     return (
       <>
-        <Breadcrumb path="INTERNET  /  RECEIVE  /  DONE" />
+        <Breadcrumb path={t('share.crumb.internetReceiveDone')} />
         <div className="flex items-center gap-2 mb-4">
           <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
             <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx">Import complete</div>
+          <div className="text-[13px] font-semibold text-tx">{t('share.importComplete')}</div>
         </div>
         <div className="text-[11px] text-tx3 font-mono mb-3">
-          {relayRxNames.length} item{relayRxNames.length !== 1 ? 's' : ''} imported from relay:
+          {t(relayRxNames.length === 1 ? 'share.importedFromRelay_one' : 'share.importedFromRelay_other', { n: relayRxNames.length })}
         </div>
         <div className="bg-raised border border-bd rounded-[3px] divide-y divide-bd max-h-[120px] overflow-y-auto mb-4">
           {relayRxNames.map((name, i) => (
@@ -1097,7 +1096,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <div className="flex justify-end">
           <BtnPrimary onClick={handleImportDoneClose}>
             <Icon name="check" size={12} color="#020504" />
-            RELOAD VAULT
+            {t('share.reloadVault')}
           </BtnPrimary>
         </div>
       </>
@@ -1107,21 +1106,21 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   function renderFailed() {
     return (
       <>
-        <Breadcrumb path="ERROR" />
+        <Breadcrumb path={t('share.crumb.error')} />
         <div className="py-6 text-center">
           <div className="w-10 h-10 rounded-full bg-danger-b border border-danger flex items-center justify-center mx-auto mb-4">
             <Icon name="close" size={18} color="oklch(0.62 0.20 22)" />
           </div>
-          <div className="text-[13px] font-semibold text-tx mb-2">Transfer failed</div>
+          <div className="text-[13px] font-semibold text-tx mb-2">{t('share.transferFailed')}</div>
           <div className="text-[12px] text-danger font-mono bg-danger-b border border-danger rounded-[3px] px-3 py-2 mt-2 text-left">
             {failedError}
           </div>
         </div>
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={onClose}>CLOSE</BtnSecondary>
+          <BtnSecondary onClick={onClose}>{t('share.close')}</BtnSecondary>
           <BtnPrimary onClick={() => { setStep('method'); setMethod(null); setError(''); setFailedError(''); }}>
-            RETRY
+            {t('share.retry')}
           </BtnPrimary>
         </div>
       </>
@@ -1164,7 +1163,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Icon name="shield" size={14} color="oklch(0.70 0.17 162)" />
-            <span className="text-[12px] font-bold tracking-wider font-ui text-tx">SHARE</span>
+            <span className="text-[12px] font-bold tracking-wider font-ui text-tx">{t('share.title')}</span>
           </div>
           <button
             onClick={step === 'method' ? onClose : handleCancel}

@@ -2,6 +2,7 @@ import { useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
+import { useTranslation, type TKey } from '../i18n';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,23 +28,24 @@ interface Props {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const FORMAT_OPTIONS: { value: ImportFormat; label: string; hint: string }[] = [
-  { value: 'env',        label: 'ENV file (.env)',   hint: 'KEY=VALUE pairs' },
-  { value: 'bitwarden',  label: 'Bitwarden (CSV)',   hint: 'Exported from Bitwarden' },
-  { value: '1password',  label: '1Password (CSV)',   hint: 'Exported from 1Password' },
-  { value: 'csv',        label: 'Generic CSV',       hint: 'Auto-detected columns' },
+const FORMAT_OPTIONS: { value: ImportFormat; label: TKey; hint: TKey }[] = [
+  { value: 'env',        label: 'import.formatEnv',       hint: 'import.hintEnv' },
+  { value: 'bitwarden',  label: 'import.formatBitwarden', hint: 'import.hintBitwarden' },
+  { value: '1password',  label: 'import.format1Password', hint: 'import.hint1Password' },
+  { value: 'csv',        label: 'import.formatCsv',       hint: 'import.hintCsv' },
 ];
 
-const TYPE_LABELS: Record<string, string> = {
-  secret:     'SECRET',
-  credential: 'CREDENTIAL',
-  note:       'NOTE',
-  link:       'LINK',
+const TYPE_LABELS: Record<string, TKey> = {
+  secret:     'import.typeSecret',
+  credential: 'import.typeCredential',
+  note:       'import.typeNote',
+  link:       'import.typeLink',
 };
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ImportModal({ onClose }: Props) {
+  const { t } = useTranslation();
   const showToast = useVaultStore((s) => s.showToast);
 
   const [format,     setFormat]     = useState<ImportFormat>('env');
@@ -71,7 +73,7 @@ export function ImportModal({ onClose }: Props) {
       });
 
       if (items.length === 0) {
-        setParseError('No importable items found in this file.');
+        setParseError(t('import.errNoItems'));
         setParsing(false);
         return;
       }
@@ -116,8 +118,8 @@ export function ImportModal({ onClose }: Props) {
       const count = await invoke<number>('vault_import_items', { items: payload });
       const skipped = selected.length - count;
 
-      let msg = `${count} item${count !== 1 ? 's' : ''} imported`;
-      if (skipped > 0) msg += ` (${skipped} skipped — duplicate names)`;
+      let msg = t(count !== 1 ? 'import.imported_other' : 'import.imported_one', { count });
+      if (skipped > 0) msg += t('import.skipped', { skipped });
       showToast(msg);
       onClose();
     } catch (err: unknown) {
@@ -138,12 +140,12 @@ export function ImportModal({ onClose }: Props) {
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-bd shrink-0">
           <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.09em] flex-1">
-            // IMPORT FROM PASSWORD MANAGER
+            {t('import.title')}
           </div>
           <button
             onClick={onClose}
             className="text-tx3 hover:text-tx transition-colors"
-            aria-label="Close"
+            aria-label={t('common.close')}
           >
             <Icon name="close" size={13} />
           </button>
@@ -169,7 +171,7 @@ export function ImportModal({ onClose }: Props) {
           {step === 1 && (
             <div>
               <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mt-2 mb-3">
-                SELECT FORMAT
+                {t('import.selectFormat')}
               </div>
               <div className="flex flex-col gap-1.5">
                 {FORMAT_OPTIONS.map((opt) => (
@@ -198,10 +200,10 @@ export function ImportModal({ onClose }: Props) {
                     />
                     <span className="flex-1">
                       <span className="block text-[12px] font-semibold font-ui text-tx">
-                        {opt.label}
+                        {t(opt.label)}
                       </span>
                       <span className="block text-[10px] font-mono text-tx3 mt-0.5">
-                        {opt.hint}
+                        {t(opt.hint)}
                       </span>
                     </span>
                   </label>
@@ -214,7 +216,7 @@ export function ImportModal({ onClose }: Props) {
           {step === 2 && (
             <div>
               <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mt-2 mb-3">
-                SELECT FILE
+                {t('import.selectFileHeading')}
               </div>
               <div
                 className="border-2 border-dashed border-bd2 rounded-[4px] p-6 flex flex-col items-center gap-3 cursor-pointer hover:border-accent-d transition-colors"
@@ -223,10 +225,10 @@ export function ImportModal({ onClose }: Props) {
                 <Icon name="export" size={22} color="var(--color-tx3)" />
                 <div className="text-center">
                   <div className="text-[12px] font-ui font-semibold text-tx">
-                    Click to select file
+                    {t('import.clickToSelect')}
                   </div>
                   <div className="text-[10px] font-mono text-tx3 mt-0.5">
-                    {format === 'env' ? '.env files' : '.csv files'}
+                    {format === 'env' ? t('import.envFiles') : t('import.csvFiles')}
                   </div>
                 </div>
               </div>
@@ -240,7 +242,7 @@ export function ImportModal({ onClose }: Props) {
               {parsing && (
                 <div className="mt-3 flex items-center gap-2 text-[11px] font-mono text-tx3">
                   <div className="w-3 h-3 rounded-full border-2 border-transparent border-t-accent animate-spin-fast" />
-                  Parsing file…
+                  {t('import.parsingFile')}
                 </div>
               )}
               {parseError && (
@@ -256,13 +258,13 @@ export function ImportModal({ onClose }: Props) {
             <div>
               <div className="flex items-center justify-between mt-2 mb-2">
                 <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em]">
-                  PREVIEW — {rows.length} ITEM{rows.length !== 1 ? 'S' : ''} FOUND
+                  {t(rows.length !== 1 ? 'import.preview_other' : 'import.preview_one', { count: rows.length })}
                 </div>
                 <button
                   onClick={toggleAll}
                   className="text-[10px] font-mono text-tx3 hover:text-tx transition-colors"
                 >
-                  {allSelected ? 'Deselect all' : 'Select all'}
+                  {allSelected ? t('import.deselectAll') : t('import.selectAll')}
                 </button>
               </div>
 
@@ -270,9 +272,9 @@ export function ImportModal({ onClose }: Props) {
                 {/* Table header */}
                 <div className="grid grid-cols-[24px_1fr_80px_80px] gap-x-2 px-2.5 py-1.5 bg-raised border-b border-bd text-[9px] font-semibold text-tx3 font-mono tracking-[0.07em]">
                   <span />
-                  <span>NAME</span>
-                  <span>TYPE</span>
-                  <span>HAS VALUE</span>
+                  <span>{t('import.colName')}</span>
+                  <span>{t('import.colType')}</span>
+                  <span>{t('import.colHasValue')}</span>
                 </div>
 
                 {/* Table rows */}
@@ -304,7 +306,7 @@ export function ImportModal({ onClose }: Props) {
                         {row.name}
                       </span>
                       <span className="text-[9px] font-mono text-tx3 tracking-[0.05em]">
-                        {TYPE_LABELS[row.item_type] ?? row.item_type.toUpperCase()}
+                        {TYPE_LABELS[row.item_type] ? t(TYPE_LABELS[row.item_type]) : row.item_type.toUpperCase()}
                       </span>
                       <span className="text-[11px] font-mono text-tx3">
                         {(row.value || row.password) ? (
@@ -335,13 +337,13 @@ export function ImportModal({ onClose }: Props) {
                 onClick={onClose}
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
               >
-                CANCEL
+                {t('common.cancel')}
               </button>
               <button
                 onClick={() => setStep(2)}
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity"
               >
-                NEXT →
+                {t('import.next')}
               </button>
             </>
           )}
@@ -353,7 +355,7 @@ export function ImportModal({ onClose }: Props) {
                 disabled={parsing}
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
               >
-                ← BACK
+                {t('import.back')}
               </button>
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -361,8 +363,8 @@ export function ImportModal({ onClose }: Props) {
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center justify-center gap-1.5"
               >
                 {parsing ? (
-                  <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />PARSING…</>
-                ) : 'SELECT FILE'}
+                  <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('import.parsing')}</>
+                ) : t('import.selectFile')}
               </button>
             </>
           )}
@@ -374,7 +376,7 @@ export function ImportModal({ onClose }: Props) {
                 disabled={importing}
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
               >
-                ← BACK
+                {t('import.back')}
               </button>
               <button
                 onClick={handleImport}
@@ -382,8 +384,8 @@ export function ImportModal({ onClose }: Props) {
                 className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center justify-center gap-1.5"
               >
                 {importing ? (
-                  <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />IMPORTING…</>
-                ) : `IMPORT ${selectedCount} ITEM${selectedCount !== 1 ? 'S' : ''}`}
+                  <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('import.importing')}</>
+                ) : t(selectedCount !== 1 ? 'import.importN_other' : 'import.importN_one', { count: selectedCount })}
               </button>
             </>
           )}

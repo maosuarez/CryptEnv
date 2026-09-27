@@ -1,5 +1,6 @@
 import { useVaultStore } from '../../store';
 import { useUpdateStore } from '../../store/updateStore';
+import { useTranslation } from '../../i18n';
 
 const BTN = 'h-7 px-3 rounded-[3px] text-[11px] font-semibold tracking-[0.06em] font-ui cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-default';
 
@@ -12,6 +13,7 @@ export function UpdateNotice() {
   const error      = useUpdateStore((s) => s.error);
   const install    = useUpdateStore((s) => s.install);
   const dismiss    = useUpdateStore((s) => s.dismiss);
+  const { t }      = useTranslation();
 
   if (!version || dismissed || screen === 'lock') return null;
 
@@ -20,9 +22,9 @@ export function UpdateNotice() {
       role="status"
       className="fixed bottom-14 right-4 z-[8000] w-[280px] bg-raised border border-accent-d rounded-[4px] px-[14px] py-[10px] shadow-[0_4px_20px_rgba(0,0,0,.6)] animate-fade-in"
     >
-      <div className="text-[12px] font-mono text-accent">Update available: v{version}</div>
+      <div className="text-[12px] font-mono text-accent">{t('update.available', { version })}</div>
       {installed ? (
-        <div className="mt-1 text-[12px] font-mono text-tx2">Installed — restart the app to apply</div>
+        <div className="mt-1 text-[12px] font-mono text-tx2">{t('update.installed')}</div>
       ) : (
         <>
           {error && <div className="mt-1 text-[12px] font-mono text-danger break-words">{error}</div>}
@@ -32,14 +34,14 @@ export function UpdateNotice() {
               disabled={installing}
               className={`${BTN} bg-transparent border border-bd2 text-tx2 hover:text-tx`}
             >
-              LATER
+              {t('update.later')}
             </button>
             <button
               onClick={install}
               disabled={installing}
               className={`${BTN} bg-accent-b border border-accent-d text-accent hover:text-tx`}
             >
-              {installing ? 'INSTALLING…' : 'INSTALL'}
+              {installing ? t('update.installing') : t('update.install')}
             </button>
           </div>
         </>

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Icon } from './Icon';
 import { CmdHL } from './CmdHL';
+import { useTranslation } from '../../i18n';
 
 interface PlaceholderModalProps {
   command: string;
@@ -13,6 +14,7 @@ export function PlaceholderModal({ command, onClose }: PlaceholderModalProps) {
     Object.fromEntries(phs.map((p) => [p, '']))
   );
   const [ok, setOk] = useState(false);
+  const { t } = useTranslation();
 
   const filled = command.replace(/\{\{(\w+)\}\}/g, (_, k) => vals[k] || `{{${k}}}`);
 
@@ -37,10 +39,11 @@ export function PlaceholderModal({ command, onClose }: PlaceholderModalProps) {
         <div className="flex items-center justify-between mb-4">
           <div className="text-[13px] font-semibold text-tx flex items-center gap-[7px]">
             <Icon name="terminal" size={13} color="oklch(0.72 0.16 68)" />
-            Fill Placeholders
+            {t('ui.fillPlaceholders')}
           </div>
           <button
             onClick={onClose}
+            aria-label={t('common.close')}
             className="bg-transparent border-none cursor-pointer text-tx3 flex p-[2px] hover:text-tx transition-colors"
           >
             <Icon name="close" size={13} />
@@ -53,7 +56,7 @@ export function PlaceholderModal({ command, onClose }: PlaceholderModalProps) {
             <input
               value={vals[p]}
               onChange={(e) => setVals((v) => ({ ...v, [p]: e.target.value }))}
-              placeholder={`Value for ${p}…`}
+              placeholder={t('ui.valueFor', { name: p })}
               className={[
                 'w-full px-[10px] py-[7px] bg-raised border border-bd2',
                 'rounded-[3px] text-[12px] font-mono text-tx',
@@ -82,7 +85,7 @@ export function PlaceholderModal({ command, onClose }: PlaceholderModalProps) {
             size={12}
             color={ok ? 'oklch(0.70 0.17 162)' : '#020504'}
           />
-          {ok ? 'COPIED!' : 'COPY FILLED COMMAND'}
+          {ok ? t('ui.copiedBang') : t('ui.copyFilled')}
         </button>
       </div>
     </div>

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { WslActionReport, WslError, WslStatus } from '../types';
+import { t } from '../i18n';
 
 export const wslKeys = {
   detect: ['wsl', 'detect'] as const,
@@ -37,10 +38,10 @@ export function formatWslError(e: unknown): string {
   if (e && typeof e === 'object' && 'kind' in e) {
     const err = e as WslError;
     switch (err.kind) {
-      case 'unsupported':   return 'WSL integration is only available on Windows';
-      case 'notAvailable':  return 'WSL is not installed';
-      case 'unknownDistro': return `Distribution "${err.message ?? ''}" is no longer installed — refresh and try again`;
-      case 'tooling':       return err.message ? `WSL error: ${err.message}` : 'WSL error';
+      case 'unsupported':   return t('store.wslUnsupported');
+      case 'notAvailable':  return t('store.wslNotAvailable');
+      case 'unknownDistro': return t('store.wslUnknownDistro', { distro: err.message ?? '' });
+      case 'tooling':       return err.message ? t('store.wslToolingDetail', { message: err.message }) : t('store.wslTooling');
     }
   }
   return e instanceof Error ? e.message : String(e);

@@ -2,6 +2,7 @@ import { useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
+import { useTranslation } from '../i18n';
 
 interface BackupModalProps {
   onClose: () => void;
@@ -48,6 +49,7 @@ function PwField({
 }
 
 export function BackupModal({ onClose }: BackupModalProps) {
+  const { t } = useTranslation();
   const showToast = useVaultStore((s) => s.showToast);
   const [tab, setTab] = useState<Tab>('export');
 
@@ -71,7 +73,7 @@ export function BackupModal({ onClose }: BackupModalProps) {
   const handleExport = async () => {
     const path = exportPath.trim();
     if (!path) {
-      setExportErr('Enter a file path for the backup.');
+      setExportErr(t('backup.errNoPath'));
       return;
     }
     // Append .cenvbak extension if missing
@@ -81,8 +83,8 @@ export function BackupModal({ onClose }: BackupModalProps) {
     setExportMsg('');
     try {
       const count = await invoke<number>('vault_export_backup', { path: finalPath });
-      setExportMsg(`${count} item${count !== 1 ? 's' : ''} exported to ${finalPath}`);
-      showToast(`Backup saved — ${count} items`);
+      setExportMsg(t(count !== 1 ? 'backup.exportedTo_other' : 'backup.exportedTo_one', { count, path: finalPath }));
+      showToast(t('backup.toastSaved', { count }));
     } catch (e: unknown) {
       setExportErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -101,18 +103,18 @@ export function BackupModal({ onClose }: BackupModalProps) {
     reader.onload = (ev) => {
       setFileContent(ev.target?.result as string ?? null);
     };
-    reader.onerror = () => setRestoreErr('Failed to read file.');
+    reader.onerror = () => setRestoreErr(t('backup.errReadFile'));
     reader.readAsText(file);
   };
 
   // ── Restore handler ─────────────────────────────────────────────────────────
   const handleRestore = async () => {
     if (!fileContent) {
-      setRestoreErr('Select a .cenvbak file first.');
+      setRestoreErr(t('backup.errNoFile'));
       return;
     }
     if (!restorePw) {
-      setRestoreErr('Enter the master password used when this backup was created.');
+      setRestoreErr(t('backup.errNoPassword'));
       return;
     }
     setRestoring(true);
@@ -125,8 +127,8 @@ export function BackupModal({ onClose }: BackupModalProps) {
       });
       showToast(
         restoreMode === 'merge'
-          ? `Merged — ${count} item${count !== 1 ? 's' : ''} added`
-          : `Restored — ${count} item${count !== 1 ? 's' : ''}`,
+          ? t(count !== 1 ? 'backup.toastMerged_other' : 'backup.toastMerged_one', { count })
+          : t(count !== 1 ? 'backup.toastRestored_other' : 'backup.toastRestored_one', { count }),
       );
       onClose();
     } catch (e: unknown) {
@@ -136,11 +138,11 @@ export function BackupModal({ onClose }: BackupModalProps) {
     }
   };
 
-  const tabCls = (t: Tab) =>
+  const tabCls = (target: Tab) =>
     [
       'flex-1 py-[7px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer transition-colors',
       'border-b-2 rounded-none bg-transparent',
-      tab === t
+      tab === target
         ? 'border-accent text-accent'
         : 'border-transparent text-tx3 hover:text-tx',
     ].join(' ');
@@ -151,7 +153,7 @@ export function BackupModal({ onClose }: BackupModalProps) {
         {/* Header */}
         <div className="flex items-center px-4 pt-3 pb-0 border-b border-bd">
           <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.09em] flex-1">
-            // BACKUP & RESTORE
+            {t('backup.title')}
           </div>
           <button
             onClick={onClose}
@@ -164,10 +166,10 @@ export function BackupModal({ onClose }: BackupModalProps) {
         {/* Tabs */}
         <div className="flex border-b border-bd px-4">
           <button className={tabCls('export')} onClick={() => setTab('export')}>
-            EXPORT
+            {t('backup.tabExport')}
           </button>
           <button className={tabCls('restore')} onClick={() => setTab('restore')}>
-            RESTORE
+            {t('backup.tabRestore')}
           </button>
         </div>
 
@@ -176,14 +178,12 @@ export function BackupModal({ onClose }: BackupModalProps) {
           {tab === 'export' && (
             <>
               <p className="text-[11px] text-tx3 font-mono leading-[1.7]">
-                Exports all items and categories to an encrypted <code>.cenvbak</code> file.
-                Items remain encrypted with your vault key — the backup requires your
-                master password to restore.
+                {t('backup.exportIntroBefore')}<code>.cenvbak</code>{t('backup.exportIntroAfter')}
               </p>
 
               <div>
                 <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
-                  SAVE PATH
+                  {t('backup.savePath')}
                 </div>
                 <input
                   type="text"
@@ -193,7 +193,7 @@ export function BackupModal({ onClose }: BackupModalProps) {
                   className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors placeholder:text-tx3"
                 />
                 <div className="text-[10px] text-tx3 font-mono mt-1">
-                  Extension <code>.cenvbak</code> is appended automatically if omitted.
+                  {t('backup.extensionBefore')}<code>.cenvbak</code>{t('backup.extensionAfter')}
                 </div>
               </div>
 
@@ -217,12 +217,12 @@ export function BackupModal({ onClose }: BackupModalProps) {
                 {exporting ? (
                   <>
                     <div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />
-                    EXPORTING…
+                    {t('backup.exporting')}
                   </>
                 ) : (
                   <>
                     <Icon name="export" size={12} color="#020504" />
-                    EXPORT BACKUP
+                    {t('backup.exportBackup')}
                   </>
                 )}
               </button>
@@ -244,20 +244,20 @@ export function BackupModal({ onClose }: BackupModalProps) {
                         : 'bg-transparent border-bd2 text-tx3 hover:text-tx',
                     ].join(' ')}
                   >
-                    {mode === 'merge' ? 'MERGE' : 'REPLACE'}
+                    {mode === 'merge' ? t('backup.merge') : t('backup.replace')}
                   </button>
                 ))}
               </div>
               <p className="text-[10px] text-tx3 font-mono leading-[1.6] -mt-1">
                 {restoreMode === 'merge'
-                  ? 'Adds items from the backup to your existing vault. Duplicates are inserted as new entries.'
-                  : 'Wipes the entire vault and replaces it with the backup. This cannot be undone.'}
+                  ? t('backup.mergeHint')
+                  : t('backup.replaceHint')}
               </p>
 
               {/* File picker */}
               <div>
                 <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
-                  BACKUP FILE
+                  {t('backup.backupFile')}
                 </div>
                 <input
                   ref={fileInputRef}
@@ -272,14 +272,14 @@ export function BackupModal({ onClose }: BackupModalProps) {
                 >
                   <Icon name="export" size={12} />
                   <span className="flex-1 truncate">
-                    {fileName || 'Choose .cenvbak file…'}
+                    {fileName || t('backup.chooseFile')}
                   </span>
                 </button>
               </div>
 
               {/* Password field */}
               <PwField
-                label="MASTER PASSWORD (from backup)"
+                label={t('backup.masterPassword')}
                 value={restorePw}
                 show={showPw}
                 onChange={(v) => { setRestorePw(v); setRestoreErr(''); }}
@@ -298,7 +298,7 @@ export function BackupModal({ onClose }: BackupModalProps) {
                   disabled={restoring}
                   className="flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
                 >
-                  CANCEL
+                  {t('common.cancel')}
                 </button>
                 <button
                   onClick={handleRestore}
@@ -314,12 +314,12 @@ export function BackupModal({ onClose }: BackupModalProps) {
                   {restoring ? (
                     <>
                       <div className={`w-3 h-3 rounded-full border-2 border-transparent animate-spin-fast ${restoreMode === 'replace' ? 'border-t-white' : 'border-t-[#020504]'}`} />
-                      RESTORING…
+                      {t('backup.restoring')}
                     </>
                   ) : restoreMode === 'replace' ? (
-                    'REPLACE VAULT'
+                    t('backup.replaceVault')
                   ) : (
-                    'MERGE INTO VAULT'
+                    t('backup.mergeIntoVault')
                   )}
                 </button>
               </div>

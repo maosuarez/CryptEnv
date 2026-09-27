@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { Icon } from './Icon';
+import { useTranslation } from '../../i18n';
 
 interface CopyBtnProps {
   value:  string;
@@ -8,8 +9,9 @@ interface CopyBtnProps {
   title?: string;
 }
 
-export function CopyBtn({ value, label = 'COPY', title }: CopyBtnProps) {
+export function CopyBtn({ value, label, title }: CopyBtnProps) {
   const [ok, setOk] = useState(false);
+  const { t } = useTranslation();
 
   const handle = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -34,7 +36,7 @@ export function CopyBtn({ value, label = 'COPY', title }: CopyBtnProps) {
       ].join(' ')}
     >
       <Icon name={ok ? 'check' : 'copy'} size={12} />
-      {ok ? 'OK' : label}
+      {ok ? t('ui.ok') : (label ?? t('rows.copy'))}
     </button>
   );
 }

@@ -1,4 +1,5 @@
 import type { Category } from '../../types';
+import { useTranslation } from '../../i18n';
 
 interface TagInputProps {
   selected:   string[];
@@ -8,13 +9,14 @@ interface TagInputProps {
 
 export function TagInput({ selected, categories, onChange }: TagInputProps) {
   const avail = categories.filter((c) => !selected.includes(c.name));
+  const { t } = useTranslation();
 
   return (
     <div>
       <div className="flex flex-wrap gap-1 min-h-6 mb-1.5">
         {selected.length === 0 && (
           <span className="text-[11px] text-tx3 self-center">
-            No categories — click below to add
+            {t('ui.noCategoriesHint')}
           </span>
         )}
         {selected.map((name) => {
@@ -31,6 +33,7 @@ export function TagInput({ selected, categories, onChange }: TagInputProps) {
               {name}
               <button
                 onClick={() => onChange(selected.filter((s) => s !== name))}
+                aria-label={t('ui.removeTag', { name })}
                 className="bg-transparent border-none cursor-pointer text-accent-d p-0 leading-none text-[14px] flex items-center"
               >
                 ×

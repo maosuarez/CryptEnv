@@ -5,6 +5,7 @@ import { KebabBtn } from '../ui/KebabBtn';
 import { ContextMenu } from '../ui/ContextMenu';
 import { CatBadges } from './SecretRow';
 import { useVaultStore } from '../../store';
+import { useTranslation } from '../../i18n';
 import type { CredentialItem, Category } from '../../types';
 
 interface Props {
@@ -22,19 +23,20 @@ export function CredentialRow({ item, cats, selected, onToggle, onShare, onSelec
   const go            = useVaultStore((s) => s.go);
   const setEditTarget = useVaultStore((s) => s.setEditTarget);
   const deleteItem    = useVaultStore((s) => s.deleteItem);
+  const { t }         = useTranslation();
 
   const domain = item.url?.replace(/https?:\/\//, '').split('/')[0] ?? '';
 
   const kebab = [
-    { icon: 'edit',     label: 'Edit',         onClick: () => { setEditTarget(item); go('edit'); } },
-    { icon: 'external', label: 'Open URL',      onClick: () => {} },
+    { icon: 'edit',     label: t('common.edit'),onClick: () => { setEditTarget(item); go('edit'); } },
+    { icon: 'external', label: t('rows.openUrl'),      onClick: () => {} },
     { divider: true },
-    { icon: 'trash',    label: 'Delete', danger: true, onClick: () => deleteItem(item.id) },
+    { icon: 'trash',    label: t('common.deleteLower'), danger: true, onClick: () => deleteItem(item.id) },
   ];
 
   const ctxItems = [
-    { icon: 'export', label: 'Share this item',    onClick: () => onShare?.(item.id) },
-    { icon: 'check',  label: 'Select for sharing', onClick: () => onSelect?.(item.id) },
+    { icon: 'export', label: t('rows.shareItem'),    onClick: () => onShare?.(item.id) },
+    { icon: 'check',  label: t('rows.selectForSharing'), onClick: () => onSelect?.(item.id) },
   ];
 
   return (
@@ -80,15 +82,15 @@ export function CredentialRow({ item, cats, selected, onToggle, onShare, onSelec
       <div className="pl-5 flex flex-col gap-2">
         {/* Username */}
         <div className="flex items-center gap-2">
-          <Icon name="person" size={12} color="#4a5268" />
+          <Icon name="person" size={12} color="var(--color-tx4)" />
           <span className="flex-1 text-xs font-mono text-tx2 overflow-hidden text-ellipsis whitespace-nowrap">
             {item.username}
           </span>
-          <CopyBtn value={item.username} label="USER" title="Copy username" />
+          <CopyBtn value={item.username} label={t('rows.user')} title={t('rows.copyUsername')} />
         </div>
         {/* Password */}
         <div className="flex items-center gap-2">
-          <Icon name="key" size={12} color="#4a5268" />
+          <Icon name="key" size={12} color="var(--color-tx4)" />
           <span
             className={[
               'flex-1 text-xs font-mono overflow-hidden text-ellipsis whitespace-nowrap',
@@ -99,11 +101,12 @@ export function CredentialRow({ item, cats, selected, onToggle, onShare, onSelec
           </span>
           <button
             onClick={(e) => { e.stopPropagation(); setShowPw((v) => !v); }}
+            aria-label={showPw ? t('common.hide') : t('common.show')}
             className="bg-transparent border-none cursor-pointer text-tx3 flex p-0.5 hover:text-tx transition-colors"
           >
             <Icon name={showPw ? 'eyeOff' : 'eye'} size={13} />
           </button>
-          <CopyBtn value={item.password} label="PASS" title="Copy password" />
+          <CopyBtn value={item.password} label={t('rows.pass')} title={t('rows.copyPassword')} />
         </div>
       </div>
       {item.notes && (

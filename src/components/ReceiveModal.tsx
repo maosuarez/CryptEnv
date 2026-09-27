@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
+import { useTranslation } from '../i18n';
 
 type SessionState =
   | 'listening'
@@ -195,6 +196,7 @@ function FingerprintDisplay({ fp }: { fp: string }) {
 
 export function ReceiveModal({ onClose }: ReceiveModalProps) {
   const go = useVaultStore((s) => s.go);
+  const { t } = useTranslation();
   const [step, setStep] = useState<Step>('lan-receive');
   const [inputCode, setInputCode] = useState('');
   const [receiveStatus, setReceiveStatus] = useState<'idle' | 'loading' | 'connecting'>('idle');
@@ -236,7 +238,7 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
           }
         } else if (result.state === 'failed') {
           stopPolling();
-          setFailedError(result.error ?? 'Transfer failed');
+          setFailedError(result.error ?? t('receive.transferFailed'));
           setStep('failed');
         } else if (result.state === 'cancelled') {
           stopPolling();
@@ -248,7 +250,7 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
         setStep('failed');
       }
     }, 800);
-  }, [stopPolling, onClose]);
+  }, [stopPolling, onClose, t]);
 
   const handleCancel = async () => {
     stopPolling();
@@ -312,8 +314,8 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
 
     return (
       <>
-        <Breadcrumb path="LAN  /  RECEIVE" />
-        <SectionLabel>Enter pairing code</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.lanReceive')} />
+        <SectionLabel>{t('receive.enterPairingCode')}</SectionLabel>
         <PairingCodeInput
           value={inputCode}
           onChange={setInputCode}
@@ -322,19 +324,19 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
         {isConnecting && (
           <div className="flex items-center justify-center gap-2 text-[11px] text-tx3 font-mono mb-2">
             <Spinner />
-            <span>Connecting…</span>
+            <span>{t('receive.connecting')}</span>
           </div>
         )}
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex justify-between">
-          <BtnSecondary onClick={handleCancel}>BACK</BtnSecondary>
+          <BtnSecondary onClick={handleCancel}>{t('receive.back')}</BtnSecondary>
           <BtnPrimary
             onClick={handleReceiveSubmit}
             disabled={inputCode.length < 6 || isLoading || isConnecting}
           >
             {isLoading ? <Spinner /> : null}
-            CONNECT
+            {t('receive.connect')}
           </BtnPrimary>
         </div>
       </>
@@ -344,28 +346,27 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   function renderFingerprint() {
     return (
       <>
-        <Breadcrumb path="LAN  /  RECEIVE  /  VERIFY" />
-        <SectionLabel>Verify fingerprint</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.lanVerify')} />
+        <SectionLabel>{t('receive.verifyFingerprint')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-3 leading-[1.6]">
-          Confirm that both devices show the same fingerprint before proceeding:
+          {t('receive.verifyPrompt')}
         </p>
         <FingerprintDisplay fp={fingerprint} />
         <p className="text-[11px] text-tx3 font-mono mt-2 mb-4 leading-[1.5]">
-          If they match, you are connected to the right device.
-          If they differ, reject immediately.
+          {t('receive.verifyHint')}
         </p>
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex gap-2 justify-between">
           <BtnSecondary onClick={() => handleFingerprintConfirm(false)} disabled={fpConfirming}>
-            REJECT
+            {t('receive.reject')}
           </BtnSecondary>
           <BtnPrimary
             onClick={() => handleFingerprintConfirm(true)}
             disabled={fpConfirming}
           >
             {fpConfirming ? <Spinner /> : <Icon name="check" size={12} color="#020504" />}
-            CONFIRM
+            {t('receive.confirm')}
           </BtnPrimary>
         </div>
       </>
@@ -375,10 +376,10 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   function renderDoneReceive() {
     return (
       <>
-        <Breadcrumb path="LAN  /  RECEIVE  /  DONE" />
-        <SectionLabel>Received items</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.lanDone')} />
+        <SectionLabel>{t('receive.receivedItems')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-3 leading-[1.6]">
-          {receivedNames.length} item{receivedNames.length !== 1 ? 's' : ''} successfully received and added to your vault.
+          {t(receivedNames.length === 1 ? 'receive.received_one' : 'receive.received_other', { n: receivedNames.length })}
         </p>
         <div className="bg-raised border border-bd rounded-[3px] px-3 py-2 mb-4 max-h-[200px] overflow-y-auto">
           {receivedNames.map((name, i) => (
@@ -389,7 +390,7 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
         </div>
         <Divider />
         <div className="flex justify-end">
-          <BtnPrimary onClick={handleImportDoneClose}>CLOSE</BtnPrimary>
+          <BtnPrimary onClick={handleImportDoneClose}>{t('receive.close')}</BtnPrimary>
         </div>
       </>
     );
@@ -398,28 +399,28 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   function renderFileImport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  IMPORT" />
-        <SectionLabel>Import encrypted file</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.fileImport')} />
+        <SectionLabel>{t('receive.importFile')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-4 leading-[1.6]">
-          A file dialog will open. Select the encrypted file, then enter the passphrase you received.
+          {t('receive.importFileHint')}
         </p>
         <div className="mb-3">
-          <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">Passphrase</div>
+          <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('receive.passphrase')}</div>
           <input
             type="password"
             value={importPassphrase}
             onChange={(e) => setImportPassphrase(e.target.value)}
-            placeholder="Enter passphrase…"
+            placeholder={t('receive.passphrasePlaceholder')}
             className="w-full bg-bg border border-bd2 text-tx font-mono text-[13px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
           />
         </div>
         {error && <div className="mb-3"><InlineError msg={error} /></div>}
         <Divider />
         <div className="flex gap-2 justify-between">
-          <BtnSecondary onClick={handleCancel}>CANCEL</BtnSecondary>
+          <BtnSecondary onClick={handleCancel}>{t('common.cancel')}</BtnSecondary>
           <BtnPrimary onClick={handleFileImportSubmit} disabled={!importPassphrase || importLoading}>
             {importLoading ? <Spinner /> : null}
-            IMPORT
+            {t('receive.import')}
           </BtnPrimary>
         </div>
       </>
@@ -429,10 +430,10 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   function renderDoneFileImport() {
     return (
       <>
-        <Breadcrumb path="FILE  /  IMPORT  /  DONE" />
-        <SectionLabel>Import successful</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.fileImportDone')} />
+        <SectionLabel>{t('receive.importSuccess')}</SectionLabel>
         <p className="text-[12px] text-tx2 mb-3 leading-[1.6]">
-          {importedNames.length} item{importedNames.length !== 1 ? 's' : ''} successfully imported into your vault.
+          {t(importedNames.length === 1 ? 'receive.imported_one' : 'receive.imported_other', { n: importedNames.length })}
         </p>
         <div className="bg-raised border border-bd rounded-[3px] px-3 py-2 mb-4 max-h-[200px] overflow-y-auto">
           {importedNames.map((name, i) => (
@@ -443,7 +444,7 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
         </div>
         <Divider />
         <div className="flex justify-end">
-          <BtnPrimary onClick={handleImportDoneClose}>CLOSE</BtnPrimary>
+          <BtnPrimary onClick={handleImportDoneClose}>{t('receive.close')}</BtnPrimary>
         </div>
       </>
     );
@@ -452,12 +453,12 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   function renderFailed() {
     return (
       <>
-        <Breadcrumb path="ERROR" />
-        <SectionLabel>Transfer failed</SectionLabel>
+        <Breadcrumb path={t('receive.crumb.error')} />
+        <SectionLabel>{t('receive.transferFailed')}</SectionLabel>
         <InlineError msg={failedError} />
         <Divider />
         <div className="flex justify-end">
-          <BtnSecondary onClick={handleCancel}>CLOSE</BtnSecondary>
+          <BtnSecondary onClick={handleCancel}>{t('receive.close')}</BtnSecondary>
         </div>
       </>
     );
@@ -481,7 +482,7 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Icon name="shield" size={14} color="oklch(0.70 0.17 162)" />
-            <span className="text-[12px] font-bold tracking-wider font-ui text-tx">RECEIVE</span>
+            <span className="text-[12px] font-bold tracking-wider font-ui text-tx">{t('receive.title')}</span>
           </div>
           <button
             onClick={step === 'lan-receive' ? onClose : handleCancel}
