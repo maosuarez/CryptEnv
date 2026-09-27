@@ -12,6 +12,7 @@ pub mod relay;
 pub mod scope;
 pub mod search;
 pub mod set;
+pub mod setup;
 pub mod share;
 pub mod sync;
 pub mod tui;

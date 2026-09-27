@@ -45,6 +45,8 @@ enum Cmd {
     Tui(commands::tui::TuiArgs),
     /// Manage projects and their environments (list, inject, delete)
     Project(commands::project::ProjectArgs),
+    /// Configure the CLI for a split setup (e.g. `setup wsl`)
+    Setup(commands::setup::SetupArgs),
     /// Share secrets via internet relay (send, receive)
     Relay(commands::relay::RelayArgs),
     /// Sync new variables from .env.example into .env without overwriting existing values
@@ -53,7 +55,7 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.cmd {
+    let result = client::init_api_base().and_then(|()| match cli.cmd {
         Cmd::Add(args) => commands::add::run(args),
         Cmd::Doctor(args) => commands::doctor::run(args),
         Cmd::Fill(args) => commands::fill::run(args),
@@ -70,7 +72,8 @@ fn main() {
         Cmd::Project(args) => commands::project::run(args),
         Cmd::Relay(args) => commands::relay::run(args),
         Cmd::Sync(args) => commands::sync::run(args),
-    };
+        Cmd::Setup(args) => commands::setup::run(args),
+    });
     if let Err(e) = result {
         eprintln!("{}", e);
         std::process::exit(1);

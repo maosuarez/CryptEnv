@@ -38,6 +38,18 @@ crypt-env tui
 
 The `crypt-env` CLI communicates with the running app via the local authenticated REST API (`127.0.0.1:47821`).
 
+### Client configuration (environment variables)
+
+All three are optional and default to today's behavior — the CLI, the `crypt-env tui`, and `crypt-env-mcp` all read them. They exist mainly for split setups where the client and the vault run on different sides of a boundary (see the [WSL ↔ Windows guide](wsl-windows.md)).
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CRYPTENV_API_URL` | `https://127.0.0.1:47821` | REST base URL the client connects to. Must be an absolute `http`/`https` URL — a malformed value aborts the command before any request. Resolved once per invocation. If the host is **not** a loopback address (`127.0.0.0/8`, `::1`, `localhost`) the client prints a one-line stderr warning that the vault is expected to be reachable only over localhost, then proceeds. |
+| `CRYPTENV_CERT_PATH` | probe `APPDATA` → `XDG_DATA_HOME` → `HOME/.local/share`, each joined with `com.maosuarez.cryptenv/tls/cert.pem` | Absolute path to the REST API's TLS certificate PEM, checked **before** the platform probe. When set, the file is used verbatim: if it cannot be read the client errors naming the path — it never falls back to the probe, and never disables certificate verification. |
+| `CRYPTENV_TOKEN_PATH` | `%APPDATA%\com.maosuarez.cryptenv\.cli_token` (Windows) or `~/.local/share/com.maosuarez.cryptenv/.cli_token` | Absolute path to the session-token file. On non-Windows targets, if the token is written but its permissions cannot be tightened to owner-only (e.g. a `/mnt/c` DrvFs path under WSL), the client keeps the token and continues; a genuine write failure still errors. |
+
+Use `crypt-env setup wsl` to persist `CRYPTENV_API_URL` and `CRYPTENV_CERT_PATH` into your shell startup non-destructively — see the [WSL ↔ Windows guide](wsl-windows.md).
+
 ### Item Management
 
 #### `crypt-env add [KEY=value] | [--file .env] | [$VARNAME]`

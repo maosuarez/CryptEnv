@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 
-use crate::client::{authenticated_delete, authenticated_get, authenticated_post, authenticated_put, CliError, API_BASE};
+use crate::client::{authenticated_delete, authenticated_get, authenticated_post, authenticated_put, CliError};
 
 // ─── CLI argument structs ─────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ pub fn run(args: CategoryArgs) -> Result<(), CliError> {
 // ─── List ─────────────────────────────────────────────────────────────────────
 
 fn run_list() -> Result<(), CliError> {
-    let resp = authenticated_get(&format!("{API_BASE}/categories"))?;
+    let resp = authenticated_get(&format!("{base}/categories", base = crate::client::api_base()))?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -97,7 +97,7 @@ fn run_list() -> Result<(), CliError> {
 
 fn run_create(name: String, color: String) -> Result<(), CliError> {
     let body = serde_json::json!({ "name": name, "color": color });
-    let resp = authenticated_post(&format!("{API_BASE}/categories"), &body)?;
+    let resp = authenticated_post(&format!("{base}/categories", base = crate::client::api_base()), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -133,7 +133,7 @@ fn run_edit(id: String, name: Option<String>, color: Option<String>) -> Result<(
         body["color"] = serde_json::json!(c);
     }
 
-    let resp = authenticated_put(&format!("{API_BASE}/categories/{id}"), &body)?;
+    let resp = authenticated_put(&format!("{base}/categories/{id}", base = crate::client::api_base()), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -158,7 +158,7 @@ fn run_edit(id: String, name: Option<String>, color: Option<String>) -> Result<(
 // ─── Delete ───────────────────────────────────────────────────────────────────
 
 fn run_delete(id: String) -> Result<(), CliError> {
-    let resp = authenticated_delete(&format!("{API_BASE}/categories/{id}"))?;
+    let resp = authenticated_delete(&format!("{base}/categories/{id}", base = crate::client::api_base()))?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);

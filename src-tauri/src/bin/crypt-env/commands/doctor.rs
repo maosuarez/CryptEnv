@@ -1,5 +1,5 @@
 use clap::Args;
-use crate::client::{API_BASE, CliError, read_token};
+use crate::client::{CliError, read_token};
 use crate::commands::scope;
 
 #[derive(Args)]
@@ -13,7 +13,7 @@ pub fn run(_args: DoctorArgs) -> Result<(), CliError> {
         .build()
         .map_err(|e| CliError::Api(e.to_string()))?;
 
-    match client.get(format!("{API_BASE}/health")).send() {
+    match client.get(format!("{base}/health", base = crate::client::api_base())).send() {
         Err(e) if e.is_connect() => {
             println!("  [!!] App running        not running — open crypt-env and try again");
             println!();

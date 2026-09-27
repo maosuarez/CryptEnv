@@ -103,10 +103,11 @@ Hierarchical organization for environment variables. Projects contain multiple t
 - `src-tauri/src/db/mod.rs` — SQLite tables: `projects`, `environments`, `environment_vars`, `item_projects`, `project_categories`
 - `items.is_global` plaintext column tracks reusability across projects; `item_projects` tracks ownership
 
-### 2. Interactive TUI (`crypt-env tui`)
+### 2. CLI & Interactive TUI (`crypt-env`, `crypt-env tui`)
 Terminal user interface for vault management without opening the GUI.
 - Source: `src-tauri/src/bin/crypt-env/commands/tui.rs` (ratatui 0.29 + crossterm 0.28)
 - Keybindings: `↑`/`↓`/`j`/`k` (navigate), `/` (fuzzy search), `Enter` (detail), `v` (reveal), `c` (copy), `d` (delete), `?` (help), `q` (quit).
+- Client config: `CRYPTENV_API_URL`, `CRYPTENV_CERT_PATH`, `CRYPTENV_TOKEN_PATH` env vars (endpoint / TLS anchor / token path) resolved in `src-tauri/src/bin/crypt-env/client.rs`; `crypt-env setup wsl` (`commands/setup.rs`) persists them into the shell. See [`docs/cli.md`](docs/cli.md) and the WSL ↔ Windows topology guide [`docs/wsl-windows.md`](docs/wsl-windows.md).
 
 ### 3. Internet Relay Sharing
 Secure ephemeral secret sharing via Supabase table (AES-256-GCM + Argon2id passphrases + burn-after-read + 24-hour TTL).

@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use comfy_table::{presets::UTF8_FULL, ContentArrangement, Table};
 use serde::Deserialize;
 
-use crate::client::{authenticated_delete, authenticated_get, authenticated_post, CliError, ItemSummary, API_BASE};
+use crate::client::{authenticated_delete, authenticated_get, authenticated_post, CliError, ItemSummary};
 
 // ─── CLI argument structs ─────────────────────────────────────────────────────
 
@@ -125,7 +125,7 @@ pub fn run(args: ProjectArgs) -> Result<(), CliError> {
 // ─── List ─────────────────────────────────────────────────────────────────────
 
 fn fetch_projects() -> Result<Vec<ProjectSummary>, CliError> {
-    let resp = authenticated_get(&format!("{API_BASE}/projects"))?;
+    let resp = authenticated_get(&format!("{base}/projects", base = crate::client::api_base()))?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -187,7 +187,7 @@ fn run_inject(id: Option<i64>, project: Option<String>, environment: Option<Stri
     };
 
     let resp = authenticated_post(
-        &format!("{API_BASE}/environments/{environment_id}/inject"),
+        &format!("{base}/environments/{environment_id}/inject", base = crate::client::api_base()),
         &serde_json::json!({}),
     )?;
 
@@ -231,7 +231,7 @@ fn resolve_environment_id(project: &str, environment: &str) -> Result<i64, CliEr
 // ─── Delete ───────────────────────────────────────────────────────────────────
 
 fn run_delete(id: i64) -> Result<(), CliError> {
-    let resp = authenticated_delete(&format!("{API_BASE}/projects/{id}"))?;
+    let resp = authenticated_delete(&format!("{base}/projects/{id}", base = crate::client::api_base()))?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -249,7 +249,7 @@ fn run_delete(id: i64) -> Result<(), CliError> {
 }
 
 fn run_delete_env(id: i64) -> Result<(), CliError> {
-    let resp = authenticated_delete(&format!("{API_BASE}/environments/{id}"))?;
+    let resp = authenticated_delete(&format!("{base}/environments/{id}", base = crate::client::api_base()))?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -334,7 +334,7 @@ fn select_environments<'a>(project: &'a ProjectSummary, envs: Option<&str>) -> R
 /// the manifest can show `KEY -> item name` instead of raw item ids — reuses
 /// the existing `GET /items` endpoint rather than adding a new one (D4).
 fn fetch_environment_item_names(environment_id: i64) -> Result<HashMap<i64, String>, CliError> {
-    let resp = authenticated_get(&format!("{API_BASE}/items?environment_id={environment_id}"))?;
+    let resp = authenticated_get(&format!("{base}/items?environment_id={environment_id}", base = crate::client::api_base()))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
     }
@@ -385,7 +385,7 @@ fn run_share(id: Option<i64>, name: Option<String>, envs: Option<String>, yes: b
 
     let environment_ids: Vec<i64> = selected.iter().map(|e| e.id).collect();
     let body = serde_json::json!({ "environment_ids": environment_ids });
-    let resp = authenticated_post(&format!("{API_BASE}/projects/{}/relay/send", project.id), &body)?;
+    let resp = authenticated_post(&format!("{}/projects/{}/relay/send", crate::client::api_base(), project.id), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -431,7 +431,7 @@ fn run_receive(code: String, passphrase: String, as_name: Option<String>) -> Res
         body["project_name_override"] = serde_json::json!(name);
     }
 
-    let resp = authenticated_post(&format!("{API_BASE}/projects/relay/receive"), &body)?;
+    let resp = authenticated_post(&format!("{base}/projects/relay/receive", base = crate::client::api_base()), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);

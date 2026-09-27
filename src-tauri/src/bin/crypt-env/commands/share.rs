@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
-use crate::client::{authenticated_get, authenticated_post, CliError, API_BASE};
+use crate::client::{authenticated_get, authenticated_post, CliError};
 use crate::commands::scope;
 
 // ─── CLI argument structs ─────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ fn run_send(items: Vec<i64>, project: Option<String>, env: Option<String>) -> Re
     // 1. Start listen session — items must already be linked into this
     // project/environment (the API 422s otherwise).
     let body = serde_json::json!({ "items": items });
-    let url = resolved_scope.append_query(&format!("{API_BASE}/share/listen"));
+    let url = resolved_scope.append_query(&format!("{base}/share/listen", base = crate::client::api_base()));
     let resp = authenticated_post(&url, &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -110,7 +110,7 @@ fn run_send(items: Vec<i64>, project: Option<String>, env: Option<String>) -> Re
     // 4. POST /share/confirm
     let confirm_body = serde_json::json!({ "confirmed": confirmed });
     let confirm_resp =
-        authenticated_post(&format!("{API_BASE}/share/confirm"), &confirm_body)?;
+        authenticated_post(&format!("{base}/share/confirm", base = crate::client::api_base()), &confirm_body)?;
     if !confirm_resp.status().is_success() {
         let text = confirm_resp.text().unwrap_or_default();
         return Err(CliError::Api(format!("confirm failed: {text}")));
@@ -154,7 +154,7 @@ fn run_receive(project: Option<String>, env: Option<String>) -> Result<(), CliEr
     // 2. POST /share/connect — received items get owned by this project and
     // linked into this environment.
     let body = serde_json::json!({ "pairing_code": pairing_code });
-    let url = resolved_scope.append_query(&format!("{API_BASE}/share/connect"));
+    let url = resolved_scope.append_query(&format!("{base}/share/connect", base = crate::client::api_base()));
     let resp = authenticated_post(&url, &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -182,7 +182,7 @@ fn run_receive(project: Option<String>, env: Option<String>) -> Result<(), CliEr
     // 4. POST /share/confirm
     let confirm_body = serde_json::json!({ "confirmed": confirmed });
     let confirm_resp =
-        authenticated_post(&format!("{API_BASE}/share/confirm"), &confirm_body)?;
+        authenticated_post(&format!("{base}/share/confirm", base = crate::client::api_base()), &confirm_body)?;
     if !confirm_resp.status().is_success() {
         let text = confirm_resp.text().unwrap_or_default();
         return Err(CliError::Api(format!("confirm failed: {text}")));
@@ -217,7 +217,7 @@ fn run_export(items: Vec<i64>, output: PathBuf) -> Result<(), CliError> {
         "output_path": output_str,
     });
 
-    let resp = authenticated_post(&format!("{API_BASE}/share/export"), &body)?;
+    let resp = authenticated_post(&format!("{base}/share/export", base = crate::client::api_base()), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -255,7 +255,7 @@ fn run_import(file: PathBuf, project: Option<String>, env: Option<String>) -> Re
         "passphrase": passphrase,
     });
 
-    let url = resolved_scope.append_query(&format!("{API_BASE}/share/import"));
+    let url = resolved_scope.append_query(&format!("{base}/share/import", base = crate::client::api_base()));
     let resp = authenticated_post(&url, &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -303,7 +303,7 @@ fn poll_until_fingerprint() -> Result<String, CliError> {
     for _ in 0..max_polls {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        let resp = authenticated_get(&format!("{API_BASE}/share/status"))?;
+        let resp = authenticated_get(&format!("{base}/share/status", base = crate::client::api_base()))?;
         if !resp.status().is_success() {
             continue;
         }
@@ -337,7 +337,7 @@ fn poll_until_terminal(context: &str) -> Result<(), CliError> {
     for _ in 0..max_polls {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        let resp = authenticated_get(&format!("{API_BASE}/share/status"))?;
+        let resp = authenticated_get(&format!("{base}/share/status", base = crate::client::api_base()))?;
         if !resp.status().is_success() {
             continue;
         }
@@ -368,7 +368,7 @@ fn poll_until_terminal_with_names() -> Result<(Vec<String>, Vec<String>), CliErr
     for _ in 0..max_polls {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        let resp = authenticated_get(&format!("{API_BASE}/share/status"))?;
+        let resp = authenticated_get(&format!("{base}/share/status", base = crate::client::api_base()))?;
         if !resp.status().is_success() {
             continue;
         }

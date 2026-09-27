@@ -27,7 +27,7 @@ pub fn run(args: SearchArgs) -> Result<(), CliError> {
     let resolved_scope = scope::resolve(args.project.as_deref(), args.env.as_deref(), false)?;
     let url = resolved_scope.append_query(&format!(
         "{}/items?search={}&include_global={}",
-        client::API_BASE,
+        client::api_base(),
         client::urlencod(&args.query),
         client::urlencod(&args.scope_globals)
     ));
