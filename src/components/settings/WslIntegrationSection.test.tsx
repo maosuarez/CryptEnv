@@ -6,15 +6,15 @@ import type { WslActionReport, WslStatus } from '../../types';
 const invoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 
-import { WslIntegrationSection, WSLCONFIG_SNIPPET } from './WslIntegrationSection';
+import { WslIntegrationSection, WSLCONFIG_SNIPPET, launcherLine } from './WslIntegrationSection';
 import { useWslStore } from '../../store/wslStore';
 
 const TWO_DISTROS: WslStatus = {
   available: true,
   mirrored:  false,
   distros: [
-    { name: 'Ubuntu', defaultUser: 'me',   configured: true  },
-    { name: 'Debian', defaultUser: null,   configured: false },
+    { name: 'Ubuntu', defaultUser: 'me',   configured: true,  launcher: true  },
+    { name: 'Debian', defaultUser: null,   configured: false, launcher: false },
   ],
 };
 
@@ -25,6 +25,9 @@ const REPORT: WslActionReport = {
   backups:          ['/home/me/.bashrc.cryptenv.bak'],
   marker_added:     true,
   marker_removed:   false,
+  launcher:         '/home/me/.local/share/cryptenv/bin/crypt-env',
+  launcher_status:  'written',
+  launcher_note:    null,
 };
 
 function mockCommands(detect: () => Promise<unknown>, action?: () => Promise<unknown>) {
@@ -81,6 +84,17 @@ describe('WslIntegrationSection gating', () => {
     expect(debian.textContent).not.toContain('REMOVE');
   });
 
+  it('flags a configured distro without the crypt-env command and offers reconfigure', async () => {
+    mockCommands(() => Promise.resolve({
+      ...TWO_DISTROS,
+      distros: [{ name: 'Ubuntu', defaultUser: 'me', configured: true, launcher: false }],
+    }));
+    renderSection(true);
+    const ubuntu = await screen.findByTestId('wsl-distro-Ubuntu');
+    expect(ubuntu.textContent).toContain('no crypt-env command');
+    expect(ubuntu.textContent).toContain('RECONFIGURE');
+  });
+
   it('shows a non-fatal "could not detect" state on a tooling error', async () => {
     mockCommands(() => Promise.reject({ kind: 'tooling', message: 'unrecognised output from wsl.exe' }));
     renderSection(true);
@@ -97,6 +111,8 @@ describe('mirrored networking banner', () => {
     const banner = await screen.findByTestId('wsl-mirrored-banner');
     expect(banner.textContent).toContain(WSLCONFIG_SNIPPET.split('\n')[1]);
     expect(banner.textContent).toContain('wsl --shutdown');
+    expect(banner.textContent).toContain('Not needed for the crypt-env command');
+    expect(banner.textContent).toContain('native Linux crypt-env');
     const buttons = Array.from(banner.querySelectorAll('button'));
     expect(buttons).toHaveLength(1);
     expect(buttons[0].getAttribute('aria-label')).toBe('Copy .wslconfig snippet');
@@ -122,6 +138,7 @@ describe('configure / remove', () => {
     expect(report.textContent).toContain('Configured Debian');
     expect(report.textContent).toContain('/home/me/.bashrc.cryptenv.bak');
     expect(report.textContent).toContain('Added the cryptenv block to /home/me/.bashrc');
+    expect(report.textContent).toContain('Installed the crypt-env command at /home/me/.local/share/cryptenv/bin/crypt-env');
     await waitFor(() =>
       expect(invoke.mock.calls.filter(([c]) => c === 'wsl_detect')).toHaveLength(2),
     );
@@ -130,7 +147,10 @@ describe('configure / remove', () => {
   it('removes from a configured distro and reports a no-op honestly', async () => {
     mockCommands(
       () => Promise.resolve(TWO_DISTROS),
-      () => Promise.resolve({ ...REPORT, env_file_changed: false, rc_files: [], backups: [], marker_added: false }),
+      () => Promise.resolve({
+        ...REPORT, env_file_changed: false, rc_files: [], backups: [], marker_added: false,
+        launcher: null, launcher_status: 'absent',
+      }),
     );
     renderSection(true);
     const ubuntu = await screen.findByTestId('wsl-distro-Ubuntu');
@@ -141,5 +161,35 @@ describe('configure / remove', () => {
     expect(invoke).toHaveBeenCalledWith('wsl_remove_client', { distro: 'Ubuntu' });
     expect(report.textContent).toContain('Removed from Ubuntu');
     expect(report.textContent).toContain('Nothing to remove');
+  });
+
+  it('reports a deleted launcher on remove instead of "Nothing to remove"', async () => {
+    mockCommands(
+      () => Promise.resolve(TWO_DISTROS),
+      () => Promise.resolve({
+        ...REPORT, env_file_changed: false, rc_files: [], backups: [], marker_added: false,
+        launcher_status: 'deleted',
+      }),
+    );
+    renderSection(true);
+    const ubuntu = await screen.findByTestId('wsl-distro-Ubuntu');
+    const remove = Array.from(ubuntu.querySelectorAll('button')).find((b) => b.textContent === 'REMOVE');
+    fireEvent.click(remove as HTMLButtonElement);
+
+    const report = await screen.findByTestId('wsl-report');
+    expect(report.textContent).toContain('Deleted the crypt-env command');
+    expect(report.textContent).not.toContain('Nothing to remove');
+  });
+});
+
+describe('launcherLine', () => {
+  it('describes every launcher outcome and tolerates reports from older helpers', () => {
+    const base = { ...REPORT, launcher: '/l' };
+    expect(launcherLine({ ...base, launcher_status: 'unchanged' })).toBe('crypt-env command already up to date at /l');
+    expect(launcherLine({ ...base, launcher_status: 'skipped', launcher_note: 'windows CLI not found' }))
+      .toBe('Skipped the crypt-env command (windows CLI not found)');
+    expect(launcherLine({ ...base, launcher_status: 'absent' })).toBeNull();
+    const { launcher: _l, launcher_status: _s, launcher_note: _n, ...legacy } = REPORT;
+    expect(launcherLine(legacy)).toBeNull();
   });
 });

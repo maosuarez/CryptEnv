@@ -118,7 +118,14 @@ fn print_apply(report: &ActionReport) {
 }
 
 fn print_remove(report: &ActionReport) {
-    if report.rc_files.is_empty() && !report.env_file_changed {
+    use cryptenv_setup::LauncherStatus;
+    if let (LauncherStatus::Deleted, Some(l)) = (report.launcher_status, &report.launcher) {
+        println!("crypt-env: deleted the managed launcher {l}");
+    }
+    if report.rc_files.is_empty()
+        && !report.env_file_changed
+        && report.launcher_status != LauncherStatus::Deleted
+    {
         println!("crypt-env: nothing to remove");
         return;
     }

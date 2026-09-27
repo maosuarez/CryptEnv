@@ -2,7 +2,7 @@ import { Icon } from '../ui/Icon';
 import { useVaultStore } from '../../store';
 import { useWslStore } from '../../store/wslStore';
 import { formatWslError, useWslConfigure, useWslDetect, useWslRemove } from '../../hooks/useWsl';
-import type { WslDistro } from '../../types';
+import type { WslActionReport, WslDistro } from '../../types';
 
 export const WSLCONFIG_SNIPPET = `[wsl2]
 networkingMode=mirrored`;
@@ -86,9 +86,11 @@ function MirroredBanner() {
       </div>
       <pre className="text-[11px] font-mono text-tx2 px-4 pt-3 pb-2 leading-[1.6]">{WSLCONFIG_SNIPPET}</pre>
       <p className="px-4 pb-3 text-[12px] font-mono text-tx3 leading-[1.6]">
-        Mirrored networking lets <code>crypt-env</code> inside WSL reach the vault on 127.0.0.1.
-        Applying it requires <code>wsl --shutdown</code> and changes networking for every distro,
-        so CryptEnv never edits this file for you.
+        Not needed for the <code>crypt-env</code> command that Configure installs — it runs the
+        Windows CLI and works with the default networking. Only a native Linux <code>crypt-env</code>{' '}
+        build needs mirrored networking to reach the vault on 127.0.0.1. Applying it requires{' '}
+        <code>wsl --shutdown</code> and changes networking for every distro, so CryptEnv never edits
+        this file for you.
       </p>
     </div>
   );
@@ -126,8 +128,12 @@ function DistroRow({ distro }: { distro: WslDistro }) {
         <div className="text-[13px] font-medium text-tx font-ui truncate">{distro.name}</div>
         <div className="text-[11px] font-mono text-tx3 truncate">
           {distro.defaultUser ?? 'unknown user'} ·{' '}
-          <span className={distro.configured ? 'text-accent' : ''}>
-            {distro.configured ? 'Configured' : 'Not configured'}
+          <span className={distro.configured && distro.launcher ? 'text-accent' : ''}>
+            {!distro.configured
+              ? 'Not configured'
+              : distro.launcher
+                ? 'Configured'
+                : 'Configured · no crypt-env command — reconfigure'}
           </span>
         </div>
       </div>
@@ -155,10 +161,13 @@ function ReportPanel() {
     report.rc_files.forEach((rc) => lines.push(`Added the cryptenv block to ${rc}`));
     report.backups.forEach((b) => lines.push(`Backup written to ${b}`));
   } else {
-    if (!report.env_file_changed && report.rc_files.length === 0) lines.push('Nothing to remove');
+    const launcherDeleted = report.launcher_status === 'deleted';
+    if (!report.env_file_changed && report.rc_files.length === 0 && !launcherDeleted) lines.push('Nothing to remove');
     report.rc_files.forEach((rc) => lines.push(`Removed the cryptenv block from ${rc}`));
     if (report.env_file_changed) lines.push(`Deleted ${report.env_file}`);
   }
+  const launcher = launcherLine(report);
+  if (launcher) lines.push(launcher);
 
   return (
     <div data-testid="wsl-report" className="mt-2 mb-2 px-3 py-2.5 rounded-[3px] border border-bd bg-raised">
@@ -173,4 +182,16 @@ function ReportPanel() {
       )}
     </div>
   );
+}
+
+/** Report line for the managed `crypt-env` launcher, if it was involved. */
+export function launcherLine(report: WslActionReport): string | null {
+  const path = report.launcher ?? 'crypt-env launcher';
+  switch (report.launcher_status) {
+    case 'written':   return `Installed the crypt-env command at ${path}`;
+    case 'unchanged': return `crypt-env command already up to date at ${path}`;
+    case 'deleted':   return `Deleted the crypt-env command at ${path}`;
+    case 'skipped':   return `Skipped the crypt-env command (${report.launcher_note ?? 'unknown reason'})`;
+    default:          return null;
+  }
 }

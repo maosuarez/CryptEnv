@@ -157,6 +157,8 @@ export interface WslDistro {
   name:        string;
   defaultUser: string | null;
   configured:  boolean;
+  /** The managed `crypt-env` launcher (delegating to the Windows CLI) is installed. */
+  launcher:    boolean;
 }
 
 export interface WslStatus {
@@ -173,7 +175,12 @@ export interface WslActionReport {
   backups:          string[];
   marker_added:     boolean;
   marker_removed:   boolean;
+  launcher?:        string | null;
+  launcher_status?: WslLauncherStatus;
+  launcher_note?:   string | null;
 }
+
+export type WslLauncherStatus = 'absent' | 'written' | 'unchanged' | 'deleted' | 'skipped';
 
 export interface WslError {
   kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling';

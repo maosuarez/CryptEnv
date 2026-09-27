@@ -5,12 +5,19 @@
 //!
 //! Usage:
 //!   crypt-env-setup [--api-url URL] [--cert-path PATH] [--appdata WINPATH]
+//!                   [--windows-cli WINPATH]
 //!   crypt-env-setup --remove
+//!
+//! `--windows-cli` is the Windows `crypt-env.exe` the managed `crypt-env`
+//! launcher delegates to; without it (or when it is not reachable from the
+//! distro) the launcher is reported as skipped.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cryptenv_setup::{apply, cert_under, remove, resolve_values, windows_path_to_wsl, SetupError};
+use cryptenv_setup::{
+    apply, apply_launcher, cert_under, remove, resolve_values, windows_path_to_wsl, SetupError,
+};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
@@ -19,6 +26,8 @@ struct Args {
     cert_path: Option<PathBuf>,
     /// Windows `%APPDATA%` (e.g. `C:\Users\me\AppData\Roaming`).
     appdata: Option<String>,
+    /// Windows path of `crypt-env.exe` (e.g. `C:\Program Files\CryptEnv\crypt-env.exe`).
+    windows_cli: Option<String>,
 }
 
 fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, SetupError> {
@@ -34,19 +43,20 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, SetupError
             "--api-url" => args.api_url = Some(value("--api-url")?),
             "--cert-path" => args.cert_path = Some(PathBuf::from(value("--cert-path")?)),
             "--appdata" => args.appdata = Some(value("--appdata")?),
+            "--windows-cli" => args.windows_cli = Some(value("--windows-cli")?),
             other => return Err(SetupError::Config(format!("unknown argument: {other}"))),
         }
     }
     Ok(args)
 }
 
-/// Converts the Windows `%APPDATA%` to its in-distro path, preferring
-/// `wslpath -u` (honours a custom automount root) over the `/mnt/<drive>`
-/// default mapping.
-fn appdata_to_linux(appdata: &str) -> Option<PathBuf> {
+/// Converts a Windows path (`%APPDATA%`, the CLI location) to its in-distro
+/// path, preferring `wslpath -u` (honours a custom automount root) over the
+/// `/mnt/<drive>` default mapping.
+fn windows_to_linux(win: &str) -> Option<PathBuf> {
     let via_wslpath = std::process::Command::new("wslpath")
         .arg("-u")
-        .arg(appdata)
+        .arg(win)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -54,7 +64,7 @@ fn appdata_to_linux(appdata: &str) -> Option<PathBuf> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    via_wslpath.or_else(|| windows_path_to_wsl(appdata))
+    via_wslpath.or_else(|| windows_path_to_wsl(win))
 }
 
 fn run(args: Args) -> Result<cryptenv_setup::ActionReport, SetupError> {
@@ -69,7 +79,7 @@ fn run(args: Args) -> Result<cryptenv_setup::ActionReport, SetupError> {
     let derived = args
         .appdata
         .as_deref()
-        .and_then(appdata_to_linux)
+        .and_then(windows_to_linux)
         .map(cert_under);
     let values = resolve_values(
         args.api_url.as_deref(),
@@ -78,7 +88,14 @@ fn run(args: Args) -> Result<cryptenv_setup::ActionReport, SetupError> {
         None,
         derived.as_deref().map(Path::new),
     )?;
-    apply(&home, &values)
+    let mut report = apply(&home, &values)?;
+    let exe = args
+        .windows_cli
+        .as_deref()
+        .and_then(windows_to_linux)
+        .filter(|p| p.is_file());
+    apply_launcher(&home, exe.as_deref(), &mut report)?;
+    Ok(report)
 }
 
 fn main() -> ExitCode {
@@ -101,6 +118,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cryptenv_setup::LauncherStatus;
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -113,8 +131,11 @@ mod tests {
             "https://127.0.0.1:47821",
             "--appdata",
             r"C:\Users\me\AppData\Roaming",
+            "--windows-cli",
+            r"D:\Apps\Crypt Env\crypt-env.exe",
         ]))
         .unwrap();
+        assert_eq!(a.windows_cli.as_deref(), Some(r"D:\Apps\Crypt Env\crypt-env.exe"));
         assert_eq!(a.api_url.as_deref(), Some("https://127.0.0.1:47821"));
         assert_eq!(a.appdata.as_deref(), Some(r"C:\Users\me\AppData\Roaming"));
         assert!(!a.remove);
@@ -126,5 +147,57 @@ mod tests {
     fn rejects_unknown_and_missing_values() {
         assert!(parse_args(argv(&["--bogus"])).is_err());
         assert!(parse_args(argv(&["--cert-path"])).is_err());
+        assert!(parse_args(argv(&["--windows-cli"])).is_err());
+    }
+
+    fn run_in(home: &Path, args: Args) -> cryptenv_setup::ActionReport {
+        // `run` reads HOME; tests in this module that call it are serialised
+        // through this lock.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HOME", home);
+        run(args).unwrap()
+    }
+
+    #[test]
+    fn run_without_windows_cli_skips_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        let r = run_in(
+            home.path(),
+            Args { cert_path: Some("/c.pem".into()), ..Args::default() },
+        );
+        assert_eq!(r.launcher_status, LauncherStatus::Skipped);
+        assert_eq!(r.launcher_note.as_deref(), Some(cryptenv_setup::LAUNCHER_NOTE_CLI_NOT_FOUND));
+    }
+
+    #[test]
+    fn run_with_unreachable_windows_cli_skips_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        let r = run_in(
+            home.path(),
+            Args {
+                cert_path: Some("/c.pem".into()),
+                windows_cli: Some(r"Q:\nowhere\crypt-env.exe".into()),
+                ..Args::default()
+            },
+        );
+        assert_eq!(r.launcher_status, LauncherStatus::Skipped);
+        assert!(!cryptenv_setup::launcher_path(home.path()).exists());
+    }
+
+    #[test]
+    fn run_then_remove_round_trips_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        // A Linux absolute path is not a drive path, so exercise the helper
+        // through the lib directly for the "found" case.
+        let exe = home.path().join("crypt-env.exe");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        let mut r = run_in(home.path(), Args { cert_path: Some("/c.pem".into()), ..Args::default() });
+        apply_launcher(home.path(), Some(&exe), &mut r).unwrap();
+        assert_eq!(r.launcher_status, LauncherStatus::Written);
+
+        let removed = run_in(home.path(), Args { remove: true, ..Args::default() });
+        assert_eq!(removed.launcher_status, LauncherStatus::Deleted);
+        assert!(removed.env_file_changed);
     }
 }

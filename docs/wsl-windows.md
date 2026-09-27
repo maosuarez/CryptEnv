@@ -9,6 +9,8 @@ This guide covers the one networking prerequisite, how the two clients keep sepa
 
 Both routes apply the exact same shell configuration (one shared implementation), and neither ever edits `%UserProfile%\.wslconfig`.
 
+The GUI route also installs a managed `crypt-env` command that runs the Windows `crypt-env.exe` through WSL interop, so it works right away, with no mirrored networking and no Linux build. See [The managed `crypt-env` command](#the-managed-crypt-env-command).
+
 ---
 
 ## Topology
@@ -117,10 +119,24 @@ If you copy `cert.pem` into the WSL filesystem instead, the copy goes stale at t
 
 1. **Install CryptEnv on Windows** with the NSIS installer. It also installs `crypt-env.exe` and `crypt-env-mcp.exe` next to the GUI and adds that folder to your **user** `PATH` (`HKCU\Environment`, no admin). Open a new terminal and `crypt-env --version` prints the same version as the GUI. Uninstalling removes the executables and exactly that `PATH` entry.
 2. **Open Settings.** The **WSL INTEGRATION** section appears only on Windows and only when at least one distro is detected (`wsl --list --quiet`). Each distro row shows its default user and whether the cryptenv client is already configured. Use the refresh icon after installing/removing a distro — detection only runs when the section opens or on refresh.
-3. **Mirrored networking.** If `networkingMode=mirrored` is not set under `[wsl2]` in `%UserProfile%\.wslconfig`, the section shows the snippet with a copy button and the `wsl --shutdown` caveat. **The app never writes `.wslconfig`** — applying it restarts every distro and changes networking for all of them, so that stays your call (see [Option A](#option-a--mirrored-networking-recommended)).
-4. **Configure.** Click **CONFIGURE** on a distro. The GUI re-checks that the distro still exists, copies a small static helper (`crypt-env-setup`, bundled with the installer) into the distro's `/tmp`, runs it, and deletes it. The helper performs exactly the [`setup wsl`](#walkthrough-crypt-env-setup-wsl) edits — `env.sh`, the marker block, the one-time backup — with `CRYPTENV_CERT_PATH` pointing at the **live** `/mnt/c/.../tls/cert.pem` (never a copy). A report lists the env file written, the rc files that received the block, and any backup created. Re-configuring only rewrites `env.sh`.
-5. **Open a new WSL terminal** and use `crypt-env` there. You still need a Linux `crypt-env` binary inside the distro for day-to-day use (e.g. `crypt-env-linux` from the GitHub release on your `PATH`); the GUI only configures the environment it reads.
-6. **Remove** reverses it: deletes the marker block and `env.sh`, leaves every other rc line and the `.cryptenv.bak` backup in place. Removing when nothing is installed is a no-op.
+3. **Mirrored networking (native Linux client only).** If `networkingMode=mirrored` is not set under `[wsl2]` in `%UserProfile%\.wslconfig`, the section shows the snippet with a copy button and the `wsl --shutdown` caveat. The managed `crypt-env` command from step 4 does **not** need it; only a native Linux `crypt-env` build does. **The app never writes `.wslconfig`** — applying it restarts every distro and changes networking for all of them, so that stays your call (see [Option A](#option-a--mirrored-networking-recommended)).
+4. **Configure.** Click **CONFIGURE** on a distro. The GUI re-checks that the distro still exists, copies a small static helper (`crypt-env-setup`, bundled with the installer) into the distro's `/tmp`, runs it, and deletes it. The helper performs exactly the [`setup wsl`](#walkthrough-crypt-env-setup-wsl) edits — `env.sh`, the marker block, the one-time backup — with `CRYPTENV_CERT_PATH` pointing at the **live** `/mnt/c/.../tls/cert.pem` (never a copy). It also installs the [managed `crypt-env` command](#the-managed-crypt-env-command), pointing at the `crypt-env.exe` next to the running GUI. A report lists the env file written, the rc files that received the block, any backup created, and the `crypt-env` command's outcome. Re-configuring only rewrites `env.sh` and the command. A distro configured before the command existed shows **Configured · no crypt-env command**; click **RECONFIGURE**.
+5. **Open a new WSL terminal** and run `crypt-env` there (no `.exe`). With the GUI running and unlocked, `crypt-env search <name>` hits the Windows vault. A native Linux `crypt-env` (e.g. `crypt-env-linux` from the GitHub release) is optional; if it is on your `PATH` it takes precedence over the managed command.
+6. **Remove** reverses it: deletes the marker block, `env.sh`, and the managed `crypt-env` command, and leaves every other rc line and the `.cryptenv.bak` backup in place. Removing when nothing is installed is a no-op.
+
+### The managed `crypt-env` command
+
+- **What it is:** a small POSIX script at `~/.local/share/cryptenv/bin/crypt-env` that `exec`s the Windows `crypt-env.exe` belonging to the CryptEnv installation you clicked Configure in. Arguments, stdin/stdout/stderr and the exit status pass through unchanged. It holds only that path: no secrets, token or certificate.
+- **Works for any user and install location:** the path is resolved when you click Configure (next to the running GUI) and translated with `wslpath -u`, so custom drives, install folders and `[automount] root` all work. If CryptEnv moves, run **RECONFIGURE**.
+- **PATH:** `env.sh` appends `~/.local/share/cryptenv/bin` to the **end** of `PATH`, once. Any `crypt-env` found earlier (a native Linux build in `~/.local/bin`, `~/.cargo/bin`, …) wins.
+- **Isolation:** the script unsets `CRYPTENV_API_URL`, `CRYPTENV_CERT_PATH` and `CRYPTENV_TOKEN_PATH` before calling Windows, so the Windows CLI always uses its own endpoint, certificate and token, even if you forward those variables through `WSLENV`.
+- **Never clobbers:** the file carries a `# >>> cryptenv managed launcher >>>` marker. Configure and Remove leave any file at that path without the marker untouched, and report it as *skipped*.
+- **If the Windows CLI is missing** (for example a dev build without `crypt-env.exe`), Configure still writes `env.sh` and reports the command as *skipped (windows CLI not found)*. If CryptEnv is later uninstalled, `crypt-env` exits `127` with a message naming the missing path.
+- **Caveats:**
+  - The Windows CLI sees the current directory as `\\wsl.localhost\<distro>\...`. Relative paths work, but absolute Linux paths (`/home/...`) passed as arguments are **not** translated.
+  - Each call pays ~50–150 ms of interop start-up.
+  - The command needs WSL interop (enabled by default; `[interop] enabled=false` in `/etc/wsl.conf` breaks it).
+  - `PATH` comes from `env.sh`, which is sourced from `.bashrc`/`.zshrc`, so non-interactive shells that skip those files must call the full path.
 
 ---
 

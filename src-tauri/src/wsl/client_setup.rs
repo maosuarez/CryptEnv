@@ -51,6 +51,9 @@ pub struct WslDistro {
     pub default_user: Option<String>,
     /// The cryptenv `env.sh` + rc marker block are present.
     pub configured: bool,
+    /// The managed `crypt-env` launcher (delegating to the Windows CLI) is
+    /// installed.
+    pub launcher: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +80,9 @@ pub trait WslRunner {
 
 /// Fixed probe script — takes no interpolated input.
 const CONFIGURED_PROBE: &str = r#"test -f "$HOME/.config/cryptenv/env.sh" && grep -q "cryptenv initialize" "$HOME/.bashrc" 2>/dev/null"#;
+
+/// Fixed probe script for the managed launcher — takes no interpolated input.
+const LAUNCHER_PROBE: &str = r#"grep -q ">>> cryptenv managed launcher >>>" "$HOME/.local/share/cryptenv/bin/crypt-env" 2>/dev/null"#;
 
 /// Fixed runner script. `$1` is the helper's in-distro source path; the rest
 /// are forwarded to the helper. Copies it to a private temp file, runs it, and
@@ -223,10 +229,22 @@ pub fn detect(r: &dyn WslRunner, wslconfig: Option<&str>) -> Result<WslStatus, W
                 ])
                 .map(|o| o.success)
                 .unwrap_or(false);
+            let launcher = r
+                .wsl(&[
+                    "-d".into(),
+                    name.clone(),
+                    "-e".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    LAUNCHER_PROBE.into(),
+                ])
+                .map(|o| o.success)
+                .unwrap_or(false);
             WslDistro {
                 name,
                 default_user,
                 configured,
+                launcher,
             }
         })
         .collect::<Vec<_>>();
@@ -313,13 +331,21 @@ fn run_helper(
 /// Applies the `setup wsl` contract inside `distro` via the bundled helper.
 /// `appdata_win` is the Windows `%APPDATA%`; the helper derives the live
 /// `/mnt/c/.../tls/cert.pem` path from it (the cert is referenced, never copied).
+/// `cli_win` is this installation's `crypt-env.exe`, the target of the managed
+/// `crypt-env` launcher; `None` makes the helper report the launcher skipped.
 pub fn configure_client(
     r: &dyn WslRunner,
     distro: &str,
     helper_win: &str,
     appdata_win: &str,
+    cli_win: Option<&str>,
 ) -> Result<ActionReport, WslError> {
-    run_helper(r, distro, helper_win, &["--appdata".into(), appdata_win.into()])
+    let mut args: Vec<String> = vec!["--appdata".into(), appdata_win.into()];
+    if let Some(cli) = cli_win {
+        args.push("--windows-cli".into());
+        args.push(cli.into());
+    }
+    run_helper(r, distro, helper_win, &args)
 }
 
 /// Reverses [`configure_client`] inside `distro`.
@@ -332,6 +358,10 @@ pub fn remove_client(r: &dyn WslRunner, distro: &str, helper_win: &str) -> Resul
 /// Relative location of the helper inside the app's resource dir; must match
 /// `bundle.resources` in `tauri.windows-bundle.conf.json`.
 pub const HELPER_RESOURCE: &str = "wsl/crypt-env-setup";
+
+/// File name of the Windows CLI installed next to the GUI executable.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const CLI_EXE: &str = "crypt-env.exe";
 
 #[cfg(target_os = "windows")]
 mod host {
@@ -391,6 +421,17 @@ mod host {
         blocking(|| super::detect(&SystemRunner, read_wslconfig().as_deref())).await
     }
 
+    /// This installation's `crypt-env.exe` — the NSIS installer places it next
+    /// to the GUI executable. `None` when absent (e.g. a dev build).
+    fn cli_path() -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        let cli = exe.parent()?.join(super::CLI_EXE);
+        match std::fs::metadata(&cli) {
+            Ok(m) if m.is_file() && m.len() > 0 => Some(cli.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
     pub async fn configure(
         resource_dir: Option<PathBuf>,
         appdata: Option<PathBuf>,
@@ -400,7 +441,11 @@ mod host {
         let appdata = appdata
             .map(|p| p.to_string_lossy().into_owned())
             .ok_or_else(|| WslError::Tooling("cannot resolve %APPDATA%".to_string()))?;
-        blocking(move || super::configure_client(&SystemRunner, &distro, &helper, &appdata)).await
+        let cli = cli_path();
+        blocking(move || {
+            super::configure_client(&SystemRunner, &distro, &helper, &appdata, cli.as_deref())
+        })
+        .await
     }
 
     pub async fn remove(resource_dir: Option<PathBuf>, distro: String) -> Result<ActionReport, WslError> {
@@ -528,9 +573,10 @@ mod tests {
         Ok(RunOutput::default())
     }
 
-    const REPORT: &str = r#"{"env_file":"/home/me/.config/cryptenv/env.sh","env_file_changed":true,"rc_files":["/home/me/.bashrc"],"backups":["/home/me/.bashrc.cryptenv.bak"],"marker_added":true,"marker_removed":false}"#;
+    const REPORT: &str = r#"{"env_file":"/home/me/.config/cryptenv/env.sh","env_file_changed":true,"rc_files":["/home/me/.bashrc"],"backups":["/home/me/.bashrc.cryptenv.bak"],"marker_added":true,"marker_removed":false,"launcher":"/home/me/.local/share/cryptenv/bin/crypt-env","launcher_status":"written","launcher_note":null}"#;
 
-    /// A two-distro WSL where `Ubuntu` is configured and `Debian` is not.
+    /// A two-distro WSL where `Ubuntu` is configured and `Debian` is not;
+    /// only `Ubuntu` has the launcher.
     fn two_distros() -> MockRunner {
         MockRunner::new(|a| match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             ["--list", "--quiet"] => ok(utf16le("Ubuntu\r\nDebian\r\n", false)),
@@ -597,13 +643,14 @@ mod tests {
         assert_eq!(
             s.distros,
             vec![
-                WslDistro { name: "Ubuntu".into(), default_user: Some("ubuntuuser".into()), configured: true },
-                WslDistro { name: "Debian".into(), default_user: Some("debianuser".into()), configured: false },
+                WslDistro { name: "Ubuntu".into(), default_user: Some("ubuntuuser".into()), configured: true, launcher: true },
+                WslDistro { name: "Debian".into(), default_user: Some("debianuser".into()), configured: false, launcher: false },
             ]
         );
         // Read-only: no helper run, no wslpath, only list / whoami / probe.
         for call in r.calls.borrow().iter() {
             assert!(!call.iter().any(|a| a == "wslpath" || a == RUN_HELPER));
+            assert!(!call.iter().any(|a| a == "--windows-cli" || a == "--remove"));
         }
     }
 
@@ -628,8 +675,14 @@ mod tests {
     #[test]
     fn configure_rejects_unknown_distro_without_running_anything_else() {
         let r = two_distros();
-        let err = configure_client(&r, "Arch", r"C:\App\wsl\crypt-env-setup", r"C:\Users\me\AppData\Roaming")
-            .unwrap_err();
+        let err = configure_client(
+            &r,
+            "Arch",
+            r"C:\App\wsl\crypt-env-setup",
+            r"C:\Users\me\AppData\Roaming",
+            Some(r"C:\App\crypt-env.exe"),
+        )
+        .unwrap_err();
         assert_eq!(err, WslError::UnknownDistro("Arch".into()));
         let calls = r.calls.borrow();
         assert_eq!(calls.len(), 1);
@@ -644,8 +697,10 @@ mod tests {
             "Ubuntu",
             r"C:\App\wsl\crypt-env-setup",
             r"C:\Users\me\AppData\Roaming",
+            Some(r"D:\My Apps\Crypt'Env\crypt-env.exe"),
         )
         .unwrap();
+        assert_eq!(report.launcher_status, cryptenv_setup::LauncherStatus::Written);
         assert_eq!(report.backups, vec!["/home/me/.bashrc.cryptenv.bak"]);
         assert!(report.marker_added);
 
@@ -664,10 +719,22 @@ mod tests {
                 "/mnt/c/App/wsl/crypt-env-setup".into(),
                 "--appdata".into(),
                 r"C:\Users\me\AppData\Roaming".into(),
+                "--windows-cli".into(),
+                r"D:\My Apps\Crypt'Env\crypt-env.exe".into(),
             ]
         );
         // The fixed scripts never contain caller-supplied values.
-        assert!(!RUN_HELPER.contains("Ubuntu") && !CONFIGURED_PROBE.contains("Ubuntu"));
+        for script in [RUN_HELPER, CONFIGURED_PROBE, LAUNCHER_PROBE] {
+            assert!(!script.contains("Ubuntu") && !script.contains("My Apps"));
+        }
+    }
+
+    #[test]
+    fn configure_without_cli_omits_windows_cli_arg() {
+        let r = two_distros();
+        configure_client(&r, "Ubuntu", r"C:\h", r"C:\Users\me\AppData\Roaming", None).unwrap();
+        let calls = r.calls.borrow();
+        assert!(!calls.last().unwrap().iter().any(|a| a == "--windows-cli"));
     }
 
     #[test]
