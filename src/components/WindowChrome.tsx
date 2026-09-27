@@ -3,6 +3,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { platform } from '@tauri-apps/plugin-os';
 import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
+import { useTranslation } from '../i18n';
 
 const win = getCurrentWindow();
 
@@ -22,6 +23,7 @@ export function WindowChrome() {
   const screen = useVaultStore((s) => s.screen);
   const lock   = useVaultStore((s) => s.lock);
   const [chrome] = useState(() => chromeFor(platform()));
+  const { t } = useTranslation();
 
   return (
     <div
@@ -47,7 +49,7 @@ export function WindowChrome() {
           ].join(' ')}
         >
           <Icon name="lock" size={13} />
-          LOCK
+          {t('window.lock')}
         </button>
       )}
 
@@ -55,8 +57,8 @@ export function WindowChrome() {
         <div className="relative z-10 flex h-full items-stretch border-l border-bd">
           <button
             onClick={() => win.minimize()}
-            title="Minimize"
-            aria-label="Minimize"
+            title={t('window.minimize')}
+            aria-label={t('window.minimize')}
             className={[
               'flex items-center justify-center w-12 h-full border-none cursor-pointer',
               'bg-transparent text-tx3 hover:text-tx hover:bg-surface transition-colors duration-100',
@@ -69,8 +71,8 @@ export function WindowChrome() {
           </button>
           <button
             onClick={() => win.close()}
-            title="Close"
-            aria-label="Close"
+            title={t('common.close')}
+            aria-label={t('common.close')}
             className={[
               'flex items-center justify-center w-12 h-full border-none cursor-pointer',
               'bg-transparent text-tx3 hover:text-tx hover:bg-danger transition-colors duration-100',

@@ -5,6 +5,7 @@ import { CopyBtn } from '../ui/CopyBtn';
 import { KebabBtn } from '../ui/KebabBtn';
 import { ContextMenu } from '../ui/ContextMenu';
 import { useVaultStore } from '../../store';
+import { useTranslation } from '../../i18n';
 import type { SecretItem, Category } from '../../types';
 
 interface Props {
@@ -20,6 +21,7 @@ const BADGE_VISIBLE_MAX = 2;
 
 export function CatBadges({ names, cats }: { names: string[]; cats: Category[] }) {
   const [expanded, setExpanded] = useState(false);
+  const { t } = useTranslation();
 
   if (names.length === 0) return null;
 
@@ -30,7 +32,7 @@ export function CatBadges({ names, cats }: { names: string[]; cats: Category[] }
     <div className="flex items-center gap-1 flex-wrap shrink-0 max-w-[220px]">
       {visible.map((name) => {
         const c = cats.find((x) => x.name === name);
-        const color = c?.color ?? '#4a5268';
+        const color = c?.color ?? 'var(--color-tx4)';
         return (
           <span
             key={name}
@@ -59,7 +61,7 @@ export function CatBadges({ names, cats }: { names: string[]; cats: Category[] }
           onClick={(e) => { e.stopPropagation(); setExpanded(false); }}
           className="inline-flex items-center px-1.5 py-0.5 rounded-[2px] border border-bd2 bg-raised text-tx3 text-[0.6rem] font-mono tracking-wide shrink-0 leading-none cursor-pointer hover:border-bd hover:text-tx2 transition-colors"
         >
-          less
+          {t('rows.less')}
         </button>
       )}
     </div>
@@ -78,6 +80,7 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
   const setEditTarget = useVaultStore((s) => s.setEditTarget);
   const deleteItem   = useVaultStore((s) => s.deleteItem);
   const showToast    = useVaultStore((s) => s.showToast);
+  const { t }        = useTranslation();
 
   const copyAs = async (fmt: 'env' | 'bash' | 'ps1') => {
     const text =
@@ -86,25 +89,25 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
                       `$env:${item.name} = "${item.value}"`;
     try {
       await writeText(text);
-      showToast(`Copied as ${fmt === 'ps1' ? 'PowerShell' : fmt}`);
+      showToast(t('rows.copiedAs', { fmt: fmt === 'ps1' ? 'PowerShell' : fmt }));
     } catch {
-      showToast('Clipboard error');
+      showToast(t('rows.clipboardError'));
     }
   };
 
   const kebab = [
-    { icon: 'edit',   label: 'Edit',            onClick: () => { setEditTarget(item); go('edit'); } },
+    { icon: 'edit',   label: t('common.edit'),   onClick: () => { setEditTarget(item); go('edit'); } },
     { divider: true },
-    { icon: 'export', label: 'Copy .env',        sub: '.env', onClick: () => copyAs('env')  },
-    { icon: 'export', label: 'Copy bash',        sub: 'bash', onClick: () => copyAs('bash') },
-    { icon: 'export', label: 'Copy PowerShell',  sub: 'ps1',  onClick: () => copyAs('ps1')  },
+    { icon: 'export', label: t('rows.copyAs', { fmt: '.env' }),        sub: '.env', onClick: () => copyAs('env')  },
+    { icon: 'export', label: t('rows.copyAs', { fmt: 'bash' }),        sub: 'bash', onClick: () => copyAs('bash') },
+    { icon: 'export', label: t('rows.copyAs', { fmt: 'PowerShell' }),  sub: 'ps1',  onClick: () => copyAs('ps1')  },
     { divider: true },
-    { icon: 'trash',  label: 'Delete', danger: true, onClick: () => deleteItem(item.id) },
+    { icon: 'trash',  label: t('common.deleteLower'), danger: true, onClick: () => deleteItem(item.id) },
   ];
 
   const ctxItems = [
-    { icon: 'export', label: 'Share this item',   onClick: () => onShare?.(item.id) },
-    { icon: 'check',  label: 'Select for sharing', onClick: () => onSelect?.(item.id) },
+    { icon: 'export', label: t('rows.shareItem'),   onClick: () => onShare?.(item.id) },
+    { icon: 'check',  label: t('rows.selectForSharing'), onClick: () => onSelect?.(item.id) },
   ];
 
   return (
@@ -153,6 +156,7 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
         </span>
         <button
           onClick={(e) => { e.stopPropagation(); setRev((v) => !v); }}
+          aria-label={rev ? t('common.hide') : t('common.show')}
           className="border border-bd bg-transparent text-tx3 cursor-pointer p-1 rounded-[3px] flex shrink-0 hover:border-bd2 hover:text-tx transition-all duration-150"
         >
           <Icon name={rev ? 'eyeOff' : 'eye'} size={13} />

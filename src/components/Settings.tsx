@@ -7,6 +7,9 @@ import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
 import { WslIntegrationSection } from './settings/WslIntegrationSection';
 import { useVaultStore } from '../store';
+import { useSystemInfo } from '../hooks/useSystemInfo';
+import { useThemeStore, type Theme } from '../store/themeStore';
+import { LANGUAGES, LANGUAGE_NAMES, useTranslation, type Language } from '../i18n';
 import type { IconName } from '../types';
 
 function Row({ icon, label, children }: { icon: IconName; label: string; children: React.ReactNode }) {
@@ -71,6 +74,50 @@ create policy "insert" on relay_packages for insert to anon with check (true);
 create policy "select" on relay_packages for select to anon using (true);
 create policy "update" on relay_packages for update to anon using (true) with check (true);`;
 
+function AppearanceSection() {
+  const { t, lang, setLang } = useTranslation();
+  const theme    = useThemeStore((s) => s.theme);
+  const setTheme = useThemeStore((s) => s.setTheme);
+  const themes: Theme[] = ['dark', 'light'];
+
+  return (
+    <>
+      <Sec title={t('appearance.section')} />
+      <Row icon="eye" label={t('appearance.theme')}>
+        <div className="flex border border-bd rounded-[3px] overflow-hidden">
+          {themes.map((th) => (
+            <button
+              key={th}
+              onClick={() => setTheme(th)}
+              aria-pressed={theme === th}
+              className={[
+                'h-8 px-4 text-[12px] font-semibold tracking-[0.06em] font-ui border-none cursor-pointer transition-colors duration-150',
+                theme === th
+                  ? 'bg-accent text-[#020504]'
+                  : 'bg-transparent text-tx3 hover:text-tx hover:bg-raised',
+              ].join(' ')}
+            >
+              {t(th === 'dark' ? 'appearance.dark' : 'appearance.light')}
+            </button>
+          ))}
+        </div>
+      </Row>
+      <Row icon="globe" label={t('appearance.language')}>
+        <select
+          value={lang}
+          onChange={(e) => setLang(e.target.value as Language)}
+          aria-label={t('appearance.language')}
+          className="h-9 bg-raised border border-bd2 text-tx rounded-[3px] px-2 text-[13px] font-ui cursor-pointer outline-none focus:border-accent transition-colors"
+        >
+          {LANGUAGES.map((l) => (
+            <option key={l} value={l}>{LANGUAGE_NAMES[l]}</option>
+          ))}
+        </select>
+      </Row>
+    </>
+  );
+}
+
 function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'success' | 'error') => void }) {
   const [relayMode, setRelayMode] = useState<'shared' | 'custom'>('shared');
   const [url,       setUrl]       = useState('');
@@ -78,13 +125,14 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
   const [showKey,   setShowKey]   = useState(false);
   const [sqlOpen,   setSqlOpen]   = useState(false);
   const [saving,    setSaving]    = useState(false);
+  const { t } = useTranslation();
 
   useEffect(() => {
     // Relay settings are persisted server-side; no need to load them here.
   }, []);
 
   const handleSaveRelay = async () => {
-    if (!url.trim() || !anonKey.trim()) { showToast('Both URL and Anon Key are required', 'error'); return; }
+    if (!url.trim() || !anonKey.trim()) { showToast(t('settings.relay.required'), 'error'); return; }
     setSaving(true);
     try {
       await invoke('vault_save_settings', {
@@ -93,7 +141,7 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
         relaySupabaseUrl: url.trim(),
         relaySupabaseAnonKey: anonKey.trim(),
       });
-      showToast('Relay settings saved');
+      showToast(t('settings.relay.saved'));
     } catch (e) {
       showToast(String(e), 'error');
     } finally {
@@ -114,7 +162,7 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
               : 'bg-transparent text-tx3 hover:text-tx hover:bg-surface',
           ].join(' ')}
         >
-          SHARED RELAY
+          {t('settings.relay.shared')}
         </button>
         <button
           onClick={() => setRelayMode('custom')}
@@ -125,17 +173,17 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
               : 'bg-transparent text-tx3 hover:text-tx hover:bg-surface',
           ].join(' ')}
         >
-          CUSTOM RELAY
+          {t('settings.relay.custom')}
         </button>
       </div>
 
       {relayMode === 'shared' && (
         <div className="rounded-[3px] border border-bd bg-raised px-4 py-3 space-y-1.5">
-          <div className="text-[13px] font-medium text-tx font-ui">Using developer-hosted relay</div>
+          <div className="text-[13px] font-medium text-tx font-ui">{t('settings.relay.usingShared')}</div>
           <div className="text-[12px] font-mono text-tx3 leading-[1.9] space-y-0.5">
             <div>AES-256-GCM · Argon2id KDF</div>
-            <div>Burn-after-read · 24h TTL</div>
-            <div>Relay cannot read your data</div>
+            <div>{t('settings.relay.burnAfterRead')}</div>
+            <div>{t('settings.relay.cannotRead')}</div>
           </div>
         </div>
       )}
@@ -145,12 +193,12 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
           <div className="flex items-start gap-2 px-3 py-2 rounded-[3px] border border-bd bg-raised">
             <span className="text-tx3 text-[13px] mt-0.5 shrink-0">ℹ</span>
             <p className="text-[12px] font-mono text-tx3 leading-[1.6]">
-              Your data is encrypted before upload — the relay stores only ciphertext.
+              {t('settings.relay.encryptedBeforeUpload')}
             </p>
           </div>
 
           <div>
-            <div className="text-[11px] font-semibold text-tx3 font-mono tracking-[0.08em] mb-1.5">SUPABASE PROJECT URL</div>
+            <div className="text-[11px] font-semibold text-tx3 font-mono tracking-[0.08em] mb-1.5">{t('settings.relay.url')}</div>
             <input
               type="text"
               value={url}
@@ -165,7 +213,7 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
           </div>
 
           <div>
-            <div className="text-[11px] font-semibold text-tx3 font-mono tracking-[0.08em] mb-1.5">SUPABASE ANON KEY</div>
+            <div className="text-[11px] font-semibold text-tx3 font-mono tracking-[0.08em] mb-1.5">{t('settings.relay.anonKey')}</div>
             <div className="relative">
               <input
                 type={showKey ? 'text' : 'password'}
@@ -199,26 +247,26 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
               ].join(' ')}
             >
               {saving
-                ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />SAVING…</>
-                : 'SAVE RELAY'}
+                ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('common.saving')}</>
+                : t('settings.relay.save')}
             </button>
             <button
               onClick={() => setSqlOpen((v) => !v)}
               className="h-8 px-4 text-[12px] font-semibold tracking-[0.06em] font-ui text-tx3 border border-bd2 rounded-[3px] hover:text-tx transition-colors bg-transparent cursor-pointer"
             >
-              {sqlOpen ? 'HIDE SQL ▲' : 'SETUP SQL ▼'}
+              {sqlOpen ? t('settings.relay.hideSql') : t('settings.relay.setupSql')}
             </button>
           </div>
 
           {sqlOpen && (
             <div className="rounded-[3px] border border-bd bg-raised overflow-hidden">
               <div className="flex items-center justify-between px-3 py-2 border-b border-bd">
-                <span className="text-[11px] font-mono text-tx3 tracking-[0.06em]">Run in your Supabase SQL Editor</span>
+                <span className="text-[11px] font-mono text-tx3 tracking-[0.06em]">{t('settings.relay.runInEditor')}</span>
                 <button
-                  onClick={() => navigator.clipboard.writeText(RELAY_SQL).then(() => showToast('SQL copied'))}
+                  onClick={() => navigator.clipboard.writeText(RELAY_SQL).then(() => showToast(t('settings.relay.sqlCopied')))}
                   className="text-tx3 hover:text-accent transition-colors"
-                  title="Copy SQL"
-                  aria-label="Copy SQL"
+                  title={t('settings.relay.copySql')}
+                  aria-label={t('settings.relay.copySql')}
                 >
                   <Icon name="copy" size={12} />
                 </button>
@@ -234,6 +282,9 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
 
 export function Settings() {
   const go               = useVaultStore((s) => s.go);
+  const goBack           = useVaultStore((s) => s.goBack);
+  const sysInfo          = useSystemInfo();
+  const { t }            = useTranslation();
   const showToast        = useVaultStore((s) => s.showToast);
   const storeWipe        = useVaultStore((s) => s.wipe);
   const storeLockTimeout = useVaultStore((s) => s.lockTimeout);
@@ -288,14 +339,14 @@ export function Settings() {
   const closeChangePw = () => { setChangePwOpen(false); setPwError(''); };
 
   const handleChangePassword = async () => {
-    if (newPw.length < 8) { setPwError('New password must be at least 8 characters'); return; }
-    if (newPw !== confirmPw) { setPwError('New passwords do not match'); return; }
+    if (newPw.length < 8) { setPwError(t('settings.toast.pwTooShort')); return; }
+    if (newPw !== confirmPw) { setPwError(t('settings.toast.pwMismatch')); return; }
     setPwChanging(true);
     setPwError('');
     try {
       await invoke('vault_change_password', { currentPassword: currentPw, newPassword: newPw });
       closeChangePw();
-      showToast('Master password changed successfully');
+      showToast(t('settings.toast.pwChanged'));
     } catch (e: unknown) {
       setPwError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -348,7 +399,7 @@ export function Settings() {
       setMcpToken(token);
       setMcpTokenVisible(true);
     } catch (e) {
-      showToast('Failed to generate token');
+      showToast(t('settings.toast.tokenFailed'));
     } finally {
       setGeneratingMcp(false);
     }
@@ -371,7 +422,7 @@ export function Settings() {
       await invoke('biometric_enroll', { password: bioPw });
       setBioEnrolled(true);
       setBioPw('');
-      showToast('Biometric unlock enabled');
+      showToast(t('settings.toast.bioEnabled'));
     } catch (e: unknown) {
       showToast(e instanceof Error ? e.message : String(e));
     } finally {
@@ -384,9 +435,9 @@ export function Settings() {
     try {
       await invoke('biometric_disable');
       setBioEnrolled(false);
-      showToast('Biometric unlock disabled');
+      showToast(t('settings.toast.bioDisabled'));
     } catch {
-      showToast('Failed to disable biometric unlock');
+      showToast(t('settings.toast.bioDisableFailed'));
     } finally {
       setBioWorking(false);
     }
@@ -415,7 +466,7 @@ export function Settings() {
     setInstallingUpdate(true);
     try {
       await invoke('install_update');
-      showToast('Update installed — restart the app to apply');
+      showToast(t('settings.toast.updateInstalled'));
     } catch (e) {
       showToast(String(e), 'error');
     } finally {
@@ -428,38 +479,38 @@ export function Settings() {
       {/* Header */}
       <div className="px-6 py-3 border-b border-bd flex items-center gap-3 shrink-0">
         <button
-          onClick={() => go('vault')}
+          onClick={goBack}
           className="flex items-center gap-1.5 text-[13px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
         >
           <Icon name="back" size={13} />
-          Back
+          {t('common.back')}
         </button>
-        <div className="flex-1 text-[13px] font-semibold text-center text-tx">Settings</div>
+        <div className="flex-1 text-[13px] font-semibold text-center text-tx">{t('settings.title')}</div>
         <div className="w-[50px]" />
       </div>
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto px-6 py-4 bg-surface">
-        <Sec title="SECURITY" />
-        <Row icon="key" label="Master Password">
+        <Sec title={t('settings.sections.security')} />
+        <Row icon="key" label={t('settings.rows.masterPassword')}>
           <button
             onClick={openChangePw}
             className="h-8 px-4 rounded-[3px] text-[12px] font-semibold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
           >
-            CHANGE
+            {t('settings.btn.change')}
           </button>
         </Row>
         {bioAvailable && (
-          <Row icon="fingerprint" label="Biometric Unlock">
+          <Row icon="fingerprint" label={t('settings.rows.biometric')}>
             {bioEnrolled ? (
               <div className="flex items-center gap-2">
-                <span className="text-[12px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-1">ENABLED</span>
+                <span className="text-[12px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-1">{t('settings.btn.enabled')}</span>
                 <button
                   onClick={handleBioDisable}
                   disabled={bioWorking}
                   className="h-8 px-4 rounded-[3px] text-[12px] font-semibold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
                 >
-                  {bioWorking ? 'DISABLING…' : 'DISABLE'}
+                  {bioWorking ? t('settings.btn.disabling') : t('settings.btn.disable')}
                 </button>
               </div>
             ) : (
@@ -469,7 +520,7 @@ export function Settings() {
                     type={showBioPw ? 'text' : 'password'}
                     value={bioPw}
                     onChange={(e) => setBioPw(e.target.value)}
-                    placeholder="Master password…"
+                    placeholder={t('settings.masterPwPlaceholder')}
                     autoComplete="off"
                     className={[
                       'bg-transparent border-0 border-b-2 border-bd2 text-tx font-mono text-[13px]',
@@ -490,27 +541,29 @@ export function Settings() {
                   className="h-8 px-4 rounded-[3px] text-[12px] font-semibold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40 flex items-center gap-1.5"
                 >
                   {bioWorking
-                    ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />ENABLING…</>
-                    : 'ENABLE'}
+                    ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />{t('settings.btn.enabling')}</>
+                    : t('settings.btn.enable')}
                 </button>
               </div>
             )}
           </Row>
         )}
-        <Row icon="timer" label="Auto-lock Timeout">
+        <Row icon="timer" label={t('settings.rows.autoLock')}>
           <select
             value={timeoutDraft}
             onChange={(e) => setTimeoutDraft(Number(e.target.value))}
             className="h-9 bg-raised border border-bd2 text-tx rounded-[3px] px-2 text-[13px] font-ui cursor-pointer outline-none focus:border-accent transition-colors"
           >
-            {[{ v: 1, l: '1 min' }, { v: 5, l: '5 min' }, { v: 15, l: '15 min' }, { v: 30, l: '30 min' }, { v: 0, l: 'Never' }].map((o) => (
+            {[1, 5, 15, 30, 0].map((v) => ({ v, l: v === 0 ? t('settings.never') : t('settings.minutes', { n: v }) })).map((o) => (
               <option key={o.v} value={o.v}>{o.l}</option>
             ))}
           </select>
         </Row>
 
-        <Sec title="INTERFACE" />
-        <Row icon="kbd" label="Global Hotkey">
+        <AppearanceSection />
+
+        <Sec title={t('settings.sections.interface')} />
+        <Row icon="kbd" label={t('settings.rows.hotkey')}>
           <button
             onClick={() => setCapturing(true)}
             onKeyDown={(e) => {
@@ -536,77 +589,77 @@ export function Settings() {
                 : 'bg-raised border-bd2 text-tx hover:border-accent',
             ].join(' ')}
           >
-            {capturing ? 'Press keys…' : hotkeyDraft}
+            {capturing ? t('settings.pressKeys') : hotkeyDraft}
           </button>
         </Row>
-        <Row icon="tag" label="Manage Categories">
+        <Row icon="tag" label={t('settings.rows.manageCategories')}>
           <button
             onClick={() => go('categories')}
             className="flex items-center gap-1.5 h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
           >
-            MANAGE →
+            {t('settings.btn.manageArrow')}
           </button>
         </Row>
 
-        <Sec title="PROJECTS" />
-        <Row icon="terminal" label="Projects & Environments">
+        <Sec title={t('settings.sections.projects')} />
+        <Row icon="terminal" label={t('settings.rows.projects')}>
           <button
             onClick={() => go('projects')}
             className="flex items-center gap-1.5 h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
           >
-            MANAGE →
+            {t('settings.btn.manageArrow')}
           </button>
         </Row>
 
-        <Sec title="DATA" />
-        <Row icon="export" label="Import from Password Manager">
+        <Sec title={t('settings.sections.data')} />
+        <Row icon="export" label={t('settings.rows.importPm')}>
           <button
             onClick={() => setImportOpen(true)}
             className="h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
           >
-            IMPORT
+            {t('settings.btn.import')}
           </button>
         </Row>
-        <Row icon="export" label="Backup & Restore">
+        <Row icon="export" label={t('settings.rows.backup')}>
           <button
             onClick={() => setBackupOpen(true)}
             className="h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
           >
-            MANAGE
+            {t('settings.btn.manage')}
           </button>
         </Row>
-        <Row icon="trash" label="Wipe All Data">
+        <Row icon="trash" label={t('settings.rows.wipe')}>
           <button
             onClick={() => setWipeOpen(true)}
             className="h-8 px-4 bg-danger-b border border-danger rounded-[3px] text-danger text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:opacity-80 transition-opacity"
           >
-            WIPE
+            {t('settings.btn.wipe')}
           </button>
         </Row>
 
-        <Sec title="SHARE" />
-        <Row icon="export" label="Receive / Import items">
+        <Sec title={t('settings.sections.share')} />
+        <Row icon="export" label={t('settings.rows.receive')}>
           <button
             onClick={() => setShareOpen(true)}
             className="h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
           >
-            OPEN
+            {t('settings.btn.open')}
           </button>
         </Row>
 
-        <Sec title="INTERNET SHARING" />
+        <Sec title={t('settings.sections.internetSharing')} />
         <RelayConfigSection showToast={showToast} />
 
-        <Sec title="INTEGRATIONS" />
-        <Row icon="key" label="MCP Token">
+        <Sec title={t('settings.sections.integrations')} />
+        <Row icon="key" label={t('settings.rows.mcpToken')}>
           <button
             onClick={handleGenerateMcpToken}
             disabled={generatingMcp}
             className="h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors disabled:opacity-40 flex items-center gap-1.5"
           >
             {generatingMcp
-              ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />GEN…</>
-              : mcpToken ? 'REGENERATE' : 'GENERATE'}
+              ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />{t('settings.btn.generatingShort')}</>
+              : mcpToken ? t('settings.btn.regenerate') : t('settings.btn.generate')}
           </button>
         </Row>
         {mcpToken && (
@@ -617,16 +670,16 @@ export function Settings() {
             <button
               onClick={() => setMcpTokenVisible((v) => !v)}
               className="text-tx3 hover:text-tx transition-colors shrink-0"
-              title={mcpTokenVisible ? 'Hide' : 'Show'}
-              aria-label={mcpTokenVisible ? 'Hide token' : 'Show token'}
+              title={mcpTokenVisible ? t('common.hide') : t('common.show')}
+              aria-label={mcpTokenVisible ? t('settings.hideToken') : t('settings.showToken')}
             >
               <Icon name={mcpTokenVisible ? 'eyeOff' : 'eye'} size={13} />
             </button>
             <button
-              onClick={() => { navigator.clipboard.writeText(mcpToken); showToast('Token copied'); }}
+              onClick={() => { navigator.clipboard.writeText(mcpToken); showToast(t('settings.toast.tokenCopied')); }}
               className="text-tx3 hover:text-tx transition-colors shrink-0"
-              title="Copy"
-              aria-label="Copy token"
+              title={t('common.copy')}
+              aria-label={t('settings.copyToken')}
             >
               <Icon name="copy" size={13} />
             </button>
@@ -635,27 +688,27 @@ export function Settings() {
 
         <WslIntegrationSection isWindows={isWindows} />
 
-        <Sec title="UPDATES" />
-        <Row icon="export" label="Application Update">
+        <Sec title={t('settings.sections.updates')} />
+        <Row icon="export" label={t('settings.rows.appUpdate')}>
           <button
             onClick={handleCheckUpdate}
             disabled={checkingUpdate || installingUpdate}
             className="h-8 px-4 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors disabled:opacity-40 flex items-center gap-1.5"
           >
             {checkingUpdate
-              ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />CHECKING…</>
-              : 'CHECK'}
+              ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-current animate-spin-fast" />{t('settings.btn.checking')}</>
+              : t('settings.btn.check')}
           </button>
         </Row>
         {updateStatus === 'uptodate' && (
           <div className="mt-2 mb-2 px-3 py-2 rounded-[3px] border border-bd bg-raised text-[12px] font-mono text-tx3">
-            Up to date
+            {t('settings.upToDate')}
           </div>
         )}
         {updateStatus === 'available' && availableVersion && (
           <div className="mt-2 mb-2 flex items-center gap-3 px-3 py-2 rounded-[3px] border border-accent-d bg-accent-b">
             <span className="flex-1 text-[12px] font-mono text-accent">
-              Version {availableVersion} available
+              {t('settings.versionAvailable', { version: availableVersion })}
             </span>
             <button
               onClick={handleInstallUpdate}
@@ -663,16 +716,17 @@ export function Settings() {
               className="h-7 px-3 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold tracking-[0.06em] font-ui cursor-pointer hover:opacity-90 disabled:opacity-40 flex items-center gap-1.5"
             >
               {installingUpdate
-                ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />INSTALLING…</>
-                : 'INSTALL'}
+                ? <><div className="w-2.5 h-2.5 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('settings.btn.installing')}</>
+                : t('settings.btn.install')}
             </button>
           </div>
         )}
 
         <div className="mt-8 mb-4 px-4 py-3 bg-raised border border-bd rounded-[3px]">
           <div className="text-[11px] text-tx3 font-mono leading-[1.9]">
-            vault v2.0.0 · tauri 2.0 · rust 1.77<br />
-            storage: ~/.vault/data.enc · argon2id m=65536 t=3
+            CryptEnv{sysInfo.version ? ` v${sysInfo.version}` : ''}{sysInfo.os ? ` · ${sysInfo.os}` : ''}<br />
+            AES-256-GCM · Argon2id m=65536 t=3 p=4<br />
+            <span className="break-all">{t('appearance.storage', { path: sysInfo.dbPath ?? '…' })}</span>
           </div>
         </div>
       </div>
@@ -692,11 +746,11 @@ export function Settings() {
           ].join(' ')}
         >
           {saving ? (
-            <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />SAVING…</>
+            <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('common.saving')}</>
           ) : saved ? (
-            <><Icon name="check" size={13} color="oklch(0.70 0.17 162)" />SAVED</>
+            <><Icon name="check" size={13} color="oklch(0.70 0.17 162)" />{t('common.saved')}</>
           ) : (
-            'SAVE SETTINGS'
+            t('settings.btn.saveSettings')
           )}
         </button>
       </div>
@@ -706,13 +760,13 @@ export function Settings() {
         <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-20 p-6">
           <div className="w-full bg-surface border border-danger rounded-[4px] p-6">
             <div className="text-[12px] font-semibold text-danger font-mono tracking-[0.09em] mb-4">
-              WIPE ALL DATA
+              {t('settings.wipeDialog.title')}
             </div>
             <p className="text-[13px] text-tx mb-2 font-ui">
-              This will permanently delete your vault database and all stored secrets.
+              {t('settings.wipeDialog.body')}
             </p>
             <p className="text-[12px] text-tx3 font-mono mb-6">
-              This action cannot be undone.
+              {t('settings.wipeDialog.irreversible')}
             </p>
             <div className="flex gap-3">
               <button
@@ -720,7 +774,7 @@ export function Settings() {
                 disabled={wiping}
                 className="flex-1 h-10 rounded-[3px] text-[12px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
               >
-                CANCEL
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleWipe}
@@ -728,8 +782,8 @@ export function Settings() {
                 className="flex-1 h-10 rounded-[3px] text-[12px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-danger border-none text-white hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center justify-center gap-1.5"
               >
                 {wiping
-                  ? <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-white animate-spin-fast" />WIPING…</>
-                  : 'CONFIRM WIPE'}
+                  ? <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-white animate-spin-fast" />{t('settings.btn.wiping')}</>
+                  : t('settings.btn.confirmWipe')}
               </button>
             </div>
           </div>
@@ -741,25 +795,25 @@ export function Settings() {
         <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-20 p-6">
           <div className="w-full bg-surface border border-bd rounded-[4px] p-6">
             <div className="text-[12px] font-semibold text-tx3 font-mono tracking-[0.09em] mb-5">
-              CHANGE MASTER PASSWORD
+              {t('settings.pwDialog.title')}
             </div>
 
             <PwField
-              label="CURRENT PASSWORD"
+              label={t('settings.pwDialog.current')}
               value={currentPw}
               show={showCurrent}
               onChange={setCurrentPw}
               onToggle={() => setShowCurrent((v) => !v)}
             />
             <PwField
-              label="NEW PASSWORD"
+              label={t('settings.pwDialog.new')}
               value={newPw}
               show={showNew}
               onChange={setNewPw}
               onToggle={() => setShowNew((v) => !v)}
             />
             <PwField
-              label="CONFIRM NEW PASSWORD"
+              label={t('settings.pwDialog.confirm')}
               value={confirmPw}
               show={showConfirm}
               onChange={setConfirmPw}
@@ -778,7 +832,7 @@ export function Settings() {
                 disabled={pwChanging}
                 className="flex-1 h-10 rounded-[3px] text-[12px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors disabled:opacity-40"
               >
-                CANCEL
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleChangePassword}
@@ -786,8 +840,8 @@ export function Settings() {
                 className="flex-1 h-10 rounded-[3px] text-[12px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center justify-center gap-1.5"
               >
                 {pwChanging
-                  ? <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />CHANGING…</>
-                  : 'CONFIRM CHANGE'}
+                  ? <><div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />{t('settings.btn.changing')}</>
+                  : t('settings.btn.confirmChange')}
               </button>
             </div>
           </div>

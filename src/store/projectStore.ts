@@ -11,6 +11,16 @@ export interface EnvironmentInput {
   vars:       EnvironmentVar[];
 }
 
+export interface ProjectFromTemplatesInput {
+  name:         string;
+  description?: string;
+  template:     string;
+  categories:   string[];
+  /** Name of the auto-created environment; blank → "default". */
+  initialEnvironment?: string;
+  vars:         Array<{ key: string; value: string }>;
+}
+
 interface ProjectStore {
   projects: Project[];
   loading:  boolean;
@@ -18,6 +28,7 @@ interface ProjectStore {
 
   load:              () => Promise<void>;
   saveProject:       (input: { id?: number; name: string; description?: string; template: string; categories: string[] }) => Promise<number>;
+  createFromTemplates: (input: ProjectFromTemplatesInput) => Promise<number>;
   removeProject:     (id: number) => Promise<ProjectDeleteImpact>;
   previewDelete:     (id: number) => Promise<ProjectDeleteImpact>;
   saveEnvironment:   (input: EnvironmentInput) => Promise<number>;
@@ -51,6 +62,24 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         description: input.description ?? null,
         template:    input.template,
         categories:  input.categories,
+      },
+    });
+    await get().load();
+    return id;
+  },
+
+  createFromTemplates: async (input) => {
+    const id = await invoke<number>('project_create_from_templates', {
+      input: {
+        project: {
+          id:          0,
+          name:        input.name,
+          description: input.description ?? null,
+          template:    input.template,
+          categories:  input.categories,
+          initialEnvironment: input.initialEnvironment ?? null,
+        },
+        vars: input.vars,
       },
     });
     await get().load();

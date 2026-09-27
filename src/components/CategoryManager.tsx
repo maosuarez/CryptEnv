@@ -3,12 +3,14 @@ import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
 import { CAT_COLORS_PRESET } from '../store';
 import type { Category } from '../types';
+import { useTranslation } from '../i18n';
 
 export function CategoryManager() {
   const cats    = useVaultStore((s) => s.cats);
   const items   = useVaultStore((s) => s.items);
-  const go      = useVaultStore((s) => s.go);
+  const goBack  = useVaultStore((s) => s.goBack);
   const saveCats = useVaultStore((s) => s.saveCats);
+  const { t } = useTranslation();
 
   const [list,       setList]       = useState<Category[]>(cats.map((c) => ({ ...c })));
   const [editing,    setEditing]    = useState<string | null>(null);
@@ -52,12 +54,12 @@ export function CategoryManager() {
       {/* Header */}
       <div className="px-3.5 py-[9px] border-b border-bd flex items-center gap-[10px] shrink-0">
         <button
-          onClick={() => go('vault')}
+          onClick={goBack}
           className="flex items-center gap-1 text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
         >
-          <Icon name="back" size={13} />Back
+          <Icon name="back" size={13} />{t('common.back')}
         </button>
-        <div className="flex-1 text-[13px] font-semibold text-center text-tx">Categories</div>
+        <div className="flex-1 text-[13px] font-semibold text-center text-tx">{t('categories.title')}</div>
         <div className="w-[50px]" />
       </div>
 
@@ -68,7 +70,7 @@ export function CategoryManager() {
             key={cat.id}
             className="flex items-center gap-[10px] px-3.5 py-2 border-b border-bd hover:bg-raised transition-colors duration-100"
           >
-            <Icon name="drag" size={12} color="#6b7899" />
+            <Icon name="drag" size={12} color="var(--color-tx3)" />
 
             {/* Color picker */}
             <div className="relative shrink-0">
@@ -89,7 +91,7 @@ export function CategoryManager() {
                       className="w-4 h-4 rounded-full cursor-pointer"
                       style={{
                         background: c,
-                        border: cat.color === c ? '2px solid #e4e8f0' : '2px solid transparent',
+                        border: cat.color === c ? '2px solid var(--color-tx)' : '2px solid transparent',
                       }}
                     />
                   ))}
@@ -117,12 +119,16 @@ export function CategoryManager() {
 
             <button
               onClick={() => setEditing(editing === cat.id ? null : cat.id)}
+              aria-label={t('categories.rename')}
+              title={t('categories.rename')}
               className="bg-transparent border-none cursor-pointer text-tx3 flex hover:text-tx transition-colors"
             >
               <Icon name="edit" size={12} />
             </button>
             <button
               onClick={() => setConfirmDel(cat)}
+              aria-label={t('common.deleteLower')}
+              title={t('common.deleteLower')}
               className="bg-transparent border-none cursor-pointer text-tx3 flex hover:text-danger transition-colors"
             >
               <Icon name="trash" size={12} />
@@ -136,7 +142,7 @@ export function CategoryManager() {
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && addCat()}
-            placeholder="New category name…"
+            placeholder={t('categories.newPlaceholder')}
             className="flex-1 px-[9px] py-[7px] bg-raised border border-bd2 rounded-[3px] text-[12px] text-tx outline-none focus:border-accent-d transition-colors"
           />
           <button
@@ -144,7 +150,7 @@ export function CategoryManager() {
             className="flex items-center gap-1 bg-accent border-none rounded-[3px] px-3 py-[7px] text-[11px] font-bold cursor-pointer font-ui text-[#020504] shrink-0 hover:opacity-90 transition-opacity"
           >
             <Icon name="plus" size={12} color="#020504" />
-            ADD
+            {t('categories.add')}
           </button>
         </div>
       </div>
@@ -162,9 +168,9 @@ export function CategoryManager() {
           ].join(' ')}
         >
           {saved ? (
-            <><Icon name="check" size={12} color="oklch(0.70 0.17 162)" />SAVED</>
+            <><Icon name="check" size={12} color="oklch(0.70 0.17 162)" />{t('common.saved')}</>
           ) : (
-            'SAVE CATEGORIES'
+            t('categories.save')
           )}
         </button>
       </div>
@@ -173,22 +179,22 @@ export function CategoryManager() {
       {confirmDel && (
         <div className="absolute inset-0 bg-[rgba(10,11,14,.85)] flex items-center justify-center p-6 z-[100] backdrop-blur-[4px]">
           <div className="bg-surface border border-danger rounded-[4px] p-[22px] w-full">
-            <div className="text-[13px] font-bold mb-1.5 text-tx">Delete "{confirmDel.name}"?</div>
+            <div className="text-[13px] font-bold mb-1.5 text-tx">{t('categories.deleteTitle', { name: confirmDel.name })}</div>
             <div className="text-[12px] text-tx2 mb-[18px] leading-[1.5]">
-              This tag will be removed from all {catCount(confirmDel.name)} items that use it.
+              {t('categories.deleteBody', { n: catCount(confirmDel.name) })}
             </div>
             <div className="flex gap-2">
               <button
                 onClick={() => setConfirmDel(null)}
                 className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui"
               >
-                CANCEL
+                {t('common.cancel')}
               </button>
               <button
                 onClick={() => remove(confirmDel.id)}
                 className="flex-1 py-2 bg-danger border-none rounded-[3px] text-white text-[12px] font-bold cursor-pointer font-ui"
               >
-                DELETE
+                {t('common.delete')}
               </button>
             </div>
           </div>

@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import type { VaultItem, Category, Screen, MenuState, GlobalToggleResult, ItemOwner } from '../types';
+import { t } from '../i18n';
+
+/** The backend's error string for any key-requiring call made while locked. */
+export function isVaultLockedError(e: unknown): boolean {
+  return String(e).includes('vault is locked');
+}
 
 export const CAT_COLORS_PRESET = [
   '#FF9900', '#10a37f', '#635bff', '#c9d1d9',
@@ -13,8 +19,24 @@ interface ToastState {
   type: 'success' | 'error';
 }
 
+/** Max remembered screens for `goBack()`; older entries are dropped. */
+export const HISTORY_LIMIT = 20;
+
+/** Resolves the screen `goBack()` lands on: the most recent history entry that
+ *  differs from `current`, or the `projects` landing page when none remains. */
+export function popHistory(history: Screen[], current: Screen): { screen: Screen; history: Screen[] } {
+  const rest = [...history];
+  while (rest.length > 0) {
+    const prev = rest.pop()!;
+    if (prev !== current && prev !== 'lock') return { screen: prev, history: rest };
+  }
+  return { screen: 'projects', history: [] };
+}
+
 interface VaultStore {
   screen:      Screen;
+  /** Screens visited before `screen`, most recent last. Cleared on lock/unlock. */
+  history:     Screen[];
   items:       VaultItem[];
   cats:        Category[];
   editTarget:  VaultItem | null;
@@ -25,6 +47,7 @@ interface VaultStore {
   hotkey:      string;
 
   go:             (screen: Screen) => void;
+  goBack:         () => void;
   setEditTarget:  (item: VaultItem | null) => void;
   openMenu:       (menu: MenuState) => void;
   closeMenu:      () => void;
@@ -35,6 +58,9 @@ interface VaultStore {
   unlock:              (password: string) => Promise<void>;
   unlockWithPayload:   (payload: { items: VaultItem[]; categories: Category[] }) => Promise<void>;
   lock:                () => Promise<void>;
+  /** The backend already locked (auto-lock event or a "vault is locked"
+   *  error): drop in-memory vault state and show the lock screen. */
+  lockedByBackend:     () => void;
   wipe:           () => Promise<void>;
   saveItem:       (form: Omit<VaultItem, 'id' | 'created'>) => Promise<void>;
   deleteItem:     (id: number) => Promise<void>;
@@ -47,6 +73,7 @@ let toastTimer: ReturnType<typeof setTimeout>;
 
 export const useVaultStore = create<VaultStore>((set, get) => ({
   screen:      'lock',
+  history:     [],
   items:       [],
   cats:        [],
   editTarget:  null,
@@ -56,7 +83,15 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   lockTimeout: 5,
   hotkey:      'Ctrl+Alt+Z',
 
-  go: (screen) => set({ screen }),
+  go: (screen) => set((s) => {
+    if (screen === s.screen) return {};
+    // The lock screen is never a back target; adjacent duplicates are collapsed.
+    const push = s.screen !== 'lock' && s.history[s.history.length - 1] !== s.screen;
+    const history = push ? [...s.history, s.screen].slice(-HISTORY_LIMIT) : s.history;
+    return { screen, history };
+  }),
+
+  goBack: () => set((s) => popHistory(s.history, s.screen)),
 
   setEditTarget: (editTarget) => set({ editTarget }),
 
@@ -85,6 +120,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       items:       result.items,
       cats:        result.categories,
       screen:      'projects',
+      history:     [],
       editTarget:  null,
       lockTimeout: settings.autoLockTimeout,
       hotkey:      settings.hotkey,
@@ -97,6 +133,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       items:       payload.items,
       cats:        payload.categories,
       screen:      'projects',
+      history:     [],
       editTarget:  null,
       lockTimeout: settings.autoLockTimeout,
       hotkey:      settings.hotkey,
@@ -107,12 +144,18 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     try {
       await invoke('vault_lock');
     } catch {}
-    set({ screen: 'lock', items: [], cats: [], editTarget: null, menu: null });
+    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+  },
+
+  lockedByBackend: () => {
+    if (get().screen === 'lock') return;
+    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+    get().showToast(t('lock.sessionLocked'), 'error');
   },
 
   wipe: async () => {
     await invoke('vault_wipe');
-    set({ screen: 'lock', items: [], cats: [], editTarget: null, menu: null });
+    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
   },
 
   saveItem: async (form) => {
@@ -130,7 +173,8 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
         ? s.items.map((i) => (i.id === saved.id ? saved : i))
         : [...s.items, saved],
       editTarget: null,
-      screen: 'vault',
+      // Return to whichever screen opened the editor.
+      ...popHistory(s.history, s.screen),
     }));
   },
 

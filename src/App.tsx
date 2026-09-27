@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { AnimatePresence, motion } from 'framer-motion';
 import { WindowChrome } from './components/WindowChrome';
 import { LockScreen } from './components/LockScreen';
@@ -36,6 +37,14 @@ export default function App() {
   const placeholder    = useVaultStore((s) => s.placeholder);
   const setPlaceholder = useVaultStore((s) => s.setPlaceholder);
   const checkForUpdate = useUpdateStore((s) => s.checkOnce);
+
+  const lockedByBackend = useVaultStore((s) => s.lockedByBackend);
+
+  // Backend auto-lock already zeroized the key — mirror it immediately.
+  useEffect(() => {
+    const unlisten = listen('vault_locked', () => lockedByBackend());
+    return () => { unlisten.then((f) => f()).catch(() => {}); };
+  }, [lockedByBackend]);
 
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   const prevScreenRef = useRef<Screen>(screen);

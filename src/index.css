@@ -12,8 +12,9 @@
   --color-bd2:     #323850;
   --color-tx:      #e4e8f0;
   --color-tx2:     #9ba6ba;
-  --color-tx3:     #6b7899;
-  --color-tx4:     #3d4558;
+  --color-tx3:     #8896b3;
+  --color-tx4:     #55617d;
+  --color-app:     #040506;
 
   --color-accent:   oklch(0.70 0.17 162);
   --color-accent-d: oklch(0.38 0.10 162);
@@ -37,6 +38,44 @@
   --animate-toast-in:  toast-in  150ms ease;
   --animate-blink:     blink     1s    ease infinite;
   --animate-spin-fast: spin      0.7s  linear infinite;
+}
+
+/* Light theme: token overrides only — components keep using the same
+   semantic utilities. Selected via `data-theme` on <html> (see store/themeStore). */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-bg:      #f4f6f8;
+  --color-surface: #ffffff;
+  --color-raised:  #e9edf2;
+  --color-bd:      #cbd5e1;
+  --color-bd2:     #94a3b8;
+  --color-tx:      #0f172a;
+  --color-tx2:     #334155;
+  --color-tx3:     #475569;
+  --color-tx4:     #64748b;
+  --color-app:     #e2e8f0;
+
+  --color-accent:   oklch(0.55 0.15 162);
+  --color-accent-d: oklch(0.62 0.12 162);
+  --color-accent-b: oklch(0.94 0.04 162);
+
+  --color-danger:   oklch(0.52 0.20 22);
+  --color-danger-b: oklch(0.95 0.03 22);
+
+  --color-warn:   oklch(0.55 0.14 68);
+  --color-warn-b: oklch(0.95 0.04 68);
+  --color-warn-d: oklch(0.70 0.12 68);
+
+  --color-cred:   oklch(0.50 0.14 220);
+  --color-cred-b: oklch(0.95 0.03 220);
+
+  --color-lnk:   oklch(0.50 0.15 270);
+  --color-lnk-b: oklch(0.95 0.03 270);
+}
+
+:root:not([data-theme="light"]) {
+  color-scheme: dark;
 }
 
 @keyframes fade-in {
@@ -66,14 +105,14 @@ html, body, #root {
 }
 
 body {
-  background: #040506;
+  background: var(--color-app);
   font-family: 'Space Grotesk', sans-serif;
-  color: #e4e8f0;
+  color: var(--color-tx);
 }
 
 ::-webkit-scrollbar       { width: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #252a3a; border-radius: 2px; }
+::-webkit-scrollbar-thumb { background: var(--color-bd); border-radius: 2px; }
 
 input::-ms-reveal,
 input::-ms-clear { display: none; }
@@ -83,6 +122,6 @@ input, textarea, select {
   background: transparent;
   border: none;
   outline: none;
-  color: #e4e8f0;
+  color: var(--color-tx);
 }
 

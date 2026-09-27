@@ -1,4 +1,4 @@
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 pub mod api;
@@ -19,14 +19,15 @@ pub mod wsl;
 mod test_support;
 
 use vault::{
-    app_complete_setup, app_generate_mcp_config, app_is_first_run,
+    app_complete_setup, app_generate_mcp_config, app_get_system_info, app_is_first_run,
     biometric_check, biometric_disable, biometric_enroll, biometric_is_enrolled, biometric_unlock,
     lock_vault, vault_change_password, vault_delete_item, vault_export_backup,
     vault_generate_mcp_token, vault_get_categories, vault_get_items, vault_get_mcp_token,
     vault_get_settings, vault_import_backup, vault_import_backup_data, vault_import_items,
     vault_is_setup, vault_list, vault_lock, vault_parse_import, vault_save_categories, vault_save_item,
     vault_save_settings, vault_unlock, vault_wipe, vault_create_project_item, vault_set_item_global,
-    vault_get_item_owners, vault_list_orphan_items, vault_prune_orphan_items, SharedState, VaultState,
+    vault_get_item_owners, vault_list_orphan_items, vault_prune_orphan_items, project_create_from_templates,
+    vault_touch, SharedState, VaultState,
 };
 use vault::share_commands::{
     share_cancel, share_confirm_fingerprint, share_export_file, share_import_file,
@@ -119,6 +120,7 @@ pub fn run() {
             // Background auto-lock: every 30 s, check idle time against the
             // configured timeout. Timeout = 0 means "never lock".
             let auto_lock_state = state.clone();
+            let auto_lock_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
@@ -159,6 +161,9 @@ pub fn run() {
 
                     if should_lock {
                         lock_vault(&auto_lock_state).await;
+                        // Let the frontend drop to the lock screen right away
+                        // instead of discovering the lock on its next call.
+                        let _ = auto_lock_handle.emit("vault_locked", ());
                     }
                 }
             });
@@ -186,6 +191,7 @@ pub fn run() {
             vault_is_setup,
             vault_unlock,
             vault_lock,
+            vault_touch,
             vault_list,
             vault_get_items,
             vault_save_item,
@@ -224,6 +230,7 @@ pub fn run() {
             share_relay_receive,
             project_list,
             project_save,
+            project_create_from_templates,
             project_delete,
             project_preview_delete,
             project_export,
@@ -245,6 +252,7 @@ pub fn run() {
             app_is_first_run,
             app_complete_setup,
             app_generate_mcp_config,
+            app_get_system_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

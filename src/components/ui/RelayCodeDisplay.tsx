@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Icon } from './Icon';
+import { useTranslation } from '../../i18n';
 
 /**
  * Two-box "code" + "passphrase" display with copy buttons, used after a
@@ -9,6 +10,7 @@ import { Icon } from './Icon';
  * original inline version.
  */
 export function RelayCodeDisplay({ code, passphrase }: { code: string; passphrase: string }) {
+  const { t } = useTranslation();
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedPass, setCopiedPass] = useState(false);
 
@@ -26,7 +28,7 @@ export function RelayCodeDisplay({ code, passphrase }: { code: string; passphras
   return (
     <>
       <div className="mb-3">
-        <div className="text-[9px] font-mono text-tx3 tracking-[0.08em] mb-1">CODE</div>
+        <div className="text-[9px] font-mono text-tx3 tracking-[0.08em] mb-1">{t('relayCode.code')}</div>
         <div className="bg-raised border border-bd2 rounded-[3px] px-4 py-2.5 flex items-center gap-3">
           <span className="flex-1 font-mono text-[18px] text-accent tracking-[0.3em] font-bold select-all">{code}</span>
           <button
@@ -37,13 +39,13 @@ export function RelayCodeDisplay({ code, passphrase }: { code: string; passphras
             ].join(' ')}
           >
             <Icon name={copiedCode ? 'check' : 'copy'} size={10} color={copiedCode ? 'oklch(0.70 0.17 162)' : 'currentColor'} />
-            {copiedCode ? 'COPIED' : 'COPY'}
+            {copiedCode ? t('relayCode.copied') : t('relayCode.copy')}
           </button>
         </div>
       </div>
 
       <div className="mb-4">
-        <div className="text-[9px] font-mono text-tx3 tracking-[0.08em] mb-1">PASSPHRASE</div>
+        <div className="text-[9px] font-mono text-tx3 tracking-[0.08em] mb-1">{t('relayCode.passphrase')}</div>
         <div className="bg-raised border border-bd2 rounded-[3px] px-4 py-2.5 flex items-center gap-3">
           <span className="flex-1 font-mono text-[13px] text-accent tracking-[0.05em] select-all break-all">{passphrase}</span>
           <button
@@ -54,13 +56,13 @@ export function RelayCodeDisplay({ code, passphrase }: { code: string; passphras
             ].join(' ')}
           >
             <Icon name={copiedPass ? 'check' : 'copy'} size={10} color={copiedPass ? 'oklch(0.70 0.17 162)' : 'currentColor'} />
-            {copiedPass ? 'COPIED' : 'COPY'}
+            {copiedPass ? t('relayCode.copied') : t('relayCode.copy')}
           </button>
         </div>
       </div>
 
       <p className="text-[10px] text-tx3 font-mono leading-[1.5] mb-3">
-        The relay link expires in 24 hours and is destroyed after first use. Never share code + passphrase in the same message.
+        {t('relayCode.expiryNote')}
       </p>
     </>
   );

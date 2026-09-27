@@ -3,6 +3,7 @@ import { KebabBtn } from '../ui/KebabBtn';
 import { ContextMenu } from '../ui/ContextMenu';
 import { CatBadges } from './SecretRow';
 import { useVaultStore } from '../../store';
+import { useTranslation } from '../../i18n';
 import type { NoteItem, Category } from '../../types';
 
 interface Props {
@@ -19,18 +20,19 @@ export function NoteRow({ item, cats, selected, onToggle, onShare, onSelect }: P
   const go            = useVaultStore((s) => s.go);
   const setEditTarget = useVaultStore((s) => s.setEditTarget);
   const deleteItem    = useVaultStore((s) => s.deleteItem);
+  const { t }         = useTranslation();
 
   const preview = item.content.replace(/\n+/g, ' ').slice(0, 80) + (item.content.length > 80 ? '…' : '');
 
   const kebab = [
-    { icon: 'edit',  label: 'Edit',                  onClick: () => { setEditTarget(item); go('edit'); } },
+    { icon: 'edit',  label: t('common.edit'),onClick: () => { setEditTarget(item); go('edit'); } },
     { divider: true },
-    { icon: 'trash', label: 'Delete', danger: true,  onClick: () => deleteItem(item.id) },
+    { icon: 'trash', label: t('common.deleteLower'), danger: true,  onClick: () => deleteItem(item.id) },
   ];
 
   const ctxItems = [
-    { icon: 'export', label: 'Share this item',    onClick: () => onShare?.(item.id) },
-    { icon: 'check',  label: 'Select for sharing', onClick: () => onSelect?.(item.id) },
+    { icon: 'export', label: t('rows.shareItem'),    onClick: () => onShare?.(item.id) },
+    { icon: 'check',  label: t('rows.selectForSharing'), onClick: () => onSelect?.(item.id) },
   ];
 
   return (

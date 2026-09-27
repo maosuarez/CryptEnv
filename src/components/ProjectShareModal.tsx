@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { RelayCodeDisplay } from './ui/RelayCodeDisplay';
+import { useTranslation } from '../i18n';
 import type { Project, VaultItem } from '../types';
 
 // ─── Whole-project relay sharing (issue #4) ───────────────────────────────────
@@ -91,6 +92,7 @@ function InlineError({ msg }: { msg: string }) {
 }
 
 export function ProjectShareModal({ mode, project, items, onClose, onReceived }: ProjectShareModalProps) {
+  const { t } = useTranslation();
   const itemsById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
 
   // ── Send state ──
@@ -155,7 +157,7 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
         setShowRename(true);
         const match = msg.match(/'([^']+)'/);
         if (match && !overrideName) setOverrideName(`${match[1]}-received`);
-        setError('A project with this name already exists here. Choose a different name below and try again.');
+        setError(t('projectShare.conflict'));
       } else {
         setError(msg);
       }
@@ -174,14 +176,14 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
             <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
               <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
             </div>
-            <div className="text-[13px] font-semibold text-tx">Uploaded successfully</div>
+            <div className="text-[13px] font-semibold text-tx">{t('projectShare.uploaded')}</div>
           </div>
           <div className="text-[11px] text-tx3 font-mono mb-3">
-            {sendResult.environmentCount} environment{sendResult.environmentCount !== 1 ? 's' : ''}, {sendResult.itemCount} item{sendResult.itemCount !== 1 ? 's' : ''}
+            {t(sendResult.environmentCount === 1 ? 'projectShare.envCount_one' : 'projectShare.envCount_other', { n: sendResult.environmentCount })}, {t(sendResult.itemCount === 1 ? 'projectShare.itemCount_one' : 'projectShare.itemCount_other', { n: sendResult.itemCount })}
           </div>
           <RelayCodeDisplay code={sendResult.code} passphrase={sendResult.passphrase} />
           <div className="flex justify-end pt-3 border-t border-bd">
-            <BtnPrimary onClick={onClose}>DONE</BtnPrimary>
+            <BtnPrimary onClick={onClose}>{t('common.done')}</BtnPrimary>
           </div>
         </>
       );
@@ -190,9 +192,9 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
     if (project.environments.length === 0) {
       return (
         <>
-          <InlineError msg="This project has no environments to share." />
+          <InlineError msg={t('projectShare.noEnvironments')} />
           <div className="flex justify-end">
-            <BtnSecondary onClick={onClose}>CLOSE</BtnSecondary>
+            <BtnSecondary onClick={onClose}>{t('projectShare.close')}</BtnSecondary>
           </div>
         </>
       );
@@ -201,8 +203,8 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
     return (
       <>
         <div className="text-[11px] text-tx3 mb-3 leading-[1.5]">
-          Select which environments of <span className="text-tx font-semibold">{project.name}</span> to share.
-          Non-default environments start unchecked — over-sharing is unrecoverable, under-sharing just costs one more send.
+          {t('projectShare.selectPrefix')}<span className="text-tx font-semibold">{project.name}</span>{t('projectShare.selectSuffix')}
+          {' '}{t('projectShare.selectHint')}
         </div>
 
         <div className="space-y-1.5 mb-4">
@@ -219,8 +221,8 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
               >
                 <input type="checkbox" checked={checked} onChange={() => toggleEnv(env.id)} className="accent-accent" />
                 <span className="text-[12px] font-mono text-tx flex-1">{env.name}</span>
-                {env.isDefault && <span className="text-[9px] text-tx3 font-mono tracking-wide">DEFAULT</span>}
-                {prodLike && <span className="text-[9px] text-danger font-mono font-bold tracking-wide">PRODUCTION-LIKE</span>}
+                {env.isDefault && <span className="text-[9px] text-tx3 font-mono tracking-wide">{t('projectShare.defaultBadge')}</span>}
+                {prodLike && <span className="text-[9px] text-danger font-mono font-bold tracking-wide">{t('projectShare.prodBadge')}</span>}
               </label>
             );
           })}
@@ -228,7 +230,7 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
 
         {selectedEnvIds.size > 0 && (
           <div className="mb-4">
-            <div className="text-[10px] font-mono text-tx3 tracking-[0.1em] mb-2">KEYS THAT WILL LEAVE THIS MACHINE (never values)</div>
+            <div className="text-[10px] font-mono text-tx3 tracking-[0.1em] mb-2">{t('projectShare.keysLeaving')}</div>
             <div className="bg-raised border border-bd rounded-[3px] max-h-[160px] overflow-y-auto divide-y divide-bd">
               {project.environments
                 .filter((e) => selectedEnvIds.has(e.id))
@@ -236,7 +238,7 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
                   <div key={env.id} className="px-3 py-2">
                     <div className="text-[10px] text-tx3 font-mono mb-1 tracking-wide">{env.name.toUpperCase()}</div>
                     {env.vars.length === 0 ? (
-                      <div className="text-[11px] text-tx3 font-mono italic">no variables</div>
+                      <div className="text-[11px] text-tx3 font-mono italic">{t('projectShare.noVariables')}</div>
                     ) : (
                       env.vars.map((v) => (
                         <div key={v.id} className="text-[11px] font-mono text-tx2 flex items-center gap-2">
@@ -255,9 +257,9 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
         {error && <InlineError msg={error} />}
 
         <div className="flex justify-between pt-3 border-t border-bd">
-          <BtnSecondary onClick={onClose}>CANCEL</BtnSecondary>
+          <BtnSecondary onClick={onClose}>{t('common.cancel')}</BtnSecondary>
           <BtnPrimary onClick={handleSend} disabled={sending || selectedEnvIds.size === 0}>
-            {sending ? 'UPLOADING…' : 'SHARE PROJECT'}
+            {sending ? t('projectShare.uploading') : t('projectShare.shareProject')}
           </BtnPrimary>
         </div>
       </>
@@ -272,10 +274,10 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
             <div className="w-7 h-7 rounded-full bg-accent-b border border-accent-d flex items-center justify-center shrink-0">
               <Icon name="check" size={13} color="oklch(0.70 0.17 162)" />
             </div>
-            <div className="text-[13px] font-semibold text-tx">Project received</div>
+            <div className="text-[13px] font-semibold text-tx">{t('projectShare.received')}</div>
           </div>
           <div className="text-[12px] text-tx2 mb-2">
-            <span className="font-semibold text-tx">{receiveResult.project}</span> — {receiveResult.itemCount} item{receiveResult.itemCount !== 1 ? 's' : ''}
+            <span className="font-semibold text-tx">{receiveResult.project}</span> — {t(receiveResult.itemCount === 1 ? 'projectShare.itemCount_one' : 'projectShare.itemCount_other', { n: receiveResult.itemCount })}
           </div>
           <div className="bg-raised border border-bd rounded-[3px] divide-y divide-bd mb-3 max-h-[140px] overflow-y-auto">
             {receiveResult.environments.map((name) => (
@@ -286,10 +288,10 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
             ))}
           </div>
           <div className="text-[10px] text-tx3 font-mono mb-3">
-            Received items are owned by this project only (not global). Set paths on each environment before injecting.
+            {t('projectShare.receivedNote')}
           </div>
           <div className="flex justify-end pt-3 border-t border-bd">
-            <BtnPrimary onClick={onClose}>DONE</BtnPrimary>
+            <BtnPrimary onClick={onClose}>{t('common.done')}</BtnPrimary>
           </div>
         </>
       );
@@ -298,10 +300,10 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
     return (
       <>
         <div className="text-[11px] text-tx3 mb-3">
-          Enter the code and passphrase from the sender. This always creates a <span className="text-tx font-semibold">new</span> project — it never merges into an existing one.
+          {t('projectShare.receiveIntroPrefix')}<span className="text-tx font-semibold">{t('projectShare.receiveIntroNew')}</span>{t('projectShare.receiveIntroSuffix')}
         </div>
         <div className="mb-3">
-          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">CODE</label>
+          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">{t('projectShare.code')}</label>
           <input
             type="text"
             value={code}
@@ -312,7 +314,7 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
           />
         </div>
         <div className="mb-3">
-          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">PASSPHRASE</label>
+          <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">{t('projectShare.passphrase')}</label>
           <input
             type="text"
             value={passphrase}
@@ -324,7 +326,7 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
 
         {showRename && (
           <div className="mb-4">
-            <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">NEW PROJECT NAME</label>
+            <label className="block text-[10px] font-mono text-tx3 tracking-[0.08em] mb-1.5">{t('projectShare.newProjectName')}</label>
             <input
               type="text"
               value={overrideName}
@@ -338,9 +340,9 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
         {error && <InlineError msg={error} />}
 
         <div className="flex justify-between pt-3 border-t border-bd">
-          <BtnSecondary onClick={onClose}>CANCEL</BtnSecondary>
+          <BtnSecondary onClick={onClose}>{t('common.cancel')}</BtnSecondary>
           <BtnPrimary onClick={handleReceive} disabled={receiving || !code || !passphrase || (showRename && !overrideName.trim())}>
-            {receiving ? 'DOWNLOADING…' : 'RECEIVE'}
+            {receiving ? t('projectShare.downloading') : t('projectShare.receive')}
           </BtnPrimary>
         </div>
       </>
@@ -354,11 +356,12 @@ export function ProjectShareModal({ mode, project, items, onClose, onReceived }:
           <div className="flex items-center gap-2">
             <Icon name="shield" size={14} color="oklch(0.70 0.17 162)" />
             <span className="text-[12px] font-bold tracking-wider font-ui text-tx">
-              {mode === 'send' ? 'SHARE PROJECT' : 'RECEIVE PROJECT'}
+              {mode === 'send' ? t('projectShare.titleSend') : t('projectShare.titleReceive')}
             </span>
           </div>
           <button
             onClick={onClose}
+            aria-label={t('common.close')}
             className="flex items-center justify-center w-6 h-6 rounded-[3px] text-tx3 hover:text-tx hover:bg-raised transition-all duration-150 cursor-pointer border-none bg-transparent"
           >
             <Icon name="close" size={13} />

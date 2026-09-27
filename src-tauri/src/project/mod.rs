@@ -85,6 +85,10 @@ pub struct ProjectInput {
     pub template: String,
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Name of the environment auto-created with a NEW project. Blank or
+    /// omitted means "default"; ignored when updating an existing project.
+    #[serde(default, rename = "initialEnvironment")]
+    pub initial_environment: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -279,6 +283,17 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
 pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, String> {
     validate_project_name(&input.name)?;
     let is_new = input.id == 0;
+    let initial_env = input
+        .initial_environment
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    // Validate before any write so a bad name can't leave an env-less project.
+    if is_new {
+        validate_environment_name(&initial_env)?;
+    }
     let project_id = db
         .upsert_project(input.id, &input.name, input.description.as_deref(), &input.template)
         .await?;
@@ -286,9 +301,9 @@ pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, Stri
         // A brand-new project has no environments yet, so this can never
         // actually collide — kept anyway so `save_environment` stays the
         // single choke point for the case-insensitivity rule rather than
-        // special-casing the auto-created 'default' environment.
-        ensure_no_case_collision(db, project_id, 0, "default").await?;
-        db.upsert_environment(0, project_id, "default", true).await?;
+        // special-casing the auto-created initial environment.
+        ensure_no_case_collision(db, project_id, 0, &initial_env).await?;
+        db.upsert_environment(0, project_id, &initial_env, true).await?;
     }
     let category_ids = category_names_to_ids(db, &input.categories).await?;
     db.set_project_categories(project_id, &category_ids).await?;
@@ -902,6 +917,53 @@ mod tests {
         let path = dir.path().join("vault.db");
         let db = VaultDb::open(path.to_str().unwrap()).await.unwrap();
         (dir, db)
+    }
+
+    fn new_project(name: &str, initial_environment: Option<&str>) -> ProjectInput {
+        ProjectInput {
+            id: 0,
+            name: name.to_string(),
+            description: None,
+            template: "generic".to_string(),
+            categories: vec![],
+            initial_environment: initial_environment.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_project_initial_environment_defaults_and_customises() {
+        let (_dir, db) = test_db().await;
+        for (name, initial, expected) in [
+            ("p1", None, "default"),
+            ("p2", Some("   "), "default"),
+            ("p3", Some(" production "), "production"),
+        ] {
+            let id = save_project(&db, new_project(name, initial)).await.unwrap();
+            let envs = db.list_environments(id).await.unwrap();
+            assert_eq!(envs.len(), 1);
+            assert_eq!(envs[0].name, expected);
+            assert!(envs[0].is_default);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_environment_rejected_before_any_write() {
+        let (_dir, db) = test_db().await;
+        let err = save_project(&db, new_project("p", Some("../evil"))).await.unwrap_err();
+        assert!(err.starts_with("name: "));
+        assert!(db.list_projects().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_environment_ignored_on_update() {
+        let (_dir, db) = test_db().await;
+        let id = save_project(&db, new_project("p", None)).await.unwrap();
+        let mut update = new_project("p", Some("staging"));
+        update.id = id;
+        save_project(&db, update).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "default");
     }
 
     fn plain_secret(name: &str, value: &str) -> VaultItem {
