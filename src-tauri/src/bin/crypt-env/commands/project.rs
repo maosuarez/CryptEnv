@@ -334,7 +334,7 @@ fn select_environments<'a>(project: &'a ProjectSummary, envs: Option<&str>) -> R
 /// the manifest can show `KEY -> item name` instead of raw item ids — reuses
 /// the existing `GET /items` endpoint rather than adding a new one (D4).
 fn fetch_environment_item_names(environment_id: i64) -> Result<HashMap<i64, String>, CliError> {
-    let resp = authenticated_get(&format!("{base}/items?environment_id={environment_id}", base = crate::client::api_base()))?;
+    let resp = authenticated_get(&format!("{base}/items?environment_id={environment_id}", base = crate::client::api_base()?))?;
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
     }
@@ -385,7 +385,7 @@ fn run_share(id: Option<i64>, name: Option<String>, envs: Option<String>, yes: b
 
     let environment_ids: Vec<i64> = selected.iter().map(|e| e.id).collect();
     let body = serde_json::json!({ "environment_ids": environment_ids });
-    let resp = authenticated_post(&format!("{}/projects/{}/relay/send", crate::client::api_base(), project.id), &body)?;
+    let resp = authenticated_post(&format!("{}/projects/{}/relay/send", crate::client::api_base()?, project.id), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
@@ -431,7 +431,7 @@ fn run_receive(code: String, passphrase: String, as_name: Option<String>) -> Res
         body["project_name_override"] = serde_json::json!(name);
     }
 
-    let resp = authenticated_post(&format!("{base}/projects/relay/receive", base = crate::client::api_base()), &body)?;
+    let resp = authenticated_post(&format!("{base}/projects/relay/receive", base = crate::client::api_base()?), &body)?;
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
