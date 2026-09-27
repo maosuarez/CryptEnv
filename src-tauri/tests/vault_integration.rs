@@ -19,6 +19,7 @@ async fn setup_project_with_one_var(db: &VaultDb) -> ([u8; 32], i64) {
         description: None,
         template: "generic".into(),
         categories: vec![],
+        initial_environment: None,
     }).await.unwrap();
 
     let projects = project::list_projects(db).await.unwrap();

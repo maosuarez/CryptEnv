@@ -251,6 +251,18 @@ pub async fn vault_lock(state: State<'_, SharedState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Refreshes the backend idle timer from frontend user activity so the
+/// background auto-lock doesn't fire while the user is actively working.
+/// No-op when locked — it must never extend or revive a locked session.
+#[tauri::command]
+pub async fn vault_touch(state: State<'_, SharedState>) -> Result<(), String> {
+    let mut s = state.lock().await;
+    if s.key.is_some() {
+        s.touch();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn vault_get_items(state: State<'_, SharedState>) -> Result<Vec<VaultItem>, String> {
     let mut s = state.lock().await;
@@ -414,6 +426,174 @@ pub async fn vault_create_project_item(
     saved.id = new_id;
     saved.is_global = Some(false);
     Ok(saved)
+}
+
+// ─── Project scaffolding from templates ───────────────────────────────────────
+
+/// Upper bound on variables a single scaffold request may create.
+const MAX_TEMPLATE_VARS: usize = 200;
+
+/// Stored in place of an empty value so an un-edited environment fails loudly
+/// at the consuming service instead of silently running with an empty secret.
+pub const TEMPLATE_PLACEHOLDER: &str = "CHANGE_ME";
+
+/// One `KEY=value` pair to scaffold. Deliberately no `Debug` derive: the value
+/// is secret material and must never be formatted into logs or errors.
+#[derive(Deserialize)]
+pub struct TemplateVarInput {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProjectFromTemplatesInput {
+    pub project: crate::project::ProjectInput,
+    #[serde(default)]
+    pub vars: Vec<TemplateVarInput>,
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Rejects the request before any write. Errors name keys/indices only.
+fn validate_template_input(input: &ProjectFromTemplatesInput) -> Result<(), String> {
+    crate::project::validate_project_name(&input.project.name)?;
+    if input.project.id != 0 {
+        return Err("templates can only be applied when creating a new project".to_string());
+    }
+    if input.vars.len() > MAX_TEMPLATE_VARS {
+        return Err(format!("too many variables ({} > {MAX_TEMPLATE_VARS})", input.vars.len()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, v) in input.vars.iter().enumerate() {
+        if !is_valid_env_key(&v.key) {
+            return Err(format!("invalid variable key at #{}: '{}' (expected [A-Z_][A-Z0-9_]*)", i + 1, v.key));
+        }
+        if !seen.insert(v.key.as_str()) {
+            return Err(format!("duplicate variable key '{}'", v.key));
+        }
+    }
+    Ok(())
+}
+
+/// Creates a project, its `default` environment, and one project-scoped
+/// secret item per variable linked into that environment — all or nothing.
+/// `db` helpers each run on the pool (no shared transaction), so failure
+/// after the project exists is undone by `delete_project`, which also
+/// removes the items this project solely owns.
+pub async fn create_project_from_templates(
+    db: &VaultDb,
+    key: &CryptoKey,
+    input: ProjectFromTemplatesInput,
+) -> Result<i64, String> {
+    scaffold_project(db, key, input, None).await
+}
+
+/// `fail_after` is a test-only failpoint: fail right after creating that many
+/// items, to exercise the rollback path.
+async fn scaffold_project(
+    db: &VaultDb,
+    key: &CryptoKey,
+    input: ProjectFromTemplatesInput,
+    fail_after: Option<usize>,
+) -> Result<i64, String> {
+    validate_template_input(&input)?;
+    let ProjectFromTemplatesInput { project, vars } = input;
+    let project_id = crate::project::save_project(db, project).await?;
+
+    match populate_default_environment(db, key, project_id, vars, fail_after).await {
+        Ok(()) => Ok(project_id),
+        Err(e) => match db.delete_project(project_id).await {
+            Ok(_) => Err(e),
+            Err(_) => Err(format!(
+                "{e} (rollback failed: delete project #{project_id} manually)"
+            )),
+        },
+    }
+}
+
+async fn populate_default_environment(
+    db: &VaultDb,
+    key: &CryptoKey,
+    project_id: i64,
+    vars: Vec<TemplateVarInput>,
+    fail_after: Option<usize>,
+) -> Result<(), String> {
+    let env = db
+        .list_environments(project_id)
+        .await?
+        .into_iter()
+        .find(|e| e.is_default)
+        .ok_or("new project has no default environment")?;
+
+    let now = epoch_to_iso8601(
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    );
+
+    let mut env_vars = Vec::with_capacity(vars.len());
+    for (i, v) in vars.into_iter().enumerate() {
+        if fail_after == Some(i) {
+            return Err(format!("failed to create item for '{}'", v.key));
+        }
+        let value = if v.value.is_empty() { TEMPLATE_PLACEHOLDER.to_string() } else { v.value };
+        let item = VaultItem {
+            id: 0,
+            item_type: "secret".to_string(),
+            name: Some(v.key.clone()),
+            value: Some(value),
+            url: None,
+            username: None,
+            password: None,
+            title: None,
+            description: None,
+            command: None,
+            shell: None,
+            categories: None,
+            notes: None,
+            content: None,
+            created: now.clone(),
+            is_global: Some(false),
+        };
+        // Map the error so nothing derived from the value can surface.
+        let item_id = create_project_item(db, key, &item, project_id)
+            .await
+            .map_err(|_| format!("failed to create item for '{}'", v.key))?;
+        env_vars.push(crate::project::EnvironmentVar { id: 0, key: v.key, item_id });
+    }
+
+    crate::project::save_environment(
+        db,
+        crate::project::EnvironmentInput {
+            id: env.id,
+            project_id,
+            name: env.name,
+            is_default: env.is_default,
+            paths: env.paths,
+            vars: env_vars,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Scaffolds a new project from the GUI's template picker (see
+/// `openspec/specs/project-templates`). GUI-only: not exposed over REST/MCP/CLI.
+#[tauri::command]
+pub async fn project_create_from_templates(
+    input: ProjectFromTemplatesInput,
+    state: State<'_, SharedState>,
+) -> Result<i64, String> {
+    let mut s = state.lock().await;
+    let key = s.key.as_ref().ok_or("vault is locked")?.clone();
+    s.touch();
+    create_project_from_templates(&s.db, &key, input).await
 }
 
 /// Result of toggling `isGlobal` on an item: at most one of the two shapes is
@@ -1614,5 +1794,110 @@ mod tests {
             raw.iter().find(|(id, ..)| *id == original_id).is_none(),
             "original shared row must be deleted after forking"
         );
+    }
+
+    // ── project_create_from_templates ──
+
+    fn tpl_input(name: &str, vars: &[(&str, &str)]) -> ProjectFromTemplatesInput {
+        ProjectFromTemplatesInput {
+            project: crate::project::ProjectInput {
+                id: 0,
+                name: name.to_string(),
+                description: None,
+                template: "node,postgres".to_string(),
+                categories: vec![],
+                initial_environment: None,
+            },
+            vars: vars
+                .iter()
+                .map(|(k, v)| TemplateVarInput { key: k.to_string(), value: v.to_string() })
+                .collect(),
+        }
+    }
+
+    async fn assert_nothing_created(db: &VaultDb) {
+        assert!(db.list_projects().await.unwrap().is_empty(), "no project must remain");
+        assert!(db.list_items().await.unwrap().is_empty(), "no item must remain");
+    }
+
+    #[tokio::test]
+    async fn scaffold_creates_project_items_and_linked_default_env() {
+        let (_dir, db, key) = test_db().await;
+        let id = create_project_from_templates(
+            &db,
+            &key,
+            tpl_input("shop", &[("NODE_ENV", "development"), ("POSTGRES_PASSWORD", "")]),
+        )
+        .await
+        .unwrap();
+
+        let projects = db.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].template, "node,postgres");
+
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert!(envs[0].is_default);
+        let vars = db.get_environment_vars(envs[0].id).await.unwrap();
+        assert_eq!(vars.len(), 2);
+
+        let raw = db.list_items().await.unwrap();
+        assert_eq!(raw.len(), 2);
+        for v in &vars {
+            let item_id = v.item_id.expect("var must link an item");
+            let (rid, _, data, _, is_global) = raw.iter().find(|(rid, ..)| *rid == item_id).unwrap();
+            assert!(!is_global);
+            assert!(!data.contains("development"), "value must be encrypted at rest");
+            let item = decrypt_item(&key, *rid, data, *is_global).unwrap();
+            assert_eq!(item.item_type, "secret");
+            assert_eq!(item.name.as_deref(), Some(v.key.as_str()));
+            let expected = if v.key == "NODE_ENV" { "development" } else { TEMPLATE_PLACEHOLDER };
+            assert_eq!(item.value.as_deref(), Some(expected));
+            assert_eq!(db.list_owning_projects(item_id).await.unwrap(), vec![id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn scaffold_with_no_vars_creates_empty_default_env() {
+        let (_dir, db, key) = test_db().await;
+        let id = create_project_from_templates(&db, &key, tpl_input("empty", &[])).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert!(db.get_environment_vars(envs[0].id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scaffold_rejects_invalid_input_without_writing() {
+        let (_dir, db, key) = test_db().await;
+        for input in [
+            tpl_input("p", &[("my-key", "secret-value-1")]),
+            tpl_input("p", &[("1ABC", "secret-value-1")]),
+            tpl_input("p", &[("lower", "secret-value-1")]),
+            tpl_input("p", &[("A", "secret-value-1"), ("A", "secret-value-2")]),
+            tpl_input("bad/name", &[("A", "secret-value-1")]),
+        ] {
+            let err = create_project_from_templates(&db, &key, input).await.unwrap_err();
+            assert!(!err.contains("secret-value"), "error leaked a value: {err}");
+        }
+        let too_many: Vec<(String, String)> =
+            (0..=MAX_TEMPLATE_VARS).map(|i| (format!("K{i}"), "v".to_string())).collect();
+        let refs: Vec<(&str, &str)> = too_many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert!(create_project_from_templates(&db, &key, tpl_input("p", &refs)).await.is_err());
+        let mut existing = tpl_input("p", &[]);
+        existing.project.id = 7;
+        assert!(create_project_from_templates(&db, &key, existing).await.is_err());
+        assert_nothing_created(&db).await;
+    }
+
+    #[tokio::test]
+    async fn scaffold_rolls_back_on_mid_way_failure() {
+        let (_dir, db, key) = test_db().await;
+        let input = tpl_input(
+            "rollback",
+            &[("A", "secret-value-a"), ("B", "secret-value-b"), ("C", "secret-value-c")],
+        );
+        let err = scaffold_project(&db, &key, input, Some(2)).await.unwrap_err();
+        assert!(err.contains("'C'"));
+        assert!(!err.contains("secret-value"), "error leaked a value: {err}");
+        assert_nothing_created(&db).await;
     }
 }
