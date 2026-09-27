@@ -19,7 +19,7 @@ pub mod wsl;
 mod test_support;
 
 use vault::{
-    app_complete_setup, app_generate_mcp_config, app_is_first_run,
+    app_complete_setup, app_generate_mcp_config, app_get_system_info, app_is_first_run,
     biometric_check, biometric_disable, biometric_enroll, biometric_is_enrolled, biometric_unlock,
     lock_vault, vault_change_password, vault_delete_item, vault_export_backup,
     vault_generate_mcp_token, vault_get_categories, vault_get_items, vault_get_mcp_token,
@@ -245,6 +245,7 @@ pub fn run() {
             app_is_first_run,
             app_complete_setup,
             app_generate_mcp_config,
+            app_get_system_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

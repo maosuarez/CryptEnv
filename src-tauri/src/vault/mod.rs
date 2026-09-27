@@ -655,6 +655,40 @@ pub async fn vault_get_settings(
     }))
 }
 
+/// Non-sensitive runtime diagnostics shown on the LockScreen and in Settings.
+/// Never carries keys, tokens, or vault contents — only the app version and
+/// where the encrypted database lives on disk.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSystemInfo {
+    pub version: String,
+    pub app_dir: String,
+    pub db_path: String,
+    pub os: String,
+}
+
+/// Pure builder for [`AppSystemInfo`], split out from the command so it can be
+/// unit-tested without a Tauri runtime. `vault.db` matches the file opened in
+/// `lib.rs::run` setup.
+pub fn build_system_info(version: &str, app_dir: &std::path::Path) -> AppSystemInfo {
+    AppSystemInfo {
+        version: version.to_string(),
+        app_dir: app_dir.display().to_string(),
+        db_path: app_dir.join("vault.db").display().to_string(),
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+    }
+}
+
+/// Available while locked: exposes no secret material.
+#[tauri::command]
+pub fn app_get_system_info(app: tauri::AppHandle) -> Result<AppSystemInfo, String> {
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("path error: {e}"))?;
+    Ok(build_system_info(&app.package_info().version.to_string(), &app_dir))
+}
+
 #[tauri::command]
 pub async fn vault_change_password(
     current_password: String,
@@ -1317,6 +1351,26 @@ mod tests {
         let (salt, token, key) = crypto::init_vault_crypto(b"test-master-password-1").unwrap();
         db.init_vault(&salt, &token).await.unwrap();
         (dir, db, key)
+    }
+
+    #[test]
+    fn system_info_reports_version_and_db_path_under_app_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = build_system_info("1.2.3", dir.path());
+        assert_eq!(info.version, "1.2.3");
+        assert!(!info.app_dir.is_empty());
+        assert_eq!(std::path::Path::new(&info.app_dir), dir.path());
+        assert_eq!(std::path::Path::new(&info.db_path), dir.path().join("vault.db"));
+        assert!(!info.os.is_empty());
+    }
+
+    #[test]
+    fn system_info_serializes_camel_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = serde_json::to_value(build_system_info("1.0.0", dir.path())).unwrap();
+        for key in ["version", "appDir", "dbPath", "os"] {
+            assert!(json.get(key).is_some(), "missing key {key}");
+        }
     }
 
     fn plain_secret(name: &str, value: &str, is_global: bool) -> VaultItem {
