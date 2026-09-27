@@ -54,3 +54,7 @@ vault.key
 
 # Added by commit-orchestrator
 /src-tauri/gen/
+
+# Windows bundle inputs staged by scripts/prepare-windows-bundle.mjs
+/src-tauri/binaries/
+/src-tauri/resources/wsl/

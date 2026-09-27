@@ -5,8 +5,12 @@
 //!
 //! Deliberately decoupled: this module knows nothing about `db`, `vault`,
 //! `api`, or `SharedState`, and nothing else calls into it except the
-//! frontend (via the two Tauri commands below) — `project::mod` does not
+//! frontend (via the Tauri commands below and in `client_setup`) — `project::mod` does not
 //! call into it either. See docs/plans/issue-3-wsl-bridge-env-paths.md §3.1.
+
+pub mod client_setup;
+
+pub use client_setup::{wsl_configure_client, wsl_detect, wsl_remove_client};
 
 // ─── Pure parsing (no I/O) ─────────────────────────────────────────────────
 

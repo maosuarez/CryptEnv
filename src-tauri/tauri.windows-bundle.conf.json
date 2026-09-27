@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["binaries/crypt-env", "binaries/crypt-env-mcp"],
+    "resources": {
+      "resources/wsl/crypt-env-setup": "wsl/crypt-env-setup"
+    }
+  }
+}

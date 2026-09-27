@@ -39,6 +39,10 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib --bins --tests --no-fail-fast
 
+      - name: Run shared setup-contract tests (crypt-env-setup)
+        working-directory: src-tauri
+        run: cargo test -p crypt-env-setup --no-fail-fast
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 

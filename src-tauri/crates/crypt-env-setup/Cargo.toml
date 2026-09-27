@@ -1,0 +1,24 @@
+[package]
+name = "crypt-env-setup"
+version = "1.0.2"
+description = "Shared `setup wsl` shell-configuration contract for the CryptEnv CLI"
+authors = ["maosuarez"]
+edition = "2021"
+
+# Kept dependency-light on purpose: the `crypt-env-setup` binary is built as a
+# static `x86_64-unknown-linux-musl` helper that the Windows GUI pushes into a
+# WSL distro (see openspec change `windows-installer-cli-and-wsl-panel`, D2/D3).
+[lib]
+name = "cryptenv_setup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crypt-env-setup"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -150,3 +150,20 @@ export type IconName =
   | 'back'        | 'shield'   | 'key'      | 'kbd'     | 'timer'   | 'person'
   | 'globe'       | 'terminal' | 'more'     | 'tag'     | 'drag'    | 'external'
   | 'export'      | 'rename'   | 'note'     | 'fingerprint' | 'refresh' | 'funnel';
+
+// ─── WSL Integration (Settings, Windows only) ────────────────────────────────
+
+export interface WslDistro {
+  name:        string;
+  defaultUser: string | null;
+  configured:  boolean;
+}
+
+export interface WslStatus {
+  available: boolean;
+  distros:   WslDistro[];
+  mirrored:  boolean;
+}
+
+export interface WslActionReport {
+  env_file:         string;

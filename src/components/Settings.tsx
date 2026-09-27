@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { platform } from '@tauri-apps/plugin-os';
 import { Icon } from './ui/Icon';
 import { ImportModal } from './ImportModal';
 import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
+import { WslIntegrationSection } from './settings/WslIntegrationSection';
 import { useVaultStore } from '../store';
 import type { IconName } from '../types';
 
@@ -249,6 +251,7 @@ export function Settings() {
   const [importOpen,   setImportOpen]   = useState(false);
   const [backupOpen,   setBackupOpen]   = useState(false);
   const [shareOpen,    setShareOpen]    = useState(false);
+  const [isWindows]                     = useState(() => platform() === 'windows');
 
   const [mcpToken,        setMcpToken]        = useState<string | null>(null);
   const [mcpTokenVisible, setMcpTokenVisible] = useState(false);
@@ -629,6 +632,8 @@ export function Settings() {
             </button>
           </div>
         )}
+
+        <WslIntegrationSection isWindows={isWindows} />
 
         <Sec title="UPDATES" />
         <Row icon="export" label="Application Update">

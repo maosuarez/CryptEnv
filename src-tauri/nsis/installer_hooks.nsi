@@ -75,8 +75,10 @@ Function AddToUserPath
   StrLen $R1 $PathOld
   IntCmp $R1 ${PATH_SAFE_CHAR_LIMIT} 0 0 path_too_long
 
-  ; Check if already present (case-insensitive substring search).
-  ${WordFind} "$PathOld" "$INSTDIR" "E+1{" $R0
+  ; Check if already present as an exact entry: search ";<INSTDIR>;" inside
+  ; ";<PATH>;" so a longer path that merely contains $INSTDIR (e.g.
+  ; "...\CryptEnv\tools") is not mistaken for our entry. Case-insensitive.
+  ${WordFind} ";$PathOld;" ";$INSTDIR;" "E+1{" $R0
   IfErrors 0 already_present
 
   ; Not present — append.
@@ -116,8 +118,13 @@ Function un.RemoveFromUserPath
   StrLen $R1 $UnPathOld
   IntCmp $R1 ${PATH_SAFE_CHAR_LIMIT} 0 0 un_path_done
 
-  ; Remove all occurrences of $INSTDIR (with surrounding semicolons).
-  ${WordReplace} "$UnPathOld" "$INSTDIR" "" "+" $UnPathNew
+  ; Remove exactly the "$INSTDIR" entry (every occurrence), never a longer
+  ; path that merely contains it: replace ";<INSTDIR>;" inside ";<PATH>;".
+  ; Run twice so adjacent duplicates (";X;X;") — whose shared separator is
+  ; consumed by the first match — are also removed.
+  ${WordReplace} ";$UnPathOld;" ";$INSTDIR;" ";" "+" $UnPathNew
+  ${WordReplace} "$UnPathNew" ";$INSTDIR;" ";" "+" $R0
+  StrCpy $UnPathNew $R0
 
   ; Clean up any double semicolons left behind.
   ${WordReplace} "$UnPathNew" ";;" ";" "+" $R0
