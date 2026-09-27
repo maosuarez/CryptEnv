@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import type { VaultItem, Category, Screen, MenuState, GlobalToggleResult, ItemOwner } from '../types';
+import { t } from '../i18n';
+
+/** The backend's error string for any key-requiring call made while locked. */
+export function isVaultLockedError(e: unknown): boolean {
+  return String(e).includes('vault is locked');
+}
 
 export const CAT_COLORS_PRESET = [
   '#FF9900', '#10a37f', '#635bff', '#c9d1d9',
@@ -52,6 +58,9 @@ interface VaultStore {
   unlock:              (password: string) => Promise<void>;
   unlockWithPayload:   (payload: { items: VaultItem[]; categories: Category[] }) => Promise<void>;
   lock:                () => Promise<void>;
+  /** The backend already locked (auto-lock event or a "vault is locked"
+   *  error): drop in-memory vault state and show the lock screen. */
+  lockedByBackend:     () => void;
   wipe:           () => Promise<void>;
   saveItem:       (form: Omit<VaultItem, 'id' | 'created'>) => Promise<void>;
   deleteItem:     (id: number) => Promise<void>;
@@ -136,6 +145,12 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       await invoke('vault_lock');
     } catch {}
     set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+  },
+
+  lockedByBackend: () => {
+    if (get().screen === 'lock') return;
+    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+    get().showToast(t('lock.sessionLocked'), 'error');
   },
 
   wipe: async () => {

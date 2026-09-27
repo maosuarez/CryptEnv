@@ -88,8 +88,9 @@ export interface Project {
   categories:   string[];
 }
 
-export type ProjectTemplate =
-  | 'generic' | 'node' | 'postgres' | 'mongo' | 'docker' | 'python';
+/** Comma-joined template ids from `src/data/projectTemplates.ts`, or
+ *  `generic` when none was selected. Legacy projects hold a single id. */
+export type ProjectTemplate = string;
 
 export interface InjectResult {
   paths:          string[];

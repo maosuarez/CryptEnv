@@ -4,7 +4,7 @@ import { platform } from '@tauri-apps/plugin-os';
 import { Icon } from './ui/Icon';
 import { TagInput } from './ui/TagInput';
 import { ProjectShareModal, type ProjectShareMode } from './ProjectShareModal';
-import { useVaultStore } from '../store';
+import { useVaultStore, isVaultLockedError } from '../store';
 import { useProjectStore } from '../store/projectStore';
 import { useTranslation } from '../i18n';
 import {
@@ -14,6 +14,11 @@ import {
 import type {
   EnvironmentVar, Environment, Project, ProjectTemplate, ProjectDeleteImpact, InjectResult, VaultItem, ItemType, Category,
 } from '../types';
+import {
+  TEMPLATE_GROUPS, TEMPLATE_PLACEHOLDER, getTemplate, isValidEnvKey, mergeTemplateVars, normalizeEnvKey,
+  searchTemplates, templateCategories, templateLabels, templateString, type MergedVar,
+} from '../data/projectTemplates';
+import { CAT_COLORS_PRESET } from '../store';
 
 interface ExportedEnvironment {
   name:      string;
@@ -29,18 +34,29 @@ interface ExportedProject {
   environments: ExportedEnvironment[];
 }
 
-// ─── Template definitions ─────────────────────────────────────────────────────
+/** Routes "vault is locked" to the lock screen (the session is gone, so a
+ *  toast alone would leave a dead form); everything else to an error toast. */
+function reportError(e: unknown) {
+  const s = useVaultStore.getState();
+  if (isVaultLockedError(e)) s.lockedByBackend();
+  else s.showToast(String(e), 'error');
+}
 
-const TEMPLATES: { id: ProjectTemplate; label: string; vars: string[] }[] = [
-  { id: 'generic',  label: 'Generic',     vars: [] },
-  { id: 'node',     label: 'Node.js',     vars: ['DATABASE_URL', 'PORT', 'NODE_ENV', 'JWT_SECRET', 'API_KEY'] },
-  { id: 'postgres', label: 'PostgreSQL',  vars: ['POSTGRES_HOST', 'POSTGRES_PORT', 'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_DB'] },
-  { id: 'mongo',    label: 'MongoDB',     vars: ['MONGO_URI', 'MONGO_DB_NAME', 'MONGO_USER', 'MONGO_PASSWORD'] },
-  { id: 'docker',   label: 'Docker',      vars: ['REGISTRY_URL', 'DOCKER_USERNAME', 'DOCKER_PASSWORD', 'BUILD_TAG', 'IMAGE_NAME'] },
-  { id: 'python',   label: 'Python',      vars: ['FLASK_ENV', 'SECRET_KEY', 'DATABASE_URL', 'REDIS_URL', 'DEBUG'] },
-];
+// Values stay lowercase: an environment name becomes the `.env.<name>`
+// filename on inject, and frameworks (Next.js, Vite, dotenv) look for
+// `.env.production` on case-sensitive filesystems. Only the displayed label
+// is capitalized and localized (it may contain non-ASCII, which env names
+// can't).
+const ENV_PRESETS = ['production', 'local', 'test', 'staging'] as const;
 
-const ENV_PRESETS = ['production', 'local', 'test', 'staging'];
+function EnvPresetOptions({ id }: { id: string }) {
+  const { t } = useTranslation();
+  return (
+    <datalist id={id}>
+      {ENV_PRESETS.map((n) => <option key={n} value={n} label={t(`projects.envPresets.${n}`)} />)}
+    </datalist>
+  );
+}
 
 // ─── Name validation (UX mirror only — see issue #7) ──────────────────────────
 //
@@ -63,43 +79,233 @@ function isValidProjectName(name: string): boolean {
   return true;
 }
 
-function TemplateModal({
-  onSelect,
+function TemplatePicker({
+  initial,
+  onConfirm,
   onClose,
 }: {
-  onSelect: (t: ProjectTemplate) => void;
-  onClose:  () => void;
+  initial:   string[];
+  onConfirm: (ids: string[]) => void;
+  onClose:   () => void;
 }) {
   const { t } = useTranslation();
+  const [query, setQuery]       = useState('');
+  const [selected, setSelected] = useState<string[]>(initial);
+
+  const visible = useMemo(() => searchTemplates(query), [query]);
+  const toggle = (id: string) =>
+    setSelected((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+
   return (
-    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
-      <div className="w-full max-w-sm bg-surface border border-bd rounded-[4px] p-4">
-        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.09em] mb-3">
-          {t('projects.templateModal.header')}
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          {TEMPLATES.map((tpl) => (
+    <div
+      className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4"
+      onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+    >
+      <div className="w-full max-w-2xl max-h-full flex flex-col bg-surface border border-bd rounded-[4px] p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <div className="flex-1 text-[10px] font-semibold text-tx3 font-mono tracking-[0.09em]">
+            {t('projects.templateModal.header')}
+          </div>
+          <span className="text-[10px] font-mono text-accent">
+            {t('projects.templateModal.selectedCount', { n: selected.length })}
+          </span>
+          {selected.length > 0 && (
             <button
-              key={tpl.id}
-              onClick={() => onSelect(tpl.id)}
-              className="p-3 bg-raised border border-bd2 rounded-[3px] text-left hover:border-accent-d hover:text-accent transition-colors group"
+              onClick={() => setSelected([])}
+              className="text-[10px] font-ui font-medium text-tx2 border border-bd2 rounded-[3px] px-2 py-[2px] hover:text-tx transition-colors"
             >
-              <div className="text-[12px] font-semibold text-tx group-hover:text-accent font-ui">
-                {tpl.id === 'generic' ? t('projects.templateModal.generic') : tpl.label}
-              </div>
-              <div className="text-[10px] text-tx3 font-mono mt-0.5">
-                {tpl.vars.length > 0 ? t('projects.templateModal.varsCount', { n: tpl.vars.length }) : t('projects.templateModal.empty')}
-              </div>
+              {t('projects.templateModal.clear')}
             </button>
-          ))}
+          )}
         </div>
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={t('projects.templateModal.searchPlaceholder')}
+          className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] mb-3 outline-none focus:border-accent-d transition-colors"
+        />
+        <div className="flex-1 min-h-0 h-[360px] overflow-y-auto pr-1">
+          {visible.length === 0 && (
+            <div className="text-[11px] text-tx3 font-mono py-6 text-center">{t('projects.templateModal.noResults')}</div>
+          )}
+          {TEMPLATE_GROUPS.map((g) => {
+            const inGroup = visible.filter((tpl) => tpl.group === g);
+            if (inGroup.length === 0) return null;
+            return (
+              <div key={g} className="mb-3">
+                <div className="text-[9px] font-semibold text-tx3 font-mono tracking-[0.12em] mb-1.5 pb-1 border-b border-bd uppercase">
+                  {t(`projects.templateModal.groups.${g}`)}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                  {inGroup.map((tpl) => {
+                    const on = selected.includes(tpl.id);
+                    return (
+                      <button
+                        key={tpl.id}
+                        onClick={() => toggle(tpl.id)}
+                        aria-pressed={on}
+                        className={[
+                          'px-2.5 py-2 border rounded-[3px] text-left transition-colors',
+                          on ? 'bg-accent-b border-accent-d' : 'bg-raised border-bd2 hover:border-accent-d',
+                        ].join(' ')}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className={`text-[12px] font-semibold font-ui truncate flex-1 ${on ? 'text-accent' : 'text-tx'}`}>
+                            {tpl.label}
+                          </span>
+                          {on && <span className="text-accent"><Icon name="check" size={11} /></span>}
+                        </div>
+                        <div className="text-[10px] text-tx3 font-mono mt-0.5">
+                          {t('projects.templateModal.varsCount', { n: tpl.vars.length })}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex gap-2 mt-3">
+          <button
+            onClick={onClose}
+            className="flex-1 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
+          >
+            {t('common.cancel')}
+          </button>
+          <button
+            onClick={() => onConfirm(selected)}
+            className="flex-1 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity"
+          >
+            {selected.length === 0 ? t('projects.templateModal.continueEmpty') : t('projects.templateModal.continue')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── TemplateVarsReview (editable merged template variables) ──────────────────
+
+interface ReviewVar extends MergedVar {
+  uid: number;
+}
+
+let reviewUid = 0;
+const toReviewVars = (merged: MergedVar[]): ReviewVar[] =>
+  merged.map((v) => ({ ...v, alsoIn: [...v.alsoIn], uid: ++reviewUid }));
+
+/** Keys that are empty or collide — used to block creation. */
+function invalidReviewKeys(vars: ReviewVar[]): Set<number> {
+  const bad = new Set<number>();
+  const seen = new Map<string, number>();
+  for (const v of vars) {
+    if (!isValidEnvKey(v.key)) bad.add(v.uid);
+    const prev = seen.get(v.key);
+    if (prev !== undefined) { bad.add(prev); bad.add(v.uid); } else seen.set(v.key, v.uid);
+  }
+  return bad;
+}
+
+function TemplateVarsReview({
+  vars,
+  onChange,
+}: {
+  vars:     ReviewVar[];
+  onChange: (vars: ReviewVar[]) => void;
+}) {
+  const { t } = useTranslation();
+  const [revealed, setRevealed] = useState<Set<number>>(new Set());
+  const invalid = useMemo(() => invalidReviewKeys(vars), [vars]);
+
+  const update = (uid: number, patch: Partial<ReviewVar>) =>
+    onChange(vars.map((v) => (v.uid === uid ? { ...v, ...patch } : v)));
+  const remove = (uid: number) => onChange(vars.filter((v) => v.uid !== uid));
+  const add = () =>
+    onChange([...vars, { key: '', value: '', sensitive: false, source: '', alsoIn: [], uid: ++reviewUid }]);
+  const toggleReveal = (uid: number) =>
+    setRevealed((r) => { const n = new Set(r); if (n.has(uid)) n.delete(uid); else n.add(uid); return n; });
+
+  // Group rows by source template, preserving first-appearance order.
+  const groups: { source: string; rows: ReviewVar[] }[] = [];
+  for (const v of vars) {
+    const g = groups.find((x) => x.source === v.source);
+    if (g) g.rows.push(v); else groups.push({ source: v.source, rows: [v] });
+  }
+
+  return (
+    <div className="mb-3">
+      <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1 flex items-center justify-between">
+        <span>{t('projects.review.header', { n: vars.length })}</span>
         <button
-          onClick={onClose}
-          className="mt-3 w-full py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-transparent border border-bd2 text-tx2 hover:text-tx transition-colors"
+          onClick={add}
+          className="flex items-center gap-1 text-accent text-[10px] font-ui font-bold hover:opacity-80 transition-opacity"
         >
-          {t('common.cancel')}
+          <Icon name="plus" size={10} />{t('projects.review.add')}
         </button>
       </div>
+      {vars.length === 0 && (
+        <div className="text-[11px] text-tx3 font-mono py-2">{t('projects.review.empty')}</div>
+      )}
+      {groups.map((g) => (
+        <div key={g.source || '_custom'} className="mb-2">
+          <div className="text-[9px] font-mono text-tx3 tracking-[0.1em] uppercase mb-1">
+            {g.source ? (getTemplate(g.source)?.label ?? g.source) : t('projects.review.custom')}
+          </div>
+          {g.rows.map((v) => {
+            const bad = invalid.has(v.uid);
+            const masked = v.sensitive && !revealed.has(v.uid);
+            return (
+              <div key={v.uid} className="mb-1">
+                <div className="flex items-center gap-1.5">
+                  <input
+                    value={v.key}
+                    onChange={(e) => update(v.uid, { key: normalizeEnvKey(e.target.value) })}
+                    placeholder="KEY"
+                    aria-invalid={bad}
+                    className={`w-[42%] bg-bg border text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] outline-none transition-colors ${bad ? 'border-danger' : 'border-bd2 focus:border-accent-d'}`}
+                  />
+                  <input
+                    type={masked ? 'password' : 'text'}
+                    value={v.value}
+                    onChange={(e) => update(v.uid, { value: e.target.value })}
+                    placeholder={TEMPLATE_PLACEHOLDER}
+                    className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] outline-none focus:border-accent-d transition-colors"
+                  />
+                  {v.sensitive && (
+                    <button
+                      onClick={() => toggleReveal(v.uid)}
+                      aria-label={masked ? t('projects.review.reveal') : t('projects.review.hide')}
+                      className="text-tx3 hover:text-tx transition-colors"
+                    >
+                      <Icon name={masked ? 'eye' : 'eyeOff'} size={12} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => remove(v.uid)}
+                    aria-label={t('projects.review.remove')}
+                    className="text-tx3 hover:text-danger transition-colors text-[14px] leading-none px-0.5"
+                  >
+                    ×
+                  </button>
+                </div>
+                {v.alsoIn.length > 0 && (
+                  <div className="text-[9px] font-mono text-tx3 mt-0.5">
+                    {t('projects.review.alsoIn', { names: v.alsoIn.map((id) => getTemplate(id)?.label ?? id).join(', ') })}
+                  </div>
+                )}
+                {bad && (
+                  <div className="text-[9px] font-mono text-danger mt-0.5">
+                    {v.key === '' || !isValidEnvKey(v.key) ? t('projects.review.invalidKey') : t('projects.review.duplicateKey')}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      <div className="text-[10px] text-tx3 font-mono mt-1">{t('projects.review.placeholderNote', { placeholder: TEMPLATE_PLACEHOLDER })}</div>
     </div>
   );
 }
@@ -336,7 +542,7 @@ function AddVarPanel({
       const item = await createProjectItem(project.id, { ...fields, type, categories: [], isGlobal: false } as Omit<VaultItem, 'id' | 'created'>);
       onAdded({ id: -Date.now(), key: key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, ''), itemId: item.id });
     } catch (err) {
-      showToast(String(err), 'error');
+      reportError(err);
     } finally {
       setSaving(false);
     }
@@ -406,12 +612,22 @@ function AddVarPanel({
   return (
     <div className="border border-bd2 rounded-[3px] p-3 mb-2 bg-raised">
       <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-2">{t('projects.addVar.newHeader')}</div>
-      <input
-        value={key}
-        onChange={(e) => setKey(e.target.value)}
-        placeholder="KEY_NAME"
-        className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-2 py-[6px] outline-none focus:border-accent-d mb-2"
-      />
+      <div className="border border-accent/60 focus-within:border-accent ring-1 ring-accent/20 rounded-[3px] bg-accent-b p-2 mb-3">
+        <label htmlFor="add-var-key" className="flex items-center gap-1.5 mb-1">
+          <span className="text-[9px] font-mono font-bold tracking-[0.1em] text-[#020504] bg-accent rounded-[2px] px-1.5 py-[1px]">
+            {t('projects.addVar.keyBadge')}
+          </span>
+          <span className="text-[10px] font-mono text-accent">{t('projects.addVar.keyRequired')}</span>
+        </label>
+        <input
+          id="add-var-key"
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          placeholder={t('projects.addVar.keyPlaceholder')}
+          className="w-full bg-bg border border-accent-d text-tx font-mono text-[13px] font-semibold rounded-[3px] px-2 py-[6px] outline-none focus:border-accent"
+        />
+        <div className="text-[10px] text-tx3 font-mono mt-1">{t('projects.addVar.keyHelp')}</div>
+      </div>
       <ItemTypePicker type={type} onSelect={(ty) => { setType(ty); setErrors({}); }} />
       <ItemTypeFields
         type={type}
@@ -470,7 +686,7 @@ function ProjectCard({ project, cats, onOpen }: { project: Project; cats: Catego
       <div className="flex items-center gap-2 mb-1.5">
         <span className="flex-1 text-[13px] font-semibold text-tx font-ui truncate">{project.name}</span>
         <span className="text-[9px] font-mono text-tx3 bg-bg border border-bd px-1.5 py-[1px] rounded-[2px] uppercase shrink-0">
-          {project.template}
+          {templateLabels(project.template).join(' · ')}
         </span>
       </div>
       <div className="flex items-center gap-1 mb-1.5 flex-wrap min-h-[18px]">
@@ -601,8 +817,9 @@ export function ProjectManager() {
   const items          = useVaultStore((s) => s.items);
   const cats           = useVaultStore((s) => s.cats);
   const getItemOwners  = useVaultStore((s) => s.getItemOwners);
+  const saveCats       = useVaultStore((s) => s.saveCats);
 
-  const { projects, loading, load, saveProject, removeProject, saveEnvironment, removeEnvironment, inject, previewInject } =
+  const { projects, loading, load, saveProject, createFromTemplates, removeProject, saveEnvironment, removeEnvironment, inject, previewInject } =
     useProjectStore();
 
   // Pending confirm-then-inject flow (see `runInject` below): `injectConfirm`
@@ -658,6 +875,9 @@ export function ProjectManager() {
   const [projName,        setProjName]        = useState('');
   const [projDescription, setProjDescription] = useState('');
   const [projTemplate,    setProjTemplate]    = useState<ProjectTemplate>('generic');
+  const [projTemplateIds, setProjTemplateIds] = useState<string[]>([]);
+  const [projInitialEnv,  setProjInitialEnv]  = useState('');
+  const [templateVars,    setTemplateVars]    = useState<ReviewVar[]>([]);
   const [projCategories,  setProjCategories]  = useState<string[]>([]);
   const [isCreatingProj,  setIsCreatingProj]  = useState(false);
   const [templateModal,   setTemplateModal]   = useState(false);
@@ -776,16 +996,83 @@ export function ProjectManager() {
     setProjName('');
     setProjDescription('');
     setProjTemplate('generic');
+    setProjTemplateIds([]);
+    setTemplateVars([]);
+    setProjInitialEnv('');
     setProjCategories([]);
     setIsCreatingProj(true);
     setConfirmDelProj(false);
     setTemplateModal(true);
   };
 
-  const handleTemplateSelect = (tpl: ProjectTemplate) => {
-    setProjTemplate(tpl);
+  // Re-picking templates rebuilds the variable list from scratch (edits are
+  // discarded) but only ever adds categories, never drops user-picked ones.
+  const handleTemplateSelect = (ids: string[]) => {
+    setProjTemplateIds(ids);
+    setProjTemplate(templateString(ids));
+    setTemplateVars(toReviewVars(mergeTemplateVars(ids)));
+    setProjCategories((cur) => [...cur, ...templateCategories(ids).filter((c) => !cur.includes(c))]);
     setTemplateModal(false);
     setMode('project');
+  };
+
+  // Blank is fine (backend defaults to "default"); otherwise mirror the env-name rule.
+  const initialEnvValid = projInitialEnv.trim() === '' || isValidEnvironmentName(projInitialEnv.trim());
+
+  const templateVarsInvalid = useMemo(() => invalidReviewKeys(templateVars).size > 0, [templateVars]);
+
+  // Categories referenced by name must exist or the backend silently drops them.
+  const ensureCategories = async (names: string[]) => {
+    const missing = names.filter((n) => !cats.some((c) => c.name === n));
+    if (missing.length === 0) return;
+    const now = Date.now();
+    const added = missing.map((name, i) => ({
+      id:    `c${now}${i}`,
+      name,
+      color: CAT_COLORS_PRESET[(cats.length + i) % CAT_COLORS_PRESET.length],
+    }));
+    await saveCats([...cats, ...added]);
+  };
+
+  // Inline tag creation (TagInput): persist, then select. Rethrows so the
+  // input keeps the draft on failure.
+  const handleCreateCategory = async (name: string) => {
+    try {
+      await ensureCategories([name]);
+      setProjCategories((cur) => (cur.includes(name) ? cur : [...cur, name]));
+    } catch (e) {
+      reportError(e);
+      throw e;
+    }
+  };
+
+  const handleCreateProject = async () => {
+    if (!isValidProjectName(projName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.projectNameRule') }), 'error'); return; }
+    if (templateVarsInvalid || !initialEnvValid) return;
+    setSaving(true);
+    try {
+      await ensureCategories(projCategories);
+      const id = await createFromTemplates({
+        name:        projName.trim(),
+        description: projDescription || undefined,
+        template:    templateString(projTemplateIds),
+        categories:  projCategories,
+        initialEnvironment: projInitialEnv.trim() || undefined,
+        vars:        templateVars.map((v) => ({ key: v.key, value: v.value })),
+      });
+      await refreshVaultItems();
+      const fresh = useProjectStore.getState().projects.find((p) => p.id === id);
+      if (fresh) {
+        setIsCreatingProj(false);
+        setTemplateVars([]);
+        openProject(fresh);
+      }
+      showToast(t('projects.toast.projectSaved'));
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleSaveProject = async () => {
@@ -806,7 +1093,7 @@ export function ProjectManager() {
       }
       showToast(t('projects.toast.projectSaved'));
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     } finally {
       setSaving(false);
     }
@@ -827,7 +1114,7 @@ export function ProjectManager() {
       await invoke('project_export', { projectId: selectedProject.id });
       showToast(t('projects.toast.templateSaved'));
     } catch (e) {
-      if (String(e) !== 'cancelled') showToast(String(e), 'error');
+      if (String(e) !== 'cancelled') reportError(e);
     }
   };
 
@@ -845,7 +1132,7 @@ export function ProjectManager() {
       const fresh = useProjectStore.getState().projects.find((p) => p.id === projectId);
       if (fresh) openProject(fresh);
     } catch (e) {
-      if (String(e) !== 'cancelled') showToast(String(e), 'error');
+      if (String(e) !== 'cancelled') reportError(e);
     } finally {
       setSaving(false);
     }
@@ -895,7 +1182,7 @@ export function ProjectManager() {
       const picked = await invoke<string | null>('project_pick_env_path');
       applyPickedEnvPath(picked);
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     }
   };
 
@@ -907,7 +1194,7 @@ export function ProjectManager() {
       const picked = await invoke<string | null>('project_pick_env_path', { startDir: home });
       applyPickedEnvPath(picked);
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     } finally {
       setWslBusy(false);
     }
@@ -936,7 +1223,7 @@ export function ProjectManager() {
       setEnvVars((prev) => prev.filter((x) => x.itemId !== v.itemId));
       showToast(t('projects.toast.itemDeleted'));
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     }
   };
 
@@ -957,7 +1244,7 @@ export function ProjectManager() {
       backToProject();
       showToast(t('projects.toast.environmentSaved'));
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     } finally {
       setSaving(false);
     }
@@ -970,7 +1257,7 @@ export function ProjectManager() {
       backToProject();
       showToast(t('projects.toast.environmentDeleted'));
     } catch (e) {
-      showToast(String(e), 'error');
+      reportError(e);
     }
   };
 
@@ -987,7 +1274,7 @@ export function ProjectManager() {
       }
       showToast(msg);
     } catch (e) {
-      if (String(e) !== 'Error: cancelled') showToast(String(e), 'error');
+      if (String(e) !== 'Error: cancelled') reportError(e);
     } finally {
       setInjecting(false);
     }
@@ -1177,20 +1464,14 @@ export function ProjectManager() {
             </div>
             <div className="mb-3">
               <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
-              <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} />
+              <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
             </div>
             <div className="mb-4">
               <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.template')}</div>
               <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-[3px] capitalize">
-                  {projTemplate}
+                <span className="text-[11px] font-mono text-tx2 bg-raised border border-bd2 rounded-[3px] px-2 py-[3px] truncate">
+                  {templateLabels(projTemplate).join(' · ')}
                 </span>
-                <button
-                  onClick={() => setTemplateModal(true)}
-                  className="text-[10px] font-ui font-medium text-tx2 border border-bd2 rounded-[3px] px-2 py-[3px] hover:text-tx transition-colors"
-                >
-                  {t('projects.change')}
-                </button>
                 <button
                   onClick={handleSaveProject}
                   disabled={saving || !isValidProjectName(projName.trim())}
@@ -1213,7 +1494,7 @@ export function ProjectManager() {
 
             {selectedProject.environments.length === 0 && (
               <div className="text-[11px] text-tx3 font-mono py-2">
-                {t('projects.noEnvironments', { presets: ENV_PRESETS.join(', ') })}
+                {t('projects.noEnvironments', { presets: ENV_PRESETS.map((n) => t(`projects.envPresets.${n}`)).join(', ') })}
               </div>
             )}
 
@@ -1238,15 +1519,21 @@ export function ProjectManager() {
 
       {(isCreatingProj || mode === 'environment') && (
         <>
-          <div className="px-3.5 py-[9px] border-b border-bd flex items-center gap-[10px] shrink-0">
+          {/* Title is absolutely centred over the full header width so the
+              back button's width can't push it off-centre; the button is
+              capped (and the title padded) so the two never overlap. */}
+          <div className="relative px-3.5 py-[9px] border-b border-bd flex items-center shrink-0">
             <button
               onClick={isCreatingProj ? goToProjects : backToProject}
-              className="flex items-center gap-1 text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
+              className="relative z-10 flex items-center gap-1 max-w-[96px] text-[12px] font-medium font-ui text-tx3 bg-transparent border-none cursor-pointer hover:text-tx transition-colors"
             >
-              <Icon name="back" size={13} />{isCreatingProj ? t('projects.navProjects') : selectedProject?.name}
+              <Icon name="back" size={13} />
+              <span className="truncate">{isCreatingProj ? t('projects.navProjects') : selectedProject?.name}</span>
             </button>
-            <div className="flex-1 text-[13px] font-semibold text-center text-tx truncate px-1">
-              {isCreatingProj ? t('projects.newProjectTitle') : (isCreatingEnv ? t('projects.newEnvironmentTitle') : (selectedEnv?.name ?? ''))}
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-[118px]">
+              <span className="text-[13px] font-semibold text-tx truncate">
+                {isCreatingProj ? t('projects.newProjectTitle') : (isCreatingEnv ? t('projects.newEnvironmentTitle') : (selectedEnv?.name ?? ''))}
+              </span>
             </div>
           </div>
 
@@ -1279,13 +1566,15 @@ export function ProjectManager() {
                 </div>
                 <div className="mb-3">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.tags')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.tagsHint')}</span></div>
-                  <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} />
+                  <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
                 </div>
                 <div className="mb-3">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.template')}</div>
                   <div className="flex items-center gap-2">
-                    <span className="text-[11px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-[3px] capitalize">
-                      {projTemplate}
+                    <span className="text-[11px] font-mono text-accent bg-accent-b border border-accent-d rounded-[3px] px-2 py-[3px] truncate">
+                      {projTemplateIds.length === 0
+                        ? t('projects.templateModal.generic')
+                        : templateLabels(projTemplate).join(' · ')}
                     </span>
                     <button
                       onClick={() => setTemplateModal(true)}
@@ -1295,6 +1584,23 @@ export function ProjectManager() {
                     </button>
                   </div>
                 </div>
+                <div className="mb-3">
+                  <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
+                    {t('projects.initialEnvironment')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.initialEnvironmentHint')}</span>
+                  </div>
+                  <input
+                    value={projInitialEnv}
+                    onChange={(e) => setProjInitialEnv(e.target.value)}
+                    placeholder="default"
+                    list="env-presets-initial"
+                    className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
+                  />
+                  <EnvPresetOptions id="env-presets-initial" />
+                  {!initialEnvValid && (
+                    <div className="text-[10px] font-mono text-danger mt-1">{t('projects.envNameRule')}</div>
+                  )}
+                </div>
+                <TemplateVarsReview vars={templateVars} onChange={setTemplateVars} />
                 <div className="text-[11px] text-tx3 font-mono py-2">
                   {t('projects.defaultEnvNote')}
                 </div>
@@ -1313,9 +1619,7 @@ export function ProjectManager() {
                     list="env-presets"
                     className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[13px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
                   />
-                  <datalist id="env-presets">
-                    {ENV_PRESETS.map((n) => <option key={n} value={n} />)}
-                  </datalist>
+                  <EnvPresetOptions id="env-presets" />
                   <label className="flex items-center gap-1.5 text-[10px] font-mono text-tx3 shrink-0 cursor-pointer select-none">
                     <input
                       type="checkbox"
@@ -1484,8 +1788,8 @@ export function ProjectManager() {
                 </>
               )}
               <button
-                onClick={isCreatingProj ? handleSaveProject : handleSaveEnvironment}
-                disabled={saving || (isCreatingProj ? !isValidProjectName(projName.trim()) : !isValidEnvironmentName(envName.trim()))}
+                onClick={isCreatingProj ? handleCreateProject : handleSaveEnvironment}
+                disabled={saving || (isCreatingProj ? (!isValidProjectName(projName.trim()) || templateVarsInvalid || !initialEnvValid) : !isValidEnvironmentName(envName.trim()))}
                 className="px-4 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center gap-1.5"
               >
                 {saving
@@ -1498,8 +1802,9 @@ export function ProjectManager() {
       )}
 
       {templateModal && (
-        <TemplateModal
-          onSelect={handleTemplateSelect}
+        <TemplatePicker
+          initial={projTemplateIds}
+          onConfirm={handleTemplateSelect}
           onClose={() => {
             setTemplateModal(false);
             if (isCreatingProj && !projName) goToProjects();
