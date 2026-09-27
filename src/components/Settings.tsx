@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { platform } from '@tauri-apps/plugin-os';
 import { Icon } from './ui/Icon';
 import { ImportModal } from './ImportModal';
@@ -31,6 +32,18 @@ function Sec({ title }: { title: string }) {
     </div>
   );
 }
+
+const defaultHotkey = (isMac: boolean) => (isMac ? 'Cmd+Alt+Z' : 'Ctrl+Alt+Z');
+
+// Older builds stored `Meta`, which the shortcut parser rejects; show the
+// platform-native name instead (the backend normalises it on save).
+const displayHotkey = (hotkey: string, isMac: boolean) =>
+  hotkey.split('+').map((k) => (k === 'Meta' ? (isMac ? 'Cmd' : 'Super') : k)).join('+');
+
+// `KeyboardEvent.code` is layout- and Shift-independent (`KeyZ`, `Digit1`,
+// `F5`, `ArrowUp`) and matches the names the Rust shortcut parser accepts.
+const hotkeyKeyFromCode = (code: string) =>
+  code.startsWith('Key') ? code.slice(3) : code.startsWith('Digit') ? code.slice(5) : code;
 
 function PwField({
   label, value, show, onChange, onToggle,
@@ -126,6 +139,9 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
   const [sqlOpen,   setSqlOpen]   = useState(false);
   const [saving,    setSaving]    = useState(false);
   const { t } = useTranslation();
+  // Persisted values: this save must not clobber (and re-register) them.
+  const savedLockTimeout = useVaultStore((s) => s.lockTimeout);
+  const savedHotkey      = useVaultStore((s) => s.hotkey);
 
   useEffect(() => {
     // Relay settings are persisted server-side; no need to load them here.
@@ -136,8 +152,8 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
     setSaving(true);
     try {
       await invoke('vault_save_settings', {
-        autoLockTimeout: 5,
-        hotkey: 'Ctrl+Alt+Z',
+        autoLockTimeout: savedLockTimeout,
+        hotkey: savedHotkey,
         relaySupabaseUrl: url.trim(),
         relaySupabaseAnonKey: anonKey.trim(),
       });
@@ -295,6 +311,7 @@ export function Settings() {
   const [timeoutDraft, setTimeoutDraft] = useState(storeLockTimeout);
   const [hotkeyDraft,  setHotkeyDraft]  = useState(storeHotkey);
   const [capturing,    setCapturing]    = useState(false);
+  const [hotkeyError,  setHotkeyError]  = useState('');
   const [saving,       setSaving]       = useState(false);
   const [saved,        setSaved]        = useState(false);
   const [wipeOpen,     setWipeOpen]     = useState(false);
@@ -303,6 +320,7 @@ export function Settings() {
   const [backupOpen,   setBackupOpen]   = useState(false);
   const [shareOpen,    setShareOpen]    = useState(false);
   const [isWindows]                     = useState(() => platform() === 'windows');
+  const [isMac]                         = useState(() => platform() === 'macos');
 
   const [mcpToken,        setMcpToken]        = useState<string | null>(null);
   const [mcpTokenVisible, setMcpTokenVisible] = useState(false);
@@ -376,6 +394,47 @@ export function Settings() {
     }).catch(() => {});
   }, []);
 
+  // While recording, suppress the global toggle so pressing the current
+  // hotkey doesn't hide the window. The OS swallows that combination before
+  // the webview sees it, so the backend echoes it via `hotkey_captured`.
+  useEffect(() => {
+    if (!capturing) return;
+    invoke('vault_pause_hotkey', { paused: true }).catch(() => {});
+    const unlisten = listen<string>('hotkey_captured', (e) => {
+      setHotkeyDraft(e.payload);
+      setHotkeyError('');
+      setCapturing(false);
+    });
+    return () => {
+      unlisten.then((f) => f()).catch(() => {});
+      invoke('vault_pause_hotkey', { paused: false }).catch(() => {});
+    };
+  }, [capturing]);
+
+  const handleHotkeyKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (!capturing) return;
+    e.preventDefault();
+    if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
+    const hasModifier = e.ctrlKey || e.altKey || e.metaKey;
+    if (e.key === 'Escape' && !hasModifier) {
+      setHotkeyError('');
+      setCapturing(false);
+      return;
+    }
+    if (!hasModifier) {
+      setHotkeyError(t('settings.hotkey.needsModifier'));
+      return;
+    }
+    const m: string[] = [];
+    if (e.ctrlKey)  m.push('Ctrl');
+    if (e.altKey)   m.push('Alt');
+    if (e.shiftKey) m.push('Shift');
+    if (e.metaKey)  m.push(isMac ? 'Cmd' : 'Super');
+    setHotkeyDraft([...m, hotkeyKeyFromCode(e.code)].join('+'));
+    setHotkeyError('');
+    setCapturing(false);
+  };
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -387,6 +446,8 @@ export function Settings() {
       setHotkey(hotkeyDraft);
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
+    } catch (e) {
+      showToast(String(e), 'error');
     } finally {
       setSaving(false);
     }
@@ -564,33 +625,35 @@ export function Settings() {
 
         <Sec title={t('settings.sections.interface')} />
         <Row icon="kbd" label={t('settings.rows.hotkey')}>
-          <button
-            onClick={() => setCapturing(true)}
-            onKeyDown={(e) => {
-              if (!capturing) return;
-              e.preventDefault();
-              const m: string[] = [];
-              if (e.ctrlKey)  m.push('Ctrl');
-              if (e.altKey)   m.push('Alt');
-              if (e.shiftKey) m.push('Shift');
-              if (e.metaKey)  m.push('Meta');
-              const k = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-              if (!['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
-                setHotkeyDraft([...m, k].join('+'));
-                setCapturing(false);
-              }
-            }}
-            onBlur={() => setCapturing(false)}
-            className={[
-              'h-8 px-4 rounded-[3px] text-[12px] cursor-pointer font-mono tracking-[0.06em]',
-              'border outline-none transition-all duration-150',
-              capturing
-                ? 'bg-accent-b border-accent-d text-accent animate-blink'
-                : 'bg-raised border-bd2 text-tx hover:border-accent',
-            ].join(' ')}
-          >
-            {capturing ? t('settings.pressKeys') : hotkeyDraft}
-          </button>
+          <div className="flex flex-col items-end gap-1">
+            <div className="flex items-center gap-2">
+              {hotkeyDraft !== defaultHotkey(isMac) && (
+                <button
+                  onClick={() => { setHotkeyDraft(defaultHotkey(isMac)); setHotkeyError(''); }}
+                  className="h-8 px-3 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui font-semibold tracking-[0.06em] hover:text-tx transition-colors"
+                >
+                  {t('settings.hotkey.reset')}
+                </button>
+              )}
+              <button
+                onClick={() => { setHotkeyError(''); setCapturing(true); }}
+                onKeyDown={handleHotkeyKeyDown}
+                onBlur={() => { setCapturing(false); setHotkeyError(''); }}
+                className={[
+                  'h-8 px-4 rounded-[3px] text-[12px] cursor-pointer font-mono tracking-[0.06em]',
+                  'border outline-none transition-all duration-150',
+                  capturing
+                    ? 'bg-accent-b border-accent-d text-accent animate-blink'
+                    : 'bg-raised border-bd2 text-tx hover:border-accent',
+                ].join(' ')}
+              >
+                {capturing ? t('settings.pressKeys') : displayHotkey(hotkeyDraft, isMac)}
+              </button>
+            </div>
+            {hotkeyError && (
+              <span role="alert" className="text-[11px] text-danger font-ui">{hotkeyError}</span>
+            )}
+          </div>
         </Row>
         <Row icon="tag" label={t('settings.rows.manageCategories')}>
           <button

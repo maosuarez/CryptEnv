@@ -117,11 +117,35 @@ body {
 input::-ms-reveal,
 input::-ms-clear { display: none; }
 
-input, textarea, select {
+input, textarea {
   font-family: 'Space Grotesk', sans-serif;
   background: transparent;
   border: none;
   outline: none;
   color: var(--color-tx);
+}
+
+/* Select reset lives in the base layer so utility classes (`bg-raised`,
+   `border-bd2`, …) on the trigger win; unlayered it overrode them and the
+   transparent trigger made WebView2 paint the option popup white. */
+@layer base {
+  select {
+    font-family: 'Space Grotesk', sans-serif;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--color-tx);
+  }
+}
+
+/* Native option popups don't inherit utilities: pin them to theme tokens. */
+:root:not([data-theme="light"]) select option,
+:root:not([data-theme="light"]) select optgroup {
+  background-color: var(--color-surface);
+  color: var(--color-tx);
+}
+
+:root:not([data-theme="light"]) select option:checked {
+  background-color: var(--color-raised);
 }
 
