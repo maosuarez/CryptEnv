@@ -60,4 +60,21 @@ describe('AddVarPanel (new variable)', () => {
     fireEvent.click(screen.getByText('ADD'));
     await waitFor(() => expect(onAdded).toHaveBeenCalledWith(expect.objectContaining({ key: 'NEW_KEY', itemId: 99 })));
   });
+
+  it('marks a newly created item global when the checkbox is ticked', async () => {
+    const created = { id: 100, type: 'secret', name: 'SHARED', value: 'v', created: '', isGlobal: false };
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'vault_create_project_item') return Promise.resolve(created);
+      if (cmd === 'vault_set_item_global') return Promise.resolve({ updated: { ...created, isGlobal: true }, forked: [] });
+      if (cmd === 'vault_list') return Promise.resolve({ items: [{ ...created, isGlobal: true }], categories: [] });
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    const onAdded = renderPanel();
+    fireEvent.change(keyInput(), { target: { value: 'SHARED' } });
+    fireEvent.change(screen.getByPlaceholderText('sk-…'), { target: { value: 'v' } });
+    fireEvent.click(screen.getByLabelText(/Mark as global/));
+    fireEvent.click(screen.getByText('ADD'));
+    await waitFor(() => expect(onAdded).toHaveBeenCalledWith(expect.objectContaining({ key: 'SHARED', itemId: 100 })));
+    expect(invoke).toHaveBeenCalledWith('vault_set_item_global', { id: 100, global: true });
+  });
 });

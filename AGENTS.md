@@ -38,6 +38,12 @@ All development, feature design, behavior changes, and non-trivial refactoring i
 - If a dependency or pattern could cause problems on Windows/Linux/macOS, highlight it before proceeding.
 - Maintain documentation integrity: preserve all existing comments and docstrings unless explicitly changing that functionality.
 
+### Public Documentation (GitHub Pages)
+- `docs/index.html` is the public user-facing documentation site (published via GitHub Pages from `/docs`). It covers the CLI, TUI, MCP server and REST API.
+- **Any change to user-visible functionality MUST update `docs/index.html` in the same change**: CLI commands/flags, TUI keybindings, MCP tools/parameters, REST endpoints/request or response shapes, client env vars, install/release artifacts, or security behavior. Keep `docs/reference.md` and the other `docs/*.md` consistent with it.
+- On every version bump, update the version pill (`.ver`) in `docs/index.html` to match `src-tauri/Cargo.toml`.
+- Keep the links to `https://maosuarez.com` and the GitHub Releases page intact.
+
 ### Security (Critical Mandates)
 - **Zero Plaintext Secrets**: Secret values **must never** appear in logs, error messages, or API responses in plaintext.
 - **Volatile Memory Only**: The master password and derived encryption keys exist in memory only during active unlocked sessions and are zeroized on drop / lock.

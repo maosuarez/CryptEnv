@@ -1653,7 +1653,7 @@ async fn handle_fill(
     let write_target: Option<PathBuf> = if let Some(out) = body.output_path.as_deref() {
         Some(PathBuf::from(out))
     } else if let Some(dir) = body.output_dir.as_deref() {
-        match fsguard::resolve_within(dir, &format!(".env.{}", env.name)) {
+        match fsguard::resolve_within(dir, &crate::project::environment_filename(&env.name)) {
             Ok(p) => Some(p),
             Err(fsguard::ContainmentError::BaseUnusable(msg)) => {
                 return err_json(
@@ -2605,7 +2605,7 @@ async fn handle_environment_example(
     let write_target: Option<PathBuf> = if let Some(p) = body.output_path.as_deref() {
         Some(PathBuf::from(p))
     } else if let Some(dir) = body.output_dir.as_deref() {
-        match fsguard::resolve_within(dir, &format!(".env.example.{}", env.name)) {
+        match fsguard::resolve_within(dir, &crate::project::environment_example_filename(&env.name)) {
             Ok(p) => Some(p),
             Err(fsguard::ContainmentError::BaseUnusable(msg)) => {
                 return err_json(

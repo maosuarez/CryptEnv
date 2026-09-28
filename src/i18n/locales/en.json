@@ -277,9 +277,11 @@
       "unmanaged_one": " (warning: {n} unmanaged path written, backup kept)",
       "unmanaged_other": " (warning: {n} unmanaged paths written, backup kept)",
       "keyRequired": "Key is required",
-      "pickGlobalFirst": "Pick a global secret first"
+      "pickGlobalFirst": "Pick a global secret first",
+      "environmentDuplicated": "Environment duplicated",
+      "markedGlobal": "Marked as global",
+      "unmarkedGlobal": "No longer global"
     },
-    "confirmDeleteEverywhere": "\"{name}\" is used by {n} projects ({names}). Delete it everywhere?",
     "templateModal": {
       "header": "// SELECT TEMPLATES",
       "generic": "Generic",
@@ -331,8 +333,9 @@
     "varRow": {
       "itemMissing": "item missing",
       "global": "global",
-      "unlink": "Remove from this environment",
-      "deleteEverywhere": "Delete item everywhere"
+      "deleteEverywhere": "Delete item everywhere",
+      "details": "View details",
+      "unlinkGlobal": "Remove from this environment (delete it from Global Secrets)"
     },
     "addVar": {
       "header": "ADD VARIABLE",
@@ -354,7 +357,8 @@
       "vaultNamePlaceholder": "e.g. OpenAI — production",
       "matchesHeader": "EXISTING GLOBAL SECRETS",
       "linkedExisting": "Linking existing global secret",
-      "unlinkExisting": "create a new one instead"
+      "unlinkExisting": "create a new one instead",
+      "markGlobal": "Mark as global (reusable across projects)"
     },
     "envCard": {
       "default": "default",
@@ -382,14 +386,63 @@
       "placeholderNote": "Each variable becomes an encrypted secret. Empty values are stored as {placeholder}."
     },
     "initialEnvironment": "INITIAL ENVIRONMENT",
-    "initialEnvironmentHint": "blank = default",
+    "initialEnvironmentHint": ".env = unnamed root environment",
     "envPresets": {
       "production": "Production",
       "local": "Local",
       "test": "Test",
       "staging": "Staging",
       "custom": "Custom…",
-      "default": "Default"
+      "root": ".env (root)"
+    },
+    "defaultLockedRoot": "The unnamed .env environment is always the default",
+    "defaultLockedOther": "This project has an unnamed .env environment, which is the default",
+    "duplicateEnv": "Duplicate environment",
+    "envTemplateHint": "Variables from this project's templates ({templates}) — review them; they are created as secrets when you save.",
+    "envTypeModal": {
+      "title": "Change environment type?",
+      "body": "This changes the file this environment injects into. Scripts or tools that read the old file will no longer receive these variables.",
+      "confirm": "Change type"
+    },
+    "duplicateModal": {
+      "title": "Duplicate {name}",
+      "body": "Creates a new environment with the same {vars} variable link(s). {paths} path(s) are pointed at the new file; {skipped} other path(s) are not copied.",
+      "target": "TARGET ENVIRONMENT",
+      "taken": "An environment with this name already exists",
+      "confirm": "Duplicate"
+    },
+    "deleteVarModal": {
+      "title": "Delete {key}?",
+      "body": "The vault item \"{name}\" will be permanently deleted and removed from every environment that uses it.",
+      "shared": "Shared by {n} projects: {names}"
+    },
+    "varGroups": {
+      "secret": "Secrets",
+      "credential": "Credentials",
+      "link": "Links",
+      "command": "Commands",
+      "note": "Notes",
+      "missing": "Missing items"
+    },
+    "varDetail": {
+      "fields": {
+        "name": "Name",
+        "value": "Value",
+        "url": "URL",
+        "username": "Username",
+        "password": "Password",
+        "title": "Title",
+        "description": "Description",
+        "command": "Command",
+        "shell": "Shell",
+        "content": "Content",
+        "notes": "Notes"
+      },
+      "created": "Created",
+      "categories": "Categories",
+      "owners": "Owning projects",
+      "global": "Global (reusable across projects)",
+      "globalHint": "Un-marking a secret shared by several projects gives each project its own copy."
     }
   },
   "receive": {

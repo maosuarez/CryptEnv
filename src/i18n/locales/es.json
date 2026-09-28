@@ -277,9 +277,11 @@
       "unmanaged_one": " (aviso: se escribió {n} ruta no administrada, se guardó respaldo)",
       "unmanaged_other": " (aviso: se escribieron {n} rutas no administradas, se guardó respaldo)",
       "keyRequired": "La clave es obligatoria",
-      "pickGlobalFirst": "Primero elige un secreto global"
+      "pickGlobalFirst": "Primero elige un secreto global",
+      "environmentDuplicated": "Entorno duplicado",
+      "markedGlobal": "Marcado como global",
+      "unmarkedGlobal": "Ya no es global"
     },
-    "confirmDeleteEverywhere": "\"{name}\" se usa en {n} proyectos ({names}). ¿Eliminarlo en todas partes?",
     "templateModal": {
       "header": "// SELECCIONAR PLANTILLAS",
       "generic": "Genérica",
@@ -331,8 +333,9 @@
     "varRow": {
       "itemMissing": "elemento faltante",
       "global": "global",
-      "unlink": "Quitar de este entorno",
-      "deleteEverywhere": "Eliminar elemento en todas partes"
+      "deleteEverywhere": "Eliminar elemento en todas partes",
+      "details": "Ver detalles",
+      "unlinkGlobal": "Quitar de este entorno (elimínalo desde Secretos globales)"
     },
     "addVar": {
       "header": "AGREGAR VARIABLE",
@@ -354,7 +357,8 @@
       "vaultNamePlaceholder": "p. ej. OpenAI — producción",
       "matchesHeader": "SECRETOS GLOBALES EXISTENTES",
       "linkedExisting": "Vinculando secreto global existente",
-      "unlinkExisting": "crear uno nuevo"
+      "unlinkExisting": "crear uno nuevo",
+      "markGlobal": "Marcar como global (reutilizable entre proyectos)"
     },
     "envCard": {
       "default": "predeterminado",
@@ -382,14 +386,63 @@
       "placeholderNote": "Cada variable se guarda como un secreto cifrado. Los valores vacíos se guardan como {placeholder}."
     },
     "initialEnvironment": "ENTORNO INICIAL",
-    "initialEnvironmentHint": "vacío = default",
+    "initialEnvironmentHint": ".env = entorno raíz sin nombre",
     "envPresets": {
       "production": "Producción",
       "local": "Local",
       "test": "Pruebas",
       "staging": "Staging",
       "custom": "Personalizado…",
-      "default": "Predeterminado"
+      "root": ".env (raíz)"
+    },
+    "defaultLockedRoot": "El entorno .env sin nombre siempre es el predeterminado",
+    "defaultLockedOther": "Este proyecto tiene un entorno .env sin nombre, que es el predeterminado",
+    "duplicateEnv": "Duplicar entorno",
+    "envTemplateHint": "Variables de las plantillas del proyecto ({templates}) — revísalas; se crean como secretos al guardar.",
+    "envTypeModal": {
+      "title": "¿Cambiar el tipo de entorno?",
+      "body": "Esto cambia el archivo en el que se inyecta este entorno. Los scripts o herramientas que lean el archivo anterior dejarán de recibir estas variables.",
+      "confirm": "Cambiar tipo"
+    },
+    "duplicateModal": {
+      "title": "Duplicar {name}",
+      "body": "Crea un entorno nuevo con los mismos {vars} vínculo(s) de variables. {paths} ruta(s) apuntan al archivo nuevo; {skipped} ruta(s) más no se copian.",
+      "target": "ENTORNO DESTINO",
+      "taken": "Ya existe un entorno con este nombre",
+      "confirm": "Duplicar"
+    },
+    "deleteVarModal": {
+      "title": "¿Eliminar {key}?",
+      "body": "El elemento \"{name}\" se eliminará permanentemente de la bóveda y de todos los entornos que lo usan.",
+      "shared": "Compartido por {n} proyectos: {names}"
+    },
+    "varGroups": {
+      "secret": "Secretos",
+      "credential": "Credenciales",
+      "link": "Enlaces",
+      "command": "Comandos",
+      "note": "Notas",
+      "missing": "Elementos faltantes"
+    },
+    "varDetail": {
+      "fields": {
+        "name": "Nombre",
+        "value": "Valor",
+        "url": "URL",
+        "username": "Usuario",
+        "password": "Contraseña",
+        "title": "Título",
+        "description": "Descripción",
+        "command": "Comando",
+        "shell": "Shell",
+        "content": "Contenido",
+        "notes": "Notas"
+      },
+      "created": "Creado",
+      "categories": "Categorías",
+      "owners": "Proyectos propietarios",
+      "global": "Global (reutilizable entre proyectos)",
+      "globalHint": "Al desmarcar un secreto compartido por varios proyectos, cada proyecto recibe su propia copia."
     }
   },
   "receive": {

@@ -277,9 +277,11 @@
       "unmanaged_one": " (aviso: {n} caminho não gerenciado escrito, backup mantido)",
       "unmanaged_other": " (aviso: {n} caminhos não gerenciados escritos, backup mantido)",
       "keyRequired": "A chave é obrigatória",
-      "pickGlobalFirst": "Escolha um segredo global primeiro"
+      "pickGlobalFirst": "Escolha um segredo global primeiro",
+      "environmentDuplicated": "Ambiente duplicado",
+      "markedGlobal": "Marcado como global",
+      "unmarkedGlobal": "Não é mais global"
     },
-    "confirmDeleteEverywhere": "\"{name}\" é usado por {n} projetos ({names}). Excluir em todos os lugares?",
     "templateModal": {
       "header": "// SELECIONAR MODELOS",
       "generic": "Genérico",
@@ -331,8 +333,9 @@
     "varRow": {
       "itemMissing": "item ausente",
       "global": "global",
-      "unlink": "Remover deste ambiente",
-      "deleteEverywhere": "Excluir item em todos os lugares"
+      "deleteEverywhere": "Excluir item em todos os lugares",
+      "details": "Ver detalhes",
+      "unlinkGlobal": "Remover deste ambiente (exclua-o em Segredos globais)"
     },
     "addVar": {
       "header": "ADICIONAR VARIÁVEL",
@@ -354,7 +357,8 @@
       "vaultNamePlaceholder": "ex. OpenAI — produção",
       "matchesHeader": "SEGREDOS GLOBAIS EXISTENTES",
       "linkedExisting": "Vinculando segredo global existente",
-      "unlinkExisting": "criar um novo"
+      "unlinkExisting": "criar um novo",
+      "markGlobal": "Marcar como global (reutilizável entre projetos)"
     },
     "envCard": {
       "default": "padrão",
@@ -382,14 +386,63 @@
       "placeholderNote": "Cada variável vira um segredo criptografado. Valores vazios são salvos como {placeholder}."
     },
     "initialEnvironment": "AMBIENTE INICIAL",
-    "initialEnvironmentHint": "vazio = default",
+    "initialEnvironmentHint": ".env = ambiente raiz sem nome",
     "envPresets": {
       "production": "Produção",
       "local": "Local",
       "test": "Teste",
       "staging": "Staging",
       "custom": "Personalizado…",
-      "default": "Padrão"
+      "root": ".env (raiz)"
+    },
+    "defaultLockedRoot": "O ambiente .env sem nome é sempre o padrão",
+    "defaultLockedOther": "Este projeto tem um ambiente .env sem nome, que é o padrão",
+    "duplicateEnv": "Duplicar ambiente",
+    "envTemplateHint": "Variáveis dos templates do projeto ({templates}) — revise-as; elas são criadas como segredos ao salvar.",
+    "envTypeModal": {
+      "title": "Alterar o tipo de ambiente?",
+      "body": "Isso altera o arquivo no qual este ambiente é injetado. Scripts ou ferramentas que leem o arquivo antigo deixarão de receber estas variáveis.",
+      "confirm": "Alterar tipo"
+    },
+    "duplicateModal": {
+      "title": "Duplicar {name}",
+      "body": "Cria um novo ambiente com os mesmos {vars} vínculo(s) de variáveis. {paths} caminho(s) apontam para o novo arquivo; {skipped} outro(s) caminho(s) não são copiados.",
+      "target": "AMBIENTE DE DESTINO",
+      "taken": "Já existe um ambiente com este nome",
+      "confirm": "Duplicar"
+    },
+    "deleteVarModal": {
+      "title": "Excluir {key}?",
+      "body": "O item \"{name}\" será excluído permanentemente do cofre e de todos os ambientes que o usam.",
+      "shared": "Compartilhado por {n} projetos: {names}"
+    },
+    "varGroups": {
+      "secret": "Segredos",
+      "credential": "Credenciais",
+      "link": "Links",
+      "command": "Comandos",
+      "note": "Notas",
+      "missing": "Itens ausentes"
+    },
+    "varDetail": {
+      "fields": {
+        "name": "Nome",
+        "value": "Valor",
+        "url": "URL",
+        "username": "Usuário",
+        "password": "Senha",
+        "title": "Título",
+        "description": "Descrição",
+        "command": "Comando",
+        "shell": "Shell",
+        "content": "Conteúdo",
+        "notes": "Notas"
+      },
+      "created": "Criado",
+      "categories": "Categorias",
+      "owners": "Projetos proprietários",
+      "global": "Global (reutilizável entre projetos)",
+      "globalHint": "Desmarcar um segredo compartilhado por vários projetos dá a cada projeto sua própria cópia."
     }
   },
   "receive": {

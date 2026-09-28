@@ -100,11 +100,17 @@ fn t1_malicious_table_rejected_by_both_layers() {
         "layer 2 must at least contain an over-length name if it doesn't reject it"
     );
 
-    // Empty / whitespace-only.
-    for empty in ["", "   "] {
-        assert!(project::validate_environment_name(empty).is_err(), "layer 1 should reject {empty:?}");
-        assert!(fsguard::resolve_within(base, empty).is_err(), "layer 2 should reject {empty:?}");
-    }
+    // Whitespace-only is rejected by both layers.
+    assert!(project::validate_environment_name("   ").is_err(), "layer 1 should reject whitespace-only");
+    assert!(fsguard::resolve_within(base, "   ").is_err(), "layer 2 should reject whitespace-only");
+
+    // The empty name is the unnamed root environment: valid at layer 1, but
+    // it never reaches a sink raw — it maps to `.env`, a direct child of base.
+    assert!(project::validate_environment_name("").is_ok(), "empty name is the root .env environment");
+    assert!(fsguard::resolve_within(base, "").is_err(), "layer 2 should still reject a raw empty filename");
+    let root = fsguard::resolve_within(base, &project::environment_filename("")).unwrap();
+    assert_eq!(root.parent(), Some(fs::canonicalize(base).unwrap().as_path()));
+    assert_eq!(root.file_name().and_then(|f| f.to_str()), Some(".env"));
 }
 
 // ─── T2 analog — filesystem invariant (objectives 1 and 4) ────────────────────

@@ -12,7 +12,7 @@ import {
   type ItemFieldsState,
 } from './itemFields/ItemTypeFields';
 import type {
-  EnvironmentVar, Environment, Project, ProjectTemplate, ProjectDeleteImpact, InjectResult, VaultItem, ItemType, Category,
+  EnvironmentVar, Environment, Project, ProjectTemplate, ProjectDeleteImpact, InjectResult, VaultItem, ItemType, Category, ItemOwner,
 } from '../types';
 import {
   TEMPLATE_GROUPS, TEMPLATE_PLACEHOLDER, getTemplate, isValidEnvKey, mergeTemplateVars, normalizeEnvKey,
@@ -51,43 +51,90 @@ const ENV_PRESETS = ['production', 'local', 'test', 'staging'] as const;
 
 const CUSTOM_ENV = '__custom__';
 
+/** Mirrors `is_root_environment` in `src-tauri/src/project/mod.rs`: the
+ *  unnamed environment (`""`), or the legacy `"default"` name, both inject
+ *  into the canonical extensionless `.env`. */
+function isRootEnvName(name: string): boolean {
+  return name === '' || name.toLowerCase() === 'default';
+}
+
+/** Filename an environment injects into: `.env` for the root environment,
+ *  `.env.<name>` otherwise. */
+function envFileName(name: string): string {
+  return isRootEnvName(name) ? '.env' : `.env.${name}`;
+}
+
+/** Points a source environment's inject path at a target environment's file,
+ *  when the path's filename is the source's own `.env[.<name>]` (same folder,
+ *  new filename). Any other path returns `null`: it isn't obviously tied to
+ *  the source environment, and copying it verbatim would make both
+ *  environments inject into the same file. */
+export function retargetEnvPath(path: string, fromName: string, toName: string): string | null {
+  const m = path.match(/^(.*[\\/])?([^\\/]+)$/);
+  if (!m || m[2] !== envFileName(fromName)) return null;
+  return (m[1] ?? '') + envFileName(toName);
+}
+
+/** Whether `name` is picked from the preset dropdown (as opposed to typed
+ *  into the "Custom…" field). The root `.env` counts as a preset. */
+function isPresetEnvName(name: string): boolean {
+  return isRootEnvName(name) || (ENV_PRESETS as readonly string[]).includes(name);
+}
+
 // Preset picker showing localized labels; "Custom…" reveals a free-text
 // field. Whatever is typed is lowercased so the stored name (and the
-// `.env.<name>` inject target) is always canonical lowercase ASCII.
+// `.env.<name>` inject target) is always canonical lowercase ASCII. The first
+// option is the unnamed root environment, shown as `.env` (empty name).
+//
+// `onChange` also reports whether the custom field is active, so the caller
+// can tell "root .env" apart from "custom, not typed yet" (both are `""`).
+// `confirmChange`, when given, gates every dropdown change (not per-keystroke
+// custom typing): it receives the pending value and an `apply` callback to
+// run once the user has confirmed.
 function EnvNameField({
-  value, onChange, allowDefault = false, className = '',
-}: { value: string; onChange: (v: string) => void; allowDefault?: boolean; className?: string }) {
+  value, onChange, confirmChange, className = '',
+}: {
+  value:          string;
+  onChange:       (v: string, custom: boolean) => void;
+  confirmChange?: (next: { value: string; custom: boolean }, apply: () => void) => void;
+  className?:     string;
+}) {
   const { t } = useTranslation();
-  const isPreset = (ENV_PRESETS as readonly string[]).includes(value) || (allowDefault && value === '');
-  const [custom, setCustom] = useState(!isPreset);
-  const selectValue = custom ? CUSTOM_ENV : value;
+  const [custom, setCustom] = useState(!isPresetEnvName(value));
+  const selectValue = custom ? CUSTOM_ENV : (isRootEnvName(value) ? '' : value);
   return (
     <div className={`flex items-center gap-2 ${className}`}>
       <select
         value={selectValue}
         onChange={(e) => {
           const v = e.target.value;
-          if (v === CUSTOM_ENV) { setCustom(true); if (isPreset) onChange(''); return; }
-          setCustom(false);
-          onChange(v);
+          const nextCustom = v === CUSTOM_ENV;
+          // Switching to custom starts from an empty field unless the name
+          // was already a free-typed one.
+          const nextValue = nextCustom ? (custom ? value : '') : v;
+          const apply = () => { setCustom(nextCustom); onChange(nextValue, nextCustom); };
+          if (confirmChange) confirmChange({ value: nextValue, custom: nextCustom }, apply);
+          else apply();
         }}
         aria-label={t('projects.environmentHeader')}
         className="bg-raised border border-bd2 text-tx rounded-[3px] px-2 py-[7px] text-[12px] font-ui cursor-pointer outline-none focus:border-accent-d transition-colors"
       >
-        {allowDefault && <option value="">{t('projects.envPresets.default')}</option>}
+        <option value="">{t('projects.envPresets.root')}</option>
         {ENV_PRESETS.map((n) => <option key={n} value={n}>{t(`projects.envPresets.${n}`)}</option>)}
         <option value={CUSTOM_ENV}>{t('projects.envPresets.custom')}</option>
       </select>
       {custom && (
         <input
           value={value}
-          onChange={(e) => onChange(e.target.value.toLowerCase())}
+          onChange={(e) => onChange(e.target.value.toLowerCase(), true)}
           placeholder="my-env"
           autoFocus
           className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
         />
       )}
-      <span className="text-[10px] font-mono text-tx3 truncate">.env.{value.trim() || (allowDefault ? 'default' : '…')}</span>
+      <span className="text-[10px] font-mono text-tx3 truncate">
+        {custom ? `.env.${value.trim() || '…'}` : envFileName(value)}
+      </span>
     </div>
   );
 }
@@ -102,6 +149,12 @@ function EnvNameField({
 
 function isValidEnvironmentName(name: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) && !name.endsWith('.') && !name.endsWith('-');
+}
+
+/** Editor-side validity: the root `.env` (empty name from the preset list) is
+ *  valid; an empty *custom* name is not. */
+function isValidEnvSelection(name: string, custom: boolean): boolean {
+  return custom ? isValidEnvironmentName(name) : (name === '' || isValidEnvironmentName(name));
 }
 
 function isValidProjectName(name: string): boolean {
@@ -469,6 +522,302 @@ function InjectConfirmModal({
   );
 }
 
+// ─── ConfirmEnvTypeChangeModal ──────────────────────────────────────────────────
+// Changing a saved environment's type/preset changes its inject target file,
+// so the switch only takes effect after an explicit confirmation.
+
+function ConfirmEnvTypeChangeModal({
+  from,
+  to,
+  onCancel,
+  onConfirm,
+}: {
+  from:      string;
+  to:        string;
+  onCancel:  () => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+      <div className="w-full max-w-sm bg-surface border border-accent-d rounded-[4px] p-4">
+        <div className="text-[14px] font-bold text-tx mb-2">{t('projects.envTypeModal.title')}</div>
+        <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">{t('projects.envTypeModal.body')}</div>
+        <div className="flex items-center gap-2 mb-3 text-[11px] font-mono">
+          <span className="bg-bg border border-bd rounded-[2px] px-2 py-1 text-tx3 truncate">{from}</span>
+          <span className="text-tx3">→</span>
+          <span className="bg-accent-b border border-accent-d rounded-[2px] px-2 py-1 text-accent truncate">{to}</span>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onCancel}
+            className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
+            {t('common.cancel')}
+          </button>
+          <button onClick={onConfirm}
+            className="flex-1 py-2 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold cursor-pointer font-ui">
+            {t('projects.envTypeModal.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── DuplicateEnvModal ──────────────────────────────────────────────────────────
+// Clones an environment (vars + paths) into a new environment of a type not
+// yet used in the project; a custom name is always available as a fallback.
+
+function DuplicateEnvModal({
+  source,
+  usedNames,
+  onCancel,
+  onConfirm,
+}: {
+  source:    Environment;
+  usedNames: string[];
+  onCancel:  () => void;
+  onConfirm: (name: string) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const rootUsed = usedNames.some(isRootEnvName);
+  const freePresets = ENV_PRESETS.filter((n) => !usedNames.includes(n));
+  const [target, setTarget] = useState<string>(!rootUsed ? '' : (freePresets[0] ?? CUSTOM_ENV));
+  const [customName, setCustomName] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const isCustom = target === CUSTOM_ENV;
+  const name = isCustom ? customName.trim() : target;
+  const retargeted = source.paths.filter((p) => retargetEnvPath(p, source.name, name) !== null).length;
+  const taken = isCustom && usedNames.some((n) => n.toLowerCase() === name);
+  const valid = isCustom ? isValidEnvironmentName(name) && !taken : true;
+
+  return (
+    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+      <div className="w-full max-w-sm bg-surface border border-accent-d rounded-[4px] p-4">
+        <div className="text-[14px] font-bold text-tx mb-2">
+          {t('projects.duplicateModal.title', { name: envFileName(source.name) })}
+        </div>
+        <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">
+          {t('projects.duplicateModal.body', { vars: source.vars.length, paths: retargeted, skipped: source.paths.length - retargeted })}
+        </div>
+        <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.duplicateModal.target')}</div>
+        <select
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          className="w-full bg-raised border border-bd2 text-tx rounded-[3px] px-2 py-[7px] text-[12px] font-ui cursor-pointer outline-none focus:border-accent-d mb-2"
+        >
+          {!rootUsed && <option value="">{t('projects.envPresets.root')}</option>}
+          {freePresets.map((n) => <option key={n} value={n}>{t(`projects.envPresets.${n}`)}</option>)}
+          <option value={CUSTOM_ENV}>{t('projects.envPresets.custom')}</option>
+        </select>
+        {isCustom && (
+          <input
+            value={customName}
+            onChange={(e) => setCustomName(e.target.value.toLowerCase())}
+            placeholder="my-env"
+            autoFocus
+            className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d mb-1"
+          />
+        )}
+        <div className="text-[10px] font-mono mb-3 min-h-[14px]">
+          {isCustom && customName.length > 0 && !valid
+            ? <span className="text-danger">{taken ? t('projects.duplicateModal.taken') : t('projects.envNameRule')}</span>
+            : <span className="text-tx3">{isCustom ? `.env.${name || '…'}` : envFileName(name)}</span>}
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onCancel}
+            className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
+            {t('common.cancel')}
+          </button>
+          <button
+            onClick={async () => { setBusy(true); try { await onConfirm(name); } finally { setBusy(false); } }}
+            disabled={!valid || busy}
+            className="flex-1 py-2 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
+          >
+            {busy ? t('common.saving') : t('projects.duplicateModal.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ConfirmDeleteVarModal ──────────────────────────────────────────────────────
+// Deleting a variable deletes its vault item everywhere, so it is always
+// confirmed; owners are listed when the item is shared across projects.
+
+function itemDisplayName(item: VaultItem): string {
+  return ('name' in item ? item.name : item.title) || `#${item.id}`;
+}
+
+function ConfirmDeleteVarModal({
+  varKey,
+  item,
+  onCancel,
+  onConfirm,
+}: {
+  varKey:    string;
+  item:      VaultItem;
+  onCancel:  () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const getItemOwners = useVaultStore((s) => s.getItemOwners);
+  const [owners, setOwners] = useState<ItemOwner[] | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    getItemOwners(item.id).then(setOwners).catch(() => setOwners(null));
+  }, [item.id]);
+
+  return (
+    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+      <div className="w-full max-w-sm bg-surface border border-danger rounded-[4px] p-4">
+        <div className="text-[14px] font-bold text-tx mb-2">{t('projects.deleteVarModal.title', { key: varKey })}</div>
+        <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">
+          {t('projects.deleteVarModal.body', { name: itemDisplayName(item) })}
+        </div>
+        {owners && owners.length > 1 && (
+          <div className="text-[11px] text-danger font-mono mb-3 leading-[1.6]">
+            {t('projects.deleteVarModal.shared', { n: owners.length, names: owners.map((o) => o.projectName).join(', ') })}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <button onClick={onCancel}
+            className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
+            {t('common.cancel')}
+          </button>
+          <button
+            onClick={async () => { setDeleting(true); try { await onConfirm(); } finally { setDeleting(false); } }}
+            disabled={deleting}
+            className="flex-1 py-2 bg-danger border-none rounded-[3px] text-white text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
+          >
+            {deleting ? t('projects.deleteModal.deleting') : t('common.delete')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── VarDetailModal ─────────────────────────────────────────────────────────────
+// Full view of the vault item behind an environment variable. Values come
+// from the (already unlocked) vault store and stay masked until revealed; the
+// reveal state lives in this component and is discarded on close.
+
+function VarDetailModal({
+  varKey,
+  item,
+  onClose,
+  onToggleGlobal,
+}: {
+  varKey:         string;
+  item:           VaultItem;
+  onClose:        () => void;
+  onToggleGlobal: (global: boolean) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const getItemOwners = useVaultStore((s) => s.getItemOwners);
+  const [owners, setOwners] = useState<ItemOwner[] | null>(null);
+  const [revealed, setRevealed] = useState<Set<string>>(new Set());
+  const [toggling, setToggling] = useState(false);
+
+  useEffect(() => {
+    getItemOwners(item.id).then(setOwners).catch(() => setOwners(null));
+  }, [item.id, item.isGlobal]);
+
+  type FieldLabel = 'name' | 'value' | 'url' | 'username' | 'password' | 'title' | 'description' | 'command' | 'shell' | 'content';
+  const fields: { label: FieldLabel; value?: string; sensitive?: boolean }[] = (() => {
+    switch (item.type) {
+      case 'secret':     return [{ label: 'name', value: item.name }, { label: 'value', value: item.value, sensitive: true }];
+      case 'credential': return [{ label: 'name', value: item.name }, { label: 'url', value: item.url }, { label: 'username', value: item.username }, { label: 'password', value: item.password, sensitive: true }];
+      case 'link':       return [{ label: 'title', value: item.title }, { label: 'url', value: item.url }, { label: 'description', value: item.description }];
+      case 'command':    return [{ label: 'name', value: item.name }, { label: 'command', value: item.command }, { label: 'shell', value: item.shell }, { label: 'description', value: item.description }];
+      case 'note':       return [{ label: 'title', value: item.title }, { label: 'content', value: item.content }];
+    }
+  })();
+  const toggleReveal = (label: string) =>
+    setRevealed((r) => { const n = new Set(r); if (n.has(label)) n.delete(label); else n.add(label); return n; });
+
+  return (
+    <div
+      className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4"
+      onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+    >
+      <div className="w-full max-w-md max-h-full overflow-y-auto bg-surface border border-bd rounded-[4px] p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <span className="flex-1 font-mono text-[14px] font-bold text-tx truncate">{varKey}</span>
+          <span className="text-[9px] font-mono text-tx3 bg-bg border border-bd px-1.5 py-[1px] rounded-[2px] uppercase shrink-0">
+            {t(`projects.varGroups.${item.type}`)}
+          </span>
+          <button onClick={onClose} aria-label={t('common.close')} className="text-tx3 hover:text-tx transition-colors">
+            <Icon name="close" size={13} />
+          </button>
+        </div>
+
+        {fields.filter((f) => f.value).map((f) => {
+          const masked = f.sensitive && !revealed.has(f.label);
+          return (
+            <div key={f.label} className="mb-2">
+              <div className="text-[9px] font-semibold text-tx3 font-mono tracking-[0.1em] uppercase mb-0.5">{t(`projects.varDetail.fields.${f.label}`)}</div>
+              <div className="flex items-start gap-2">
+                <div className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] whitespace-pre-wrap break-all">
+                  {masked ? '••••••••' : f.value}
+                </div>
+                {f.sensitive && (
+                  <button onClick={() => toggleReveal(f.label)} className="text-tx3 hover:text-tx transition-colors shrink-0 mt-1">
+                    <Icon name={masked ? 'eye' : 'eyeOff'} size={12} />
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {item.notes && (
+          <div className="mb-2">
+            <div className="text-[9px] font-semibold text-tx3 font-mono tracking-[0.1em] uppercase mb-0.5">{t('projects.varDetail.fields.notes')}</div>
+            <div className="bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] whitespace-pre-wrap break-all">{item.notes}</div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2 mb-3 text-[10px] font-mono">
+          <div>
+            <div className="text-tx3 tracking-[0.1em] uppercase mb-0.5">{t('projects.varDetail.created')}</div>
+            <div className="text-tx2">{item.created}</div>
+          </div>
+          <div>
+            <div className="text-tx3 tracking-[0.1em] uppercase mb-0.5">{t('projects.varDetail.categories')}</div>
+            <div className="text-tx2 truncate">{item.categories.length > 0 ? item.categories.join(', ') : '—'}</div>
+          </div>
+        </div>
+
+        <div className="mb-3">
+          <div className="text-[9px] font-semibold text-tx3 font-mono tracking-[0.1em] uppercase mb-0.5">{t('projects.varDetail.owners')}</div>
+          <div className="text-[11px] font-mono text-tx2">
+            {owners === null ? '…' : owners.length === 0 ? '—' : owners.map((o) => o.projectName).join(', ')}
+          </div>
+        </div>
+
+        <label className="flex items-center gap-2 border-t border-bd pt-3 text-[11px] font-ui text-tx cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={!!item.isGlobal}
+            disabled={toggling}
+            onChange={async (e) => {
+              setToggling(true);
+              try { await onToggleGlobal(e.target.checked); } finally { setToggling(false); }
+            }}
+            className="accent-[var(--color-accent)]"
+          />
+          <span className="flex-1">{t('projects.varDetail.global')}</span>
+        </label>
+        <div className="text-[10px] font-mono text-tx3 mt-1">{t('projects.varDetail.globalHint')}</div>
+      </div>
+    </div>
+  );
+}
+
 // ─── VarRow (project detail: real vault item, type-aware) ─────────────────────
 
 function varSummary(item: VaultItem, reveal: boolean): string {
@@ -483,22 +832,28 @@ function varSummary(item: VaultItem, reveal: boolean): string {
 function VarRow({
   v,
   item,
+  onOpen,
+  onDelete,
   onUnlink,
-  onDeleteEverywhere,
+  onRemoveMissing,
 }: {
-  v:                  EnvironmentVar;
-  item:                VaultItem | undefined;
-  onUnlink:            () => void;
-  onDeleteEverywhere:  () => void;
+  v:               EnvironmentVar;
+  item:            VaultItem | undefined;
+  onOpen:          () => void;
+  onDelete:        () => void;
+  onUnlink:        () => void;
+  onRemoveMissing: () => void;
 }) {
   const { t } = useTranslation();
   const [reveal, setReveal] = useState(false);
 
   if (!item) {
+    // Dangling link to an item that no longer exists — nothing to delete in
+    // the vault, so the trash only drops the reference.
     return (
       <div className="py-2 border-b border-bd flex items-center gap-2">
         <span className="flex-1 text-[11px] font-mono text-danger truncate">{v.key} — {t('projects.varRow.itemMissing')}</span>
-        <button onClick={onUnlink} className="text-tx3 hover:text-danger transition-colors shrink-0">
+        <button onClick={onRemoveMissing} className="text-tx3 hover:text-danger transition-colors shrink-0">
           <Icon name="trash" size={13} />
         </button>
       </div>
@@ -508,10 +863,10 @@ function VarRow({
   return (
     <div className="py-2 border-b border-bd group">
       <div className="flex items-center gap-2 mb-1">
-        <span className="flex-1 font-mono text-[12px] text-tx truncate">{v.key}</span>
-        <span className="text-[9px] font-mono text-tx3 bg-bg border border-bd px-1.5 py-[1px] rounded-[2px] uppercase shrink-0">
-          {item.type}
-        </span>
+        <button onClick={onOpen} title={t('projects.varRow.details')}
+          className="flex-1 min-w-0 text-left font-mono text-[12px] text-tx truncate hover:text-accent transition-colors">
+          {v.key}
+        </button>
         {item.isGlobal && (
           <span className="text-[9px] font-mono text-accent bg-accent-b border border-accent-d px-1.5 py-[1px] rounded-[2px] shrink-0">
             {t('projects.varRow.global')}
@@ -525,16 +880,65 @@ function VarRow({
             <Icon name={reveal ? 'eyeOff' : 'eye'} size={12} />
           </button>
         )}
-        <button onClick={onUnlink} title={t('projects.varRow.unlink')}
-          className="text-tx3 hover:text-tx transition-colors shrink-0 opacity-0 group-hover:opacity-100">
-          <Icon name="close" size={12} />
-        </button>
-        <button onClick={onDeleteEverywhere} title={t('projects.varRow.deleteEverywhere')}
+        {/* Global items are shared, so trash only unlinks them from this
+            environment; they're deleted from the Global Secrets view. */}
+        <button onClick={item.isGlobal ? onUnlink : onDelete}
+          title={t(item.isGlobal ? 'projects.varRow.unlinkGlobal' : 'projects.varRow.deleteEverywhere')}
           className="text-tx3 hover:text-danger transition-colors shrink-0 opacity-0 group-hover:opacity-100">
           <Icon name="trash" size={12} />
         </button>
       </div>
     </div>
+  );
+}
+
+// ─── VarGroups (environment variables, accordion per item type) ───────────────
+
+const VAR_GROUP_ORDER = ['secret', 'credential', 'link', 'command', 'note', 'missing'] as const;
+type VarGroup = typeof VAR_GROUP_ORDER[number];
+
+function VarGroups({
+  vars,
+  itemsById,
+  collapsed,
+  onToggle,
+  renderRow,
+}: {
+  vars:      EnvironmentVar[];
+  itemsById: Map<number, VaultItem>;
+  collapsed: Set<VarGroup>;
+  onToggle:  (g: VarGroup) => void;
+  renderRow: (v: EnvironmentVar, idx: number) => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const groups = new Map<VarGroup, { v: EnvironmentVar; idx: number }[]>();
+  vars.forEach((v, idx) => {
+    const g: VarGroup = itemsById.get(v.itemId)?.type ?? 'missing';
+    const list = groups.get(g);
+    if (list) list.push({ v, idx }); else groups.set(g, [{ v, idx }]);
+  });
+
+  return (
+    <>
+      {VAR_GROUP_ORDER.filter((g) => groups.has(g)).map((g) => {
+        const rows = groups.get(g) ?? [];
+        const open = !collapsed.has(g);
+        return (
+          <div key={g} className="mb-2">
+            <button
+              onClick={() => onToggle(g)}
+              aria-expanded={open}
+              className="w-full flex items-center gap-1.5 py-1.5 text-left text-[10px] font-semibold font-mono tracking-[0.08em] uppercase text-tx2 hover:text-tx transition-colors"
+            >
+              <span className={`inline-block w-2.5 text-center transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
+              <span className="flex-1">{t(`projects.varGroups.${g}`)}</span>
+              <span className="text-tx3">({rows.length})</span>
+            </button>
+            {open && <div className="pl-3">{rows.map(({ v, idx }) => renderRow(v, idx))}</div>}
+          </div>
+        );
+      })}
+    </>
   );
 }
 
@@ -554,6 +958,7 @@ export function AddVarPanel({
   const { t } = useTranslation();
   const showToast        = useVaultStore((s) => s.showToast);
   const createProjectItem = useProjectStore((s) => s.createProjectItem);
+  const toggleGlobal     = useVaultStore((s) => s.toggleGlobal);
 
   const [mode, setMode]   = useState<'choose' | 'new' | 'import'>('choose');
   const [type, setType]   = useState<ItemType>('secret');
@@ -567,6 +972,7 @@ export function AddVarPanel({
   // matching global secret links it instead of creating a new item.
   const [nameTouched, setNameTouched] = useState(false);
   const [linkedId, setLinkedId] = useState<number | null>(null);
+  const [isGlobal, setIsGlobal] = useState(false);
 
   const nameKey   = itemNameKey(type);
   const vaultName = fields[nameKey];
@@ -609,6 +1015,10 @@ export function AddVarPanel({
     setSaving(true);
     try {
       const item = await createProjectItem(project.id, { ...fields, type, categories: [], isGlobal: false } as Omit<VaultItem, 'id' | 'created'>);
+      // `vault_create_project_item` always creates a project-local item (a
+      // backend invariant), so "global" is a separate, explicit flip — the
+      // item has a single owner here, so this never forks.
+      if (isGlobal) await toggleGlobal(item.id, true);
       // The var row resolves its item from the vault store — refresh before
       // linking, or the new row renders as "item missing" until a reload.
       await refreshVaultItems();
@@ -747,6 +1157,15 @@ export function AddVarPanel({
             clearError={clearError}
             hideName
           />
+          <label className="flex items-center gap-2 mb-2 text-[11px] font-ui text-tx2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={isGlobal}
+              onChange={(e) => setIsGlobal(e.target.checked)}
+              className="accent-[var(--color-accent)]"
+            />
+            {t('projects.addVar.markGlobal')}
+          </label>
         </>
       )}
       <div className="flex gap-2 mt-1">
@@ -787,7 +1206,7 @@ async function refreshVaultItems() {
 
 function ProjectCard({ project, cats, onOpen }: { project: Project; cats: Category[]; onOpen: () => void }) {
   const { t } = useTranslation();
-  const envNames = project.environments.map((e) => e.name);
+  const envNames = project.environments.map((e) => envFileName(e.name));
   const tagColor = (name: string) => cats.find((c) => c.name === name)?.color;
   return (
     <button
@@ -829,11 +1248,13 @@ function ProjectCard({ project, cats, onOpen }: { project: Project; cats: Catego
 
 function EnvironmentCard({
   env,
+  isDefault,
   onOpen,
   onInject,
 }: {
-  env:      Environment;
-  onOpen:   () => void;
+  env:       Environment;
+  isDefault: boolean;
+  onOpen:    () => void;
   onInject: (id: number) => Promise<InjectResult>;
 }) {
   const { t } = useTranslation();
@@ -868,8 +1289,8 @@ function EnvironmentCard({
       className="w-full text-left px-3.5 py-3 border-b border-bd hover:bg-raised transition-colors"
     >
       <div className="flex items-center gap-2 mb-1.5">
-        <span className="flex-1 text-[13px] font-semibold text-tx font-ui truncate">{env.name}</span>
-        {env.isDefault && (
+        <span className="flex-1 text-[13px] font-semibold text-tx font-ui font-mono truncate">{envFileName(env.name)}</span>
+        {isDefault && (
           <span className="text-[9px] font-mono text-accent bg-accent-b border border-accent-d px-1.5 py-[1px] rounded-[2px] uppercase shrink-0">
             {t('projects.envCard.default')}
           </span>
@@ -927,10 +1348,10 @@ export function ProjectManager() {
   const showToast      = useVaultStore((s) => s.showToast);
   const items          = useVaultStore((s) => s.items);
   const cats           = useVaultStore((s) => s.cats);
-  const getItemOwners  = useVaultStore((s) => s.getItemOwners);
+  const toggleGlobal   = useVaultStore((s) => s.toggleGlobal);
   const saveCats       = useVaultStore((s) => s.saveCats);
 
-  const { projects, loading, load, saveProject, createFromTemplates, removeProject, saveEnvironment, removeEnvironment, inject, previewInject } =
+  const { projects, loading, load, saveProject, createFromTemplates, removeProject, saveEnvironment, removeEnvironment, inject, previewInject, createProjectItem } =
     useProjectStore();
 
   // Pending confirm-then-inject flow (see `runInject` below): `injectConfirm`
@@ -988,6 +1409,7 @@ export function ProjectManager() {
   const [projTemplate,    setProjTemplate]    = useState<ProjectTemplate>('generic');
   const [projTemplateIds, setProjTemplateIds] = useState<string[]>([]);
   const [projInitialEnv,  setProjInitialEnv]  = useState('');
+  const [projInitialCustom, setProjInitialCustom] = useState(false);
   const [templateVars,    setTemplateVars]    = useState<ReviewVar[]>([]);
   const [projCategories,  setProjCategories]  = useState<string[]>([]);
   const [isCreatingProj,  setIsCreatingProj]  = useState(false);
@@ -997,6 +1419,7 @@ export function ProjectManager() {
 
   // Environment form state
   const [envName,       setEnvName]       = useState('');
+  const [envCustom,     setEnvCustom]     = useState(false);
   const [envIsDefault,  setEnvIsDefault]  = useState(false);
   const [envPaths,      setEnvPaths]      = useState<string[]>([]);
   const [newPath,       setNewPath]       = useState('');
@@ -1004,6 +1427,15 @@ export function ProjectManager() {
   const [isCreatingEnv, setIsCreatingEnv] = useState(false);
   const [confirmDelEnv, setConfirmDelEnv] = useState(false);
   const [addingVar,     setAddingVar]     = useState(false);
+  // Template variables offered to a new environment of a templated project
+  // (created as project items on save).
+  const [envTemplateVars, setEnvTemplateVars] = useState<ReviewVar[]>([]);
+  // Accordion state survives switching environments for the view session.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<VarGroup>>(new Set());
+  const [pendingTypeChange, setPendingTypeChange] = useState<{ to: string; apply: () => void } | null>(null);
+  const [duplicating,   setDuplicating]   = useState(false);
+  const [deleteVarTarget, setDeleteVarTarget] = useState<EnvironmentVar | null>(null);
+  const [detailVar,     setDetailVar]     = useState<EnvironmentVar | null>(null);
 
   const [saving,    setSaving]    = useState(false);
   const [injecting, setInjecting] = useState(false);
@@ -1082,7 +1514,10 @@ export function ProjectManager() {
 
   const openEnvironment = (env: Environment) => {
     setSelectedEnv(env);
-    setEnvName(env.name);
+    // Legacy "default" is the root `.env`; it's shown (and saved) unnamed.
+    setEnvName(isRootEnvName(env.name) ? '' : env.name);
+    setEnvCustom(!isPresetEnvName(env.name));
+    setEnvTemplateVars([]);
     setEnvIsDefault(env.isDefault);
     setEnvPaths(env.paths);
     setNewPath('');
@@ -1110,6 +1545,7 @@ export function ProjectManager() {
     setProjTemplateIds([]);
     setTemplateVars([]);
     setProjInitialEnv('');
+    setProjInitialCustom(false);
     setProjCategories([]);
     setIsCreatingProj(true);
     setConfirmDelProj(false);
@@ -1127,8 +1563,8 @@ export function ProjectManager() {
     setMode('project');
   };
 
-  // Blank is fine (backend defaults to "default"); otherwise mirror the env-name rule.
-  const initialEnvValid = projInitialEnv.trim() === '' || isValidEnvironmentName(projInitialEnv.trim());
+  // Root `.env` (blank) is fine; a custom name must follow the env-name rule.
+  const initialEnvValid = isValidEnvSelection(projInitialEnv.trim(), projInitialCustom);
 
   const templateVarsInvalid = useMemo(() => invalidReviewKeys(templateVars).size > 0, [templateVars]);
 
@@ -1263,11 +1699,18 @@ export function ProjectManager() {
   const handleNewEnvironment = () => {
     if (!selectedProject) return;
     setSelectedEnv(null);
-    setEnvName('');
+    // Suggest the root `.env` first, then the first unused preset.
+    const used = selectedProject.environments.map((e) => e.name);
+    const firstFree = used.some(isRootEnvName) ? (ENV_PRESETS.find((n) => !used.includes(n)) ?? '') : '';
+    setEnvName(firstFree);
+    setEnvCustom(false);
     setEnvIsDefault(selectedProject.environments.length === 0);
     setEnvPaths([]);
     setNewPath('');
     setEnvVars([]);
+    // Keep the project's stack templates: offer their variables for review.
+    const templateIds = selectedProject.template.split(',').map((id) => id.trim()).filter(Boolean);
+    setEnvTemplateVars(toReviewVars(mergeTemplateVars(templateIds)));
     setIsCreatingEnv(true);
     setConfirmDelEnv(false);
     setAddingVar(false);
@@ -1320,28 +1763,88 @@ export function ProjectManager() {
     }
   };
 
+  // Drops a var from this environment only (dangling reference, or unlinking
+  // a global item); the vault item itself is untouched. Takes effect on save.
   const handleUnlinkVar = (idx: number) => {
     setEnvVars((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  const handleDeleteVarEverywhere = async (v: EnvironmentVar) => {
-    const item = itemsById.get(v.itemId);
-    if (item?.isGlobal) {
-      try {
-        const owners = await getItemOwners(item.id);
-        if (owners.length > 1) {
-          const names = owners.map((o) => o.projectName).join(', ');
-          if (!window.confirm(t('projects.confirmDeleteEverywhere', { name: ('name' in item ? item.name : (item as any).title) ?? v.key, n: owners.length, names }))) {
-            return;
-          }
-        }
-      } catch { /* fall through to delete */ }
-    }
+  const handleDeleteVar = async (v: EnvironmentVar) => {
     try {
       await invoke('vault_delete_item', { id: v.itemId });
       await refreshVaultItems();
       setEnvVars((prev) => prev.filter((x) => x.itemId !== v.itemId));
+      setDeleteVarTarget(null);
       showToast(t('projects.toast.itemDeleted'));
+    } catch (e) {
+      reportError(e);
+    }
+  };
+
+  const handleToggleVarGlobal = async (v: EnvironmentVar, global: boolean) => {
+    try {
+      const result = await toggleGlobal(v.itemId, global);
+      if (result.forked.length > 0) {
+        // Un-globaling a shared item forks it and repoints each project's
+        // saved vars at its own copy — follow that repoint in the editor.
+        await load();
+        const env = useProjectStore.getState().projects
+          .find((p) => p.id === selectedProject?.id)?.environments
+          .find((e) => e.id === selectedEnv?.id);
+        const fork = env?.vars.find((x) => x.key === v.key && x.itemId !== v.itemId);
+        if (fork) {
+          setEnvVars((prev) => prev.map((x) => (x.itemId === v.itemId ? { ...x, itemId: fork.itemId } : x)));
+          setDetailVar({ ...v, itemId: fork.itemId });
+        } else {
+          setDetailVar(null);
+        }
+      }
+      showToast(t(global ? 'projects.toast.markedGlobal' : 'projects.toast.unmarkedGlobal'));
+    } catch (e) {
+      reportError(e);
+    }
+  };
+
+  // Default rules: an unnamed root `.env` is always the project default;
+  // only when none exists can another environment be marked default.
+  const editingRoot = !envCustom && envName === '';
+  const otherRootExists = !!selectedProject?.environments.some((e) => e.id !== selectedEnv?.id && isRootEnvName(e.name));
+  const effectiveIsDefault = editingRoot ? true : otherRootExists ? false : envIsDefault;
+  const defaultLocked = editingRoot || otherRootExists;
+
+  const envTemplateVarsInvalid = useMemo(() => invalidReviewKeys(envTemplateVars).size > 0, [envTemplateVars]);
+
+  const handleEnvNameChange = (v: string, custom: boolean) => {
+    setEnvName(v);
+    setEnvCustom(custom);
+  };
+
+  // Only a saved environment's type change needs confirming: its inject
+  // target on disk is what changes.
+  const confirmEnvTypeChange = selectedEnv
+    ? (next: { value: string; custom: boolean }, apply: () => void) => {
+        setPendingTypeChange({ to: next.custom ? `.env.${next.value || '…'}` : envFileName(next.value), apply });
+      }
+    : undefined;
+
+  const handleDuplicateEnvironment = async (name: string) => {
+    if (!selectedProject || !selectedEnv) return;
+    const hasOtherDefault = selectedProject.environments.some((e) => e.isDefault || isRootEnvName(e.name));
+    try {
+      const id = await saveEnvironment({
+        projectId: selectedProject.id,
+        name,
+        isDefault: name === '' || !hasOtherDefault,
+        paths:     selectedEnv.paths
+          .map((p) => retargetEnvPath(p, selectedEnv.name, name))
+          .filter((p): p is string => p !== null),
+        vars:      selectedEnv.vars.map((v) => ({ ...v, id: 0 })),
+      });
+      setDuplicating(false);
+      const fresh = useProjectStore.getState().projects
+        .find((p) => p.id === selectedProject.id)?.environments.find((e) => e.id === id);
+      if (fresh) openEnvironment(fresh);
+      showToast(t('projects.toast.environmentDuplicated'));
     } catch (e) {
       reportError(e);
     }
@@ -1349,17 +1852,35 @@ export function ProjectManager() {
 
   const handleSaveEnvironment = async () => {
     if (!selectedProject) return;
-    if (!isValidEnvironmentName(envName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.envNameRule') }), 'error'); return; }
+    if (!isValidEnvSelection(envName.trim(), envCustom)) { showToast(t('projects.invalidName', { rule: t('projects.envNameRule') }), 'error'); return; }
+    if (envTemplateVarsInvalid) return;
+    // Pre-check the name so template items are never created for a save
+    // that the backend would then reject as a collision.
+    const lower = envName.trim().toLowerCase();
+    const collides = selectedProject.environments.some((e) => e.id !== selectedEnv?.id
+      && (e.name.toLowerCase() === lower || (lower === '' && isRootEnvName(e.name)) || (isRootEnvName(lower) && isRootEnvName(e.name))));
+    if (collides) { showToast(t('projects.duplicateModal.taken'), 'error'); return; }
     setSaving(true);
     try {
+      // Template variables become project-local secrets, like project
+      // scaffolding does; an empty value is stored as the placeholder.
+      const templateLinks: EnvironmentVar[] = [];
+      for (const tv of envTemplateVars) {
+        if (envVars.some((v) => v.key === tv.key)) continue;
+        const item = await createProjectItem(selectedProject.id, {
+          type: 'secret', name: tv.key, value: tv.value || TEMPLATE_PLACEHOLDER, categories: [], isGlobal: false,
+        } as Omit<VaultItem, 'id' | 'created'>);
+        templateLinks.push({ id: 0, key: tv.key, itemId: item.id });
+      }
       await saveEnvironment({
         id:        selectedEnv?.id,
         projectId: selectedProject.id,
         name:      envName.trim().toLowerCase(),
-        isDefault: envIsDefault,
+        isDefault: effectiveIsDefault,
         paths:     envPaths,
-        vars:      envVars,
+        vars:      [...envVars, ...templateLinks],
       });
+      setEnvTemplateVars([]);
       await refreshVaultItems();
       backToProject();
       showToast(t('projects.toast.environmentSaved'));
@@ -1602,9 +2123,19 @@ export function ProjectManager() {
               </div>
             )}
 
-            {selectedProject.environments.map((env) => (
-              <EnvironmentCard key={env.id} env={env} onOpen={() => openEnvironment(env)} onInject={runInject} />
-            ))}
+            {(() => {
+              // An unnamed root `.env` is the default whenever it exists.
+              const hasRoot = selectedProject.environments.some((e) => isRootEnvName(e.name));
+              return selectedProject.environments.map((env) => (
+                <EnvironmentCard
+                  key={env.id}
+                  env={env}
+                  isDefault={hasRoot ? isRootEnvName(env.name) : env.isDefault}
+                  onOpen={() => openEnvironment(env)}
+                  onInject={runInject}
+                />
+              ));
+            })()}
           </div>
 
           <div className="px-4 py-3 border-t border-bd bg-bg shrink-0">
@@ -1645,7 +2176,7 @@ export function ProjectManager() {
             </button>
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-[118px]">
               <span className="text-[13px] font-semibold text-tx truncate">
-                {isCreatingProj ? t('projects.newProjectTitle') : (isCreatingEnv ? t('projects.newEnvironmentTitle') : (selectedEnv?.name ?? ''))}
+                {isCreatingProj ? t('projects.newProjectTitle') : (isCreatingEnv ? t('projects.newEnvironmentTitle') : (selectedEnv ? envFileName(selectedEnv.name) : ''))}
               </span>
             </div>
           </div>
@@ -1701,7 +2232,7 @@ export function ProjectManager() {
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
                     {t('projects.initialEnvironment')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.initialEnvironmentHint')}</span>
                   </div>
-                  <EnvNameField value={projInitialEnv} onChange={setProjInitialEnv} allowDefault />
+                  <EnvNameField value={projInitialEnv} onChange={(v, custom) => { setProjInitialEnv(v); setProjInitialCustom(custom); }} />
                   {!initialEnvValid && (
                     <div className="text-[10px] font-mono text-danger mt-1">{t('projects.envNameRule')}</div>
                   )}
@@ -1718,18 +2249,37 @@ export function ProjectManager() {
                 </div>
 
                 <div className="mb-3 flex items-center gap-2">
-                  <EnvNameField key={selectedEnv?.id ?? 'new'} value={envName} onChange={setEnvName} className="flex-1 min-w-0" />
-                  <label className="flex items-center gap-1.5 text-[10px] font-mono text-tx3 shrink-0 cursor-pointer select-none">
+                  <EnvNameField
+                    key={selectedEnv?.id ?? 'new'}
+                    value={envName}
+                    onChange={handleEnvNameChange}
+                    confirmChange={confirmEnvTypeChange}
+                    className="flex-1 min-w-0"
+                  />
+                  <label
+                    title={defaultLocked ? t(editingRoot ? 'projects.defaultLockedRoot' : 'projects.defaultLockedOther') : undefined}
+                    className={`flex items-center gap-1.5 text-[10px] font-mono text-tx3 shrink-0 select-none ${defaultLocked ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
                     <input
                       type="checkbox"
-                      checked={envIsDefault}
+                      checked={effectiveIsDefault}
+                      disabled={defaultLocked}
                       onChange={(e) => setEnvIsDefault(e.target.checked)}
                       className="accent-[var(--color-accent)]"
                     />
                     {t('projects.defaultCheckbox')}
                   </label>
+                  {selectedEnv && (
+                    <button
+                      onClick={() => setDuplicating(true)}
+                      title={t('projects.duplicateEnv')}
+                      className="shrink-0 px-2 py-[5px] rounded-[3px] text-[10px] font-bold font-ui text-tx2 border border-bd2 hover:text-tx transition-colors"
+                    >
+                      <Icon name="copy" size={12} />
+                    </button>
+                  )}
                 </div>
-                {envName.length > 0 && !isValidEnvironmentName(envName.trim()) && (
+                {envCustom && envName.length > 0 && !isValidEnvironmentName(envName.trim()) && (
                   <div className="text-[10px] font-mono text-danger -mt-2 mb-3">{t('projects.envNameRule')}</div>
                 )}
 
@@ -1830,19 +2380,40 @@ export function ProjectManager() {
                     />
                   )}
 
-                  {envVars.length === 0 && !addingVar && (
+                  {isCreatingEnv && envTemplateVars.length > 0 && (
+                    <>
+                      <div className="text-[10px] font-mono text-tx3 mb-1">
+                        {t('projects.envTemplateHint', { templates: templateLabels(selectedProject?.template ?? '').join(' · ') })}
+                      </div>
+                      <TemplateVarsReview vars={envTemplateVars} onChange={setEnvTemplateVars} />
+                    </>
+                  )}
+
+                  {envVars.length === 0 && !addingVar && envTemplateVars.length === 0 && (
                     <div className="text-[11px] text-tx3 font-mono py-2">{t('projects.noVariables')}</div>
                   )}
 
-                  {envVars.map((v, idx) => (
-                    <VarRow
-                      key={v.id}
-                      v={v}
-                      item={itemsById.get(v.itemId)}
-                      onUnlink={() => handleUnlinkVar(idx)}
-                      onDeleteEverywhere={() => handleDeleteVarEverywhere(v)}
-                    />
-                  ))}
+                  <VarGroups
+                    vars={envVars}
+                    itemsById={itemsById}
+                    collapsed={collapsedGroups}
+                    onToggle={(g) => setCollapsedGroups((cur) => {
+                      const next = new Set(cur);
+                      if (next.has(g)) next.delete(g); else next.add(g);
+                      return next;
+                    })}
+                    renderRow={(v, idx) => (
+                      <VarRow
+                        key={v.id}
+                        v={v}
+                        item={itemsById.get(v.itemId)}
+                        onOpen={() => setDetailVar(v)}
+                        onDelete={() => setDeleteVarTarget(v)}
+                        onUnlink={() => handleUnlinkVar(idx)}
+                        onRemoveMissing={() => handleUnlinkVar(idx)}
+                      />
+                    )}
+                  />
                 </div>
               </>
             )}
@@ -1888,7 +2459,7 @@ export function ProjectManager() {
               )}
               <button
                 onClick={isCreatingProj ? handleCreateProject : handleSaveEnvironment}
-                disabled={saving || (isCreatingProj ? (!isValidProjectName(projName.trim()) || templateVarsInvalid || !initialEnvValid) : !isValidEnvironmentName(envName.trim()))}
+                disabled={saving || (isCreatingProj ? (!isValidProjectName(projName.trim()) || templateVarsInvalid || !initialEnvValid) : (!isValidEnvSelection(envName.trim(), envCustom) || envTemplateVarsInvalid))}
                 className="px-4 py-[7px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity disabled:opacity-40 flex items-center gap-1.5"
               >
                 {saving
@@ -1916,6 +2487,42 @@ export function ProjectManager() {
           project={selectedProject}
           onCancel={() => setConfirmDelProj(false)}
           onConfirm={handleDeleteProject}
+        />
+      )}
+
+      {pendingTypeChange && selectedEnv && (
+        <ConfirmEnvTypeChangeModal
+          from={envCustom ? `.env.${envName || '…'}` : envFileName(envName)}
+          to={pendingTypeChange.to}
+          onCancel={() => setPendingTypeChange(null)}
+          onConfirm={() => { pendingTypeChange.apply(); setPendingTypeChange(null); }}
+        />
+      )}
+
+      {duplicating && selectedProject && selectedEnv && (
+        <DuplicateEnvModal
+          source={selectedEnv}
+          usedNames={selectedProject.environments.map((e) => e.name)}
+          onCancel={() => setDuplicating(false)}
+          onConfirm={handleDuplicateEnvironment}
+        />
+      )}
+
+      {deleteVarTarget && itemsById.get(deleteVarTarget.itemId) && (
+        <ConfirmDeleteVarModal
+          varKey={deleteVarTarget.key}
+          item={itemsById.get(deleteVarTarget.itemId)!}
+          onCancel={() => setDeleteVarTarget(null)}
+          onConfirm={() => handleDeleteVar(deleteVarTarget)}
+        />
+      )}
+
+      {detailVar && itemsById.get(detailVar.itemId) && (
+        <VarDetailModal
+          varKey={detailVar.key}
+          item={itemsById.get(detailVar.itemId)!}
+          onClose={() => setDetailVar(null)}
+          onToggleGlobal={(global) => handleToggleVarGlobal(detailVar, global)}
         />
       )}
 

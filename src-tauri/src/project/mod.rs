@@ -233,14 +233,46 @@ fn reject_filesystem_hostile(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True for the unnamed root environment: the empty name `""`, or the legacy
+/// `"default"` name that older projects were created with. Both map to the
+/// canonical, extensionless `.env` file.
+pub fn is_root_environment(name: &str) -> bool {
+    name.is_empty() || name.eq_ignore_ascii_case("default")
+}
+
+/// Filename an environment injects into when only a directory is given:
+/// `.env` for the root environment (see `is_root_environment`), otherwise
+/// `.env.<name>` (lowercased).
+pub fn environment_filename(name: &str) -> String {
+    if is_root_environment(name) {
+        ".env".to_string()
+    } else {
+        format!(".env.{}", name.to_ascii_lowercase())
+    }
+}
+
+/// Placeholder-template counterpart of `environment_filename`:
+/// `.env.example` for the root environment, `.env.example.<name>` otherwise.
+pub fn environment_example_filename(name: &str) -> String {
+    if is_root_environment(name) {
+        ".env.example".to_string()
+    } else {
+        format!(".env.example.{}", name.to_ascii_lowercase())
+    }
+}
+
 /// Strict allowlist: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, plus an explicit
 /// rejection of a trailing `.` or `-`. Environment names are machine
 /// identifiers, land in a filename (`.env.<name>`), and are the field with
 /// the proven traversal exploit (issue #7) — the tight rule costs nothing
-/// real for names like `production`, `local`, `staging-2`.
+/// real for names like `production`, `local`, `staging-2`. The empty name is
+/// the one exception: it denotes the unnamed root environment (`.env`).
 pub fn validate_environment_name(name: &str) -> Result<(), String> {
     const RULE: &str =
-        "must be 1-64 chars, start with a letter or digit, and contain only letters, digits, '.', '_' or '-'";
+        "must be empty (root .env) or 1-64 chars, start with a letter or digit, and contain only letters, digits, '.', '_' or '-'";
+    if name.is_empty() {
+        return Ok(());
+    }
     if reject_filesystem_hostile(name).is_err() {
         return Err(format!("name: {RULE}"));
     }
@@ -338,9 +370,11 @@ async fn ensure_no_case_collision(
 ) -> Result<(), String> {
     let siblings = db.list_environments(project_id).await?;
     let lower = name.to_lowercase();
-    let collides = siblings
-        .iter()
-        .any(|env| env.id != exclude_id && env.name.to_lowercase() == lower);
+    // `""` and legacy `"default"` both resolve to `.env`, so they collide too.
+    let root = is_root_environment(name);
+    let collides = siblings.iter().any(|env| {
+        env.id != exclude_id && (env.name.to_lowercase() == lower || (root && is_root_environment(&env.name)))
+    });
     if collides {
         return Err(crate::db::ENVIRONMENT_NAME_CONFLICT.to_string());
     }
@@ -456,8 +490,13 @@ pub async fn resolve_environment(
             None => return Err(format!("project/environment not found: {p} / {e}")),
         };
 
-        let matching_envs: Vec<Environment> =
-            proj.environments.into_iter().filter(|env| env.name.to_lowercase() == e_lower).collect();
+        // The root environment answers to both `""` and legacy `"default"`.
+        let e_root = is_root_environment(e);
+        let matching_envs: Vec<Environment> = proj
+            .environments
+            .into_iter()
+            .filter(|env| env.name.to_lowercase() == e_lower || (e_root && is_root_environment(&env.name)))
+            .collect();
 
         if matching_envs.len() > 1 {
             let options: Vec<String> =
@@ -530,7 +569,7 @@ async fn resolve_and_inspect(
             // `api::mod`; issue #8 moved the resolution in here, so the
             // containment check has to live here too rather than at the
             // former call site.
-            let target = crate::fsguard::resolve_within(dir.as_str(), &format!(".env.{}", env.name.to_ascii_lowercase()))
+            let target = crate::fsguard::resolve_within(dir.as_str(), &environment_filename(&env.name))
                 .map_err(|e| format!("output_dir: {e}"))?;
             resolved.push((target.to_string_lossy().into_owned(), PathOrigin::CallerSupplied));
         }
@@ -566,7 +605,8 @@ pub async fn inject_environment_preview(db: &VaultDb, environment_id: i64) -> Re
 /// configured on this environment, plus `output_path` (if given — added to
 /// the configured set, never replacing it) or, when the environment has no
 /// configured paths and no `output_path` was given, a single default file
-/// named `.env.<environment-name>` inside `output_dir`. Merges with existing
+/// named `.env.<environment-name>` (or `.env` for the root environment)
+/// inside `output_dir`. Merges with existing
 /// file content (existing keys not in the environment are preserved).
 /// `written` reports the union of keys touched across ALL paths, not just
 /// the first one.
@@ -1329,5 +1369,72 @@ mod tests {
         }).await.unwrap();
         let env = db.get_environment(env_id).await.unwrap().unwrap();
         assert_eq!(env.name, "production");
+    }
+
+    // ─── unnamed root environment (`.env`) ─────────────────────────────
+
+    #[test]
+    fn empty_environment_name_is_valid_root() {
+        assert!(validate_environment_name("").is_ok());
+        assert!(validate_environment_name("   ").is_err());
+        assert!(is_root_environment(""));
+        assert!(is_root_environment("default"));
+        assert!(!is_root_environment("production"));
+    }
+
+    #[test]
+    fn root_environment_filename_has_no_extension() {
+        assert_eq!(environment_filename(""), ".env");
+        assert_eq!(environment_filename("default"), ".env");
+        assert_eq!(environment_filename("Production"), ".env.production");
+        assert_eq!(environment_example_filename(""), ".env.example");
+        assert_eq!(environment_example_filename("staging"), ".env.example.staging");
+    }
+
+    #[tokio::test]
+    async fn inject_output_dir_resolves_unnamed_environment_to_dot_env() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: String::new(), is_default: true,
+            paths: vec![], vars: vec![],
+        }).await.unwrap();
+        let item = plain_secret("DB_HOST", "localhost");
+        let encrypted = crate::vault::encrypt_item(&key, &item).unwrap();
+        let item_id = db.upsert_item(0, "secret", &encrypted, &item.created, false).await.unwrap();
+        db.add_item_owner(item_id, project_id).await.unwrap();
+        db.upsert_environment_var(env_id, "DB_HOST", item_id).await.unwrap();
+
+        let result = inject_environment(&db, &key, env_id, None, Some(dir.path().to_str().unwrap().to_string()), false)
+            .await
+            .unwrap();
+
+        let expected = dir.path().join(".env");
+        assert_eq!(result.paths, vec![expected.to_str().unwrap().to_string()]);
+        assert!(expected.exists());
+    }
+
+    #[tokio::test]
+    async fn unnamed_and_legacy_default_environments_collide() {
+        let (_dir, db) = test_db().await;
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        db.upsert_environment(0, project_id, "default", true).await.unwrap();
+        let err = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: String::new(), is_default: false,
+            paths: vec![], vars: vec![],
+        }).await.unwrap_err();
+        assert_eq!(err, crate::db::ENVIRONMENT_NAME_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn resolve_root_environment_by_empty_or_default_name() {
+        let (_dir, db) = test_db().await;
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let env_id = db.upsert_environment(0, project_id, "", true).await.unwrap();
+        for name in ["", "default", "DEFAULT"] {
+            let env = resolve_environment(&db, None, Some("demo"), Some(name)).await.unwrap();
+            assert_eq!(env.id, env_id);
+        }
     }
 }
