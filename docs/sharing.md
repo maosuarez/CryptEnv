@@ -25,16 +25,10 @@ Ideal for colleagues on the same Wi-Fi / local network.
 Ideal for asynchronous sharing via email, Slack, or USB drives.
 
 ### How It Works:
-- Sender exports items into a self-contained `.vault` package:
-  ```bash
-  crypt-env share export api_key_1 api_key_2 -o secrets.vault
-  ```
+- Sender exports items into a self-contained `.vault` package from the desktop app (the CLI `share` commands were removed).
 - Generates a random 12-character high-entropy passphrase.
 - Encrypted using **AES-256-GCM** with keys derived via **Argon2id** (32MB memory cost).
-- Receiver imports the file by entering the passphrase out-of-band:
-  ```bash
-  crypt-env share import -f secrets.vault
-  ```
+- Receiver imports the file in the desktop app, entering the passphrase received out-of-band.
 
 ---
 

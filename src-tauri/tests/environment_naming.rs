@@ -394,7 +394,7 @@ async fn t11_save_project_default_env_collision_rejected() {
 
     let project_id = project::save_project(
         &db,
-        ProjectInput { id: 0, name: "acme".to_string(), description: None, template: "generic".to_string(), categories: vec![], initial_environment: None },
+        ProjectInput { id: 0, name: "acme".to_string(), description: None, template: "generic".to_string(), categories: vec![], initial_environment: None , root_path: None },
     )
     .await
     .unwrap();

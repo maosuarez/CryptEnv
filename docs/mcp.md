@@ -98,7 +98,7 @@ AI: "Initiating LAN share session..."
 → Calls: crypt_env_share_listen(item_ids=["stripe_staging_key"])
 ← Returns: { pairing_code: "492015", expires_in: 300 }
 
-AI: "Pairing code 492015 generated. Ask Alice to run: crypt-env share receive 492015"
+AI: "Pairing code 492015 generated. Ask Alice to open CryptEnv → Receive and enter 492015"
 [Alice connects]
 
 AI: "Confirming fingerprint match..."

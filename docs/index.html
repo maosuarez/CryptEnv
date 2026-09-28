@@ -232,11 +232,9 @@
       <li class="sub"><a href="#globals">Global items</a></li>
       <li><a href="#client-config">Client configuration</a></li>
       <li><a href="#cli">CLI reference</a></li>
-      <li class="sub"><a href="#cli-items">Items &amp; env files</a></li>
-      <li class="sub"><a href="#cli-commands">Saved commands</a></li>
-      <li class="sub"><a href="#cli-projects">Projects</a></li>
-      <li class="sub"><a href="#cli-sharing">Sharing</a></li>
-      <li class="sub"><a href="#cli-misc">Categories &amp; setup</a></li>
+      <li class="sub"><a href="#cli-projects">Project workflow</a></li>
+      <li class="sub"><a href="#cli-items">Secrets &amp; env files</a></li>
+      <li class="sub"><a href="#cli-misc">Setup &amp; doctor</a></li>
       <li><a href="#tui">Interactive TUI</a></li>
       <li><a href="#mcp">MCP server</a></li>
       <li class="sub"><a href="#mcp-setup">Setup</a></li>
@@ -301,177 +299,136 @@
       <tr><td>Linux</td><td><code>.deb</code> / <code>.AppImage</code></td><td>Standard package install.</td></tr>
     </table></div>
     <div class="code"><span class="label">shell</span><pre><code><span class="p">$ </span>crypt-env --version
-<span class="p">$ </span>crypt-env doctor     <span class="c"># checks app, lock state, token files, crypt-env.json</span></code></pre></div>
+<span class="p">$ </span>crypt-env doctor     <span class="c"># checks app, vault, TLS cert, tokens, .crypt-env.yaml, WSL</span></code></pre></div>
     <p>The app checks for updates at startup and shows a notice when a newer signed release exists. To build from source, see <a href="https://github.com/maosuarez/CryptEnv/blob/main/docs/building.md">docs/building.md</a>.</p>
 
     <!-- ===================== 3. CONCEPTS ===================== -->
     <h2 id="concepts"><span class="num">02</span>Core concepts<a class="anchor" href="#concepts">#</a></h2>
     <div class="grid">
       <div class="card"><h4>Items</h4><p>Encrypted vault rows of type <code>secret</code>, <code>credential</code>, <code>link</code>, <code>note</code> or <code>command</code>. Each can carry categories.</p></div>
-      <div class="card"><h4>Projects</h4><p>A named group of environments. Names are unique, case-insensitive.</p></div>
-      <div class="card"><h4>Environments</h4><p>e.g. <code>local</code>, <code>staging</code>, <code>production</code>. Each links vault items under env-var keys and has optional <code>.env</code> output paths.</p></div>
+      <div class="card"><h4>Projects</h4><p>A named group of environments tied to a <strong>root directory</strong> holding <code>.crypt-env.yaml</code>. Names are unique, case-insensitive.</p></div>
+      <div class="card"><h4>Environments</h4><p>e.g. <code>local</code>, <code>staging</code>, <code>production</code>. Each links vault items under env-var keys and has one or more <code>.env</code> output paths, relative to the project root or absolute.</p></div>
       <div class="card"><h4>Commands</h4><p>Saved shell commands with <code>{{VAR}}</code> placeholders, resolved from arguments or the vault at run time.</p></div>
     </div>
     <p>An item is only "in" an environment when it is <strong>linked</strong> under a key (a real foreign key, not a name match). Linking happens when you <code>add</code> a variable, save the environment in the GUI, or import/receive items into it.</p>
     <p>Environment names must match <code>^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$</code>. Project names allow spaces and non-ASCII letters but reject path separators, control characters, reserved device names and leading/trailing dots or whitespace (max 128 chars).</p>
 
-    <h3 id="scope">Scope resolution<a class="anchor" href="#scope">#</a></h3>
-    <p>Every scoped command (<code>add</code>, <code>fill</code>, <code>inject</code>, <code>set</code>, <code>search</code>, <code>exec</code>, <code>list</code>, <code>cmd</code>, <code>sync</code>, <code>share send/receive/import</code>, <code>relay receive</code>, <code>tui</code>) resolves its project and environment once, field by field:</p>
-    <ol class="list">
-      <li>The <code>--project</code> / <code>--env</code> flags.</li>
-      <li><code>crypt-env.json</code>, searched from the current directory upwards (like <code>.git</code>).</li>
-      <li>Fallback: project = current folder name, environment = that project's default environment.</li>
-    </ol>
-    <div class="code"><span class="label">crypt-env.json</span><pre><code>{
-  "project": "my-app",
-  "environment": "production"
-}</code></pre></div>
-    <p><code>project</code> is required, <code>environment</code> is optional. Only <code>add</code> auto-creates a missing project; every other command fails with a clear message instead of creating server state.</p>
+    <h3 id="scope">Project root &amp; <code>.crypt-env.yaml</code><a class="anchor" href="#scope">#</a></h3>
+    <p>Every project-aware command (<code>config</code>, <code>add</code>, <code>fill</code>, <code>sync</code>, <code>inject</code>, <code>search</code>, <code>tui</code>) finds <code>.crypt-env.yaml</code> by searching from the current directory upwards (like <code>.git</code>). Its directory is the project root. The file holds metadata only — never a secret value — and is meant to be committed.</p>
+    <div class="code"><span class="label">.crypt-env.yaml</span><pre><code>project:
+  name: my-app
+  description: Backend API
+  categories:
+  - backend
+  environments:
+  - name: default
+    isDefault: true
+    paths:
+    - .env
+  - name: production
+    isDefault: false
+    paths:
+    - apps/api/.env.production</code></pre></div>
+    <ul>
+      <li>Environment paths relative to the root are resolved by the app at write time (they may not climb out of the root with <code>..</code>); absolute paths are used as-is.</li>
+      <li>The environment is <code>--env NAME</code>, else the file's <code>isDefault</code> environment, else the vault's default.</li>
+      <li>The vault stores the root as the app sees it. A native Linux CLI inside WSL translates absolute paths to and from <code>\\wsl.localhost\&lt;distro&gt;\…</code> / <code>C:\…</code> automatically; <code>CRYPTENV_PATH_TRANSLATION=off</code> disables it.</li>
+      <li>A legacy <code>crypt-env.json</code> (<code>{"project", "environment"}</code>) is still read, with a notice to migrate via <code>crypt-env init</code>.</li>
+    </ul>
 
     <h3 id="globals">Global items<a class="anchor" href="#globals">#</a></h3>
-    <p>Items marked <strong>global</strong> are reusable across projects (the GUI's Global Secrets view). Discovery surfaces — <code>search</code>, <code>list</code>, <code>GET /items</code>, <code>GET /commands</code>, the MCP list/search tools — union globals in by default and tag each row as <code>linked</code>, <code>global</code> or <code>global+linked</code>. Materialization surfaces — <code>fill</code>, <code>inject</code>, env example generation, LAN share — only ever use what is <strong>linked</strong>. Linking a global into an environment is always an explicit act.</p>
+    <p>Items marked <strong>global</strong> are reusable across projects (the GUI's Global Secrets view). Discovery surfaces — <code>search</code>, <code>GET /items</code>, <code>GET /commands</code>, the MCP list/search tools — union globals in by default and tag each row as <code>linked</code>, <code>global</code> or <code>global+linked</code>. Materialization surfaces — <code>fill</code>, <code>inject</code>, env example generation, LAN share — only ever use what is <strong>linked</strong>. Linking a global into an environment is always an explicit act.</p>
 
     <!-- ===================== 4. CLIENT CONFIG ===================== -->
     <h2 id="client-config"><span class="num">03</span>Client configuration<a class="anchor" href="#client-config">#</a></h2>
-    <p>The CLI, TUI and MCP server read three optional environment variables. The defaults work when client and app run on the same machine; overrides exist for split setups such as WSL ↔ Windows.</p>
+    <p>The CLI, TUI and MCP server read these optional environment variables. The defaults work when client and app run on the same machine; overrides exist for split setups such as WSL ↔ Windows.</p>
     <div class="table-wrap"><table>
       <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
       <tr><td><code>CRYPTENV_API_URL</code></td><td><code>https://127.0.0.1:47821</code></td><td>REST base URL. Must be an absolute <code>http</code>/<code>https</code> URL. A non-loopback host prints a warning and proceeds.</td></tr>
       <tr><td><code>CRYPTENV_CERT_PATH</code></td><td class="wrap">probed under <code>APPDATA</code> → <code>XDG_DATA_HOME</code> → <code>~/.local/share</code> + <code>com.maosuarez.cryptenv/tls/cert.pem</code></td><td>TLS certificate to pin. If set but unreadable the client errors — it never falls back or disables verification.</td></tr>
-      <tr><td><code>CRYPTENV_TOKEN_PATH</code></td><td class="wrap"><code>%APPDATA%\com.maosuarez.cryptenv\.cli_token</code> or <code>~/.local/share/com.maosuarez.cryptenv/.cli_token</code></td><td>Where the CLI caches its session token after unlock.</td></tr>
+      <tr><td><code>CRYPTENV_TOKEN_PATH</code></td><td class="wrap"><code>%APPDATA%\com.maosuarez.cryptenv\.cli_token</code> or <code>~/.local/share/com.maosuarez.cryptenv/.cli_token</code></td><td>Base path of the per-terminal session files (<code>&lt;path&gt;.&lt;terminal hash&gt;</code>).</td></tr>
+      <tr><td><code>CRYPTENV_TERMINAL_ID</code></td><td>detected</td><td>Overrides the terminal identity for per-terminal sessions; the WSL managed launcher sets it and forwards it via <code>WSLENV</code>.</td></tr>
+      <tr><td><code>CRYPTENV_PATH_TRANSLATION</code></td><td>on inside WSL</td><td><code>off</code> disables WSL ↔ Windows path translation (only when the app itself runs inside the distro).</td></tr>
     </table></div>
     <p>From WSL, <code>crypt-env setup wsl</code> persists these into your shell startup (see <a href="#cli-misc">setup</a> and the <a href="https://github.com/maosuarez/CryptEnv/blob/main/docs/wsl-windows.md">WSL ↔ Windows guide</a>). On Windows the GUI offers the same under <strong>Settings → WSL Integration</strong>.</p>
 
     <!-- ===================== 5. CLI ===================== -->
     <h2 id="cli"><span class="num">04</span>CLI reference<a class="anchor" href="#cli">#</a></h2>
-    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token; later commands reuse it until it expires or the vault locks.</p>
+    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
     <div class="table-wrap"><table>
       <tr><th>Command</th><th>Purpose</th></tr>
-      <tr><td><code>add</code></td><td>Add secrets from <code>KEY=value</code>, <code>$VARNAME</code> or a <code>.env</code> file</td></tr>
-      <tr><td><code>fill</code></td><td>Fill <code>.env</code> / <code>.env.example</code> with vault values</td></tr>
-      <tr><td><code>sync</code></td><td>Append new keys from <code>.env.example</code> into <code>.env</code></td></tr>
-      <tr><td><code>set</code> · <code>inject</code></td><td>Print a shell assignment for <code>eval</code></td></tr>
-      <tr><td><code>search</code></td><td>Search items by name (no values)</td></tr>
-      <tr><td><code>memory</code> · <code>list</code> · <code>exec</code> · <code>cmd</code></td><td>Save, list and run commands</td></tr>
-      <tr><td><code>project</code></td><td>List, inject, delete, share and receive projects</td></tr>
-      <tr><td><code>share</code> · <code>relay</code></td><td>LAN bridge, encrypted package, internet relay</td></tr>
-      <tr><td><code>category</code></td><td>Manage categories</td></tr>
-      <tr><td><code>tui</code></td><td>Interactive terminal UI</td></tr>
-      <tr><td><code>setup wsl</code></td><td>Configure a WSL client for a Windows vault</td></tr>
+      <tr><td><code>init [NAME] [--path PATH]</code></td><td>Register this directory as a project root and write <code>.crypt-env.yaml</code></td></tr>
+      <tr><td><code>config</code></td><td>Sync <code>.crypt-env.yaml</code> ⇄ vault (last modified wins)</td></tr>
+      <tr><td><code>add</code></td><td>Add secrets from <code>KEY=value</code>, <code>$VARNAME</code> or a <code>.env</code> file; halts on collisions</td></tr>
+      <tr><td><code>fill</code> 🔒</td><td>Write each environment's target files plus <code>.env.example</code></td></tr>
+      <tr><td><code>sync</code> 🔒</td><td>Provision keys from <code>.env.example</code> into the vault</td></tr>
+      <tr><td><code>inject</code> 🔒</td><td>Print shell assignments for <code>eval</code></td></tr>
+      <tr><td><code>search</code> 🔒</td><td>List variable names and metadata (never values)</td></tr>
       <tr><td><code>doctor</code></td><td>Diagnostics</td></tr>
+      <tr><td><code>setup wsl [DISTRO]</code></td><td>Configure the WSL ↔ Windows split</td></tr>
+      <tr><td><code>tui</code></td><td>Interactive terminal UI</td></tr>
     </table></div>
-    <p>Scoped commands accept <code>--project NAME</code> and <code>--env NAME</code> (see <a href="#scope">scope resolution</a>). Exception: <code>sync</code> uses <code>--environment</code> because its <code>--env</code> is the target file path.</p>
+    <div class="note warn"><p><code>memory</code>, <code>list</code>, <code>exec</code>, <code>cmd</code>, <code>project</code>, <code>share</code>, <code>relay</code>, <code>category</code> and <code>set</code> were removed from the CLI (unrecognized subcommand). Sharing, saved commands, categories and project deletion remain in the GUI; use <code>inject</code> instead of <code>set</code>.</p></div>
 
-    <h3 id="cli-items">Items &amp; env files<a class="anchor" href="#cli-items">#</a></h3>
+    <h3 id="cli-projects">Project workflow<a class="anchor" href="#cli-projects">#</a></h3>
+    <h4>crypt-env init [NAME] [--path PATH]</h4>
+    <p>Creates the vault project (or links an existing one with that name), records the current directory as its root and writes <code>.crypt-env.yaml</code>. <code>NAME</code> defaults to the folder name. <code>--path</code> sets the default environment's target: a directory (its <code>.env</code>) or a <code>.env*</code> file; default <code>.env</code>. An existing <code>.crypt-env.yaml</code> is never overwritten.</p>
+    <div class="code"><span class="label">shell</span><pre><code>cd ~/code/my-service
+crypt-env init                           <span class="c"># project "my-service", default env → .env</span>
+crypt-env init backend-api --path ./app  <span class="c"># default env → app/.env</span></code></pre></div>
+    <h4>crypt-env config</h4>
+    <p>Compares the file's modification time with the vault's last change (project or any environment). File newer → the vault is updated (description, categories — created if missing —, environments and their paths, root). Vault newer → the file is regenerated. Vault environments missing from the file are kept (they may hold secrets) and reported.</p>
 
-    <h4>crypt-env add [INPUT] [--file [PATH]] [--credential | --note] [--name NAME] [--force]</h4>
-    <p>Adds a variable to the resolved environment. <code>INPUT</code> is <code>KEY=value</code> or <code>$VARNAME</code> (read from your shell). <code>--file</code> bulk-imports a <code>.env</code> (default <code>./.env</code>). On an existing key it asks before updating the item in place; <code>--force</code> skips the prompt. Shared items (global, or linked elsewhere) are never rewritten silently — you get <code>SHARED_ITEM_CONFLICT</code>.</p>
+    <h3 id="cli-items">Secrets &amp; env files<a class="anchor" href="#cli-items">#</a></h3>
+    <h4>crypt-env add KEY=value | $VARNAME | FILE [--env NAME] [--global]</h4>
+    <p>Adds secrets to the environment. If any key already exists there (or among global items with <code>--global</code>) nothing is added: <code>Error: Key 'K' already exists in environment 'E'. Addition aborted.</code> The CLI then offers to show the colliding value — only after <kbd>y</kbd> <strong>and</strong> the master password.</p>
     <div class="code"><span class="label">shell</span><pre><code>crypt-env add "OPENAI_API_KEY=sk-..."
-crypt-env add '$DATABASE_URL' --name DATABASE_URL
-crypt-env add --file .env.local --project my-app --env staging
-crypt-env add "ADMIN=user:pass" --credential</code></pre></div>
-
-    <h4>crypt-env fill [PATH] [-f | --force]</h4>
-    <p>Fills a template with values from the resolved environment. With no <code>PATH</code> it looks for <code>.env.example</code> (writes sibling <code>.env</code>) then <code>.env</code>; if neither exists it generates a fresh <code>.env</code> from the environment's keys. Keys not in scope keep their original line. An existing file not created by CryptEnv is refused unless <code>--force</code>, which backs it up to <code>&lt;path&gt;.bak</code> first. No interactive prompt — safe in CI.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env fill                      <span class="c"># .env.example → .env</span>
-crypt-env fill config/.env.example --env production
-crypt-env fill .env --force         <span class="c"># overwrite an unmanaged file, keeps .env.bak</span></code></pre></div>
-
-    <h4>crypt-env sync [--example PATH] [--env PATH] [--dry-run] [--environment NAME]</h4>
-    <p>Appends keys present in <code>.env.example</code> but missing from <code>.env</code>, without touching existing lines. Values come from the vault when found.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env sync --dry-run
-crypt-env sync --example .env.example --env .env.local --environment staging</code></pre></div>
-
-    <h4>crypt-env set NAME · crypt-env inject NAME [--shell pwsh|bash|zsh|sh]</h4>
-    <p>Print a shell assignment to stdout so you can load one secret into the current shell. <code>inject</code> auto-detects the shell unless <code>--shell</code> is given.</p>
+crypt-env add '$DATABASE_URL'
+crypt-env add .env.local --env staging
+crypt-env add "SHARED_AUTH_URL=https://auth.example" --global</code></pre></div>
+    <h4>crypt-env fill [--env NAME] 🔒</h4>
+    <p>Writes every environment (or only <code>--env</code>) into its configured paths — the app does the writing, so WSL repos work with a Windows vault — and writes/extends a keys-only <code>.env.example</code> next to each target. A pre-existing file not created by CryptEnv is backed up to <code>&lt;path&gt;.bak</code> first.</p>
+    <h4>crypt-env sync [--global] [--env NAME] [--example PATH] 🔒</h4>
+    <p>Reads <code>.env.example</code> (current directory, then the project root) and creates each key missing from the environment with the value <code>change-me</code>. With <code>--global</code>, keys matching a global secret are linked to it instead and the environment is then written to its <code>.env</code> target(s).</p>
+    <h4>crypt-env inject KEY... [--env NAME] [--shell pwsh|bash|zsh|sh] 🔒</h4>
+    <p>Prints single-quoted assignments on stdout only; the password prompt goes to the terminal. All keys are resolved before anything is printed.</p>
     <div class="code"><span class="label">shell</span><pre><code><span class="c"># bash / zsh</span>
-eval "$(crypt-env set OPENAI_API_KEY)"
+eval "$(crypt-env inject DATABASE_URL API_KEY)"
 <span class="c"># PowerShell</span>
-crypt-env inject OPENAI_API_KEY --shell pwsh | Invoke-Expression</code></pre></div>
+crypt-env inject DATABASE_URL --shell pwsh | Invoke-Expression</code></pre></div>
+    <h4>crypt-env search [PATTERN] [--global] 🔒</h4>
+    <p>Prints <code>KEY</code>, <code>ENVIRONMENT</code>, <code>TYPE</code>, <code>SCOPE</code> for the project's variables across environments, or global items with <code>--global</code>. <code>%TEXT</code> is a substring match; anything else is a case-insensitive regex.</p>
+    <div class="code"><span class="label">shell</span><pre><code>crypt-env search %TOKEN
+crypt-env search '^DB_'
+crypt-env search --global</code></pre></div>
 
-    <h4>crypt-env search QUERY [--scope-globals with|without|only]</h4>
-    <p>Prints <code>ID</code>, <code>TYPE</code>, <code>NAME</code>, <code>SCOPE</code>, <code>CATEGORIES</code>. Never prints values.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env search stripe
-crypt-env search db --scope-globals only</code></pre></div>
-
-    <h3 id="cli-commands">Saved commands<a class="anchor" href="#cli-commands">#</a></h3>
-    <h4>crypt-env memory "COMMAND"</h4>
-    <p>Saves a command string; prompts for a name, an optional description and the shell. Use <code>{{VAR}}</code> for placeholders.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env memory "docker compose -f docker-compose.{{ENV}}.yml up -d --build"</code></pre></div>
-    <h4>crypt-env list [-s REGEX] [--type TYPE] [--scope-globals with|without|only]</h4>
-    <p>Lists saved commands (default type <code>command</code>) with a <code>SCOPE</code> column.</p>
-    <h4>crypt-env exec NAME [--VAR=value ...] [--shell pwsh|bash]</h4>
-    <p>Resolves placeholders and runs the command. If a linked and a global command share a name, the linked one wins and a warning is printed.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env exec deploy --ENV=staging --REGION=us-west-2</code></pre></div>
-    <h4>crypt-env cmd [NAME] [--list] [--info] [--VAR=value ...]</h4>
-    <p>All-in-one: <code>--list</code> lists commands, <code>NAME --info</code> shows description and placeholders, <code>NAME --VAR=value</code> runs it.</p>
-
-    <h3 id="cli-projects">Projects<a class="anchor" href="#cli-projects">#</a></h3>
-    <div class="table-wrap"><table>
-      <tr><th>Command</th><th>Description</th></tr>
-      <tr><td><code>project list</code></td><td>Projects with their environments (template, paths, variable count)</td></tr>
-      <tr><td><code>project inject --id ID</code><br /><code>project inject --project P --environment E</code></td><td>Write an environment's variables to its configured <code>.env</code> paths</td></tr>
-      <tr><td><code>project delete --id ID</code></td><td>Delete a project and all its environments</td></tr>
-      <tr><td><code>project delete-env --id ID</code></td><td>Delete one environment</td></tr>
-      <tr><td><code>project share --id ID | --name N [--envs a,b | all] [--yes]</code></td><td>Send a whole project (structure + values) via internet relay. Default: only the default environment</td></tr>
-      <tr><td><code>project receive --code C --passphrase P [--as NAME]</code></td><td>Receive a shared project. Always creates a new project; use <code>--as</code> on a name collision</td></tr>
-    </table></div>
-
-    <h3 id="cli-sharing">Sharing<a class="anchor" href="#cli-sharing">#</a></h3>
-    <p>Three channels. All of them encrypt end to end; received items are owned by the target project and linked into the target environment (a key that already exists there is imported but not relinked, and reported).</p>
-    <div class="grid">
-      <div class="card"><h4>LAN bridge</h4><p>Same network. mDNS discovery, ECDH key exchange, both sides confirm a fingerprint.</p></div>
-      <div class="card"><h4>Encrypted package</h4><p>A <code>.vault</code> file plus a one-time passphrase. Send them over different channels.</p></div>
-      <div class="card"><h4>Internet relay</h4><p>AES-256-GCM + Argon2id passphrase, burn after read, 24 h TTL. Requires relay settings in the app.</p></div>
-    </div>
-    <div class="code"><span class="label">shell</span><pre><code><span class="c"># LAN — items must be linked in the resolved environment</span>
-crypt-env share send 12 15
-crypt-env share receive              <span class="c"># prompts for the pairing code</span>
-
-<span class="c"># Encrypted package</span>
-crypt-env share export 12 15 -o secrets.vault
-crypt-env share import -f secrets.vault   <span class="c"># passphrase prompted, hidden</span>
-
-<span class="c"># Internet relay</span>
-crypt-env relay send --items 12,15
-crypt-env relay receive --code X7K2-M9P4 --passphrase "..."</code></pre></div>
-    <div class="note warn"><p><code>relay receive --passphrase</code> ends up in shell history. Clear it or prefix the command with a space if your shell ignores those.</p></div>
-    <p>More detail: <a href="https://github.com/maosuarez/CryptEnv/blob/main/docs/sharing.md">docs/sharing.md</a>.</p>
-
-    <h3 id="cli-misc">Categories, setup &amp; doctor<a class="anchor" href="#cli-misc">#</a></h3>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env category list
-crypt-env category create --name databases --color "#22c55e"
-crypt-env category edit --id 3f9a --name db --color "#0ea5e9"
-crypt-env category delete --id 3f9a</code></pre></div>
-    <h4>crypt-env setup wsl [--cert-path PATH] [--api-url URL] [--remove]</h4>
-    <p>Run inside WSL when the vault lives on Windows. Writes <code>~/.config/cryptenv/env.sh</code> and a marked block in your shell rc (with a one-time backup). <code>--cert-path</code> is required when the Windows <code>APPDATA</code> isn't forwarded into WSL. <code>--remove</code> undoes it.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env setup wsl --cert-path /mnt/c/Users/you/AppData/Roaming/com.maosuarez.cryptenv/tls/cert.pem</code></pre></div>
+    <h3 id="cli-misc">Setup &amp; doctor<a class="anchor" href="#cli-misc">#</a></h3>
+    <h4>crypt-env setup wsl [DISTRO] [--cert-path PATH] [--api-url URL] [--remove]</h4>
+    <p><strong>Inside WSL</strong>: detects the distribution and writes <code>~/.config/cryptenv/env.sh</code> plus a marked block in your shell rc (one-time backup). <code>--cert-path</code> is required when the Windows <code>APPDATA</code> isn't forwarded. <strong>On Windows</strong>: lists installed distributions (or reports none); run <code>crypt-env setup wsl &lt;distro&gt;</code> to configure one through the bundled helper. <code>--remove</code> undoes it.</p>
+    <div class="code"><span class="label">shell</span><pre><code>crypt-env setup wsl                <span class="c"># inside WSL, or list distros on Windows</span>
+crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code></pre></div>
     <h4>crypt-env doctor</h4>
-    <p>Reports app reachability, version, vault lock state, token files and validates <code>crypt-env.json</code> if present.</p>
+    <p>Reports the app/health endpoint, vault lock state, TLS certificate (path and days to expiry), CLI session token (and whether its file is readable by others), MCP token, <code>.crypt-env.yaml</code> validity and WSL status.</p>
 
     <!-- ===================== 6. TUI ===================== -->
     <h2 id="tui"><span class="num">05</span>Interactive TUI<a class="anchor" href="#tui">#</a></h2>
-    <p>Browse, search and reveal secrets from the terminal without opening the GUI. Scope is resolved like any other command and shown in the top bar.</p>
-    <div class="code"><span class="label">shell</span><pre><code>crypt-env tui
-crypt-env tui --project my-app --env production</code></pre></div>
-    <p>Screens: <strong>Unlock</strong> → <strong>Main</strong> (item list) → <strong>Detail</strong>, plus <strong>Help</strong> and <strong>Confirm</strong>.</p>
+    <p>Three panes — projects · environments (plus <em>global items</em>) · variables with values masked — opening on the current directory's project. Workspace actions run on the current directory's <code>.crypt-env.yaml</code>.</p>
+    <div class="code"><span class="label">shell</span><pre><code>crypt-env tui</code></pre></div>
     <div class="table-wrap"><table>
-      <tr><th>Key</th><th>Screen</th><th>Action</th></tr>
-      <tr><td><kbd>Enter</kbd></td><td>Unlock</td><td>Submit master password</td></tr>
-      <tr><td><kbd>↑</kbd> <kbd>↓</kbd> / <kbd>k</kbd> <kbd>j</kbd></td><td>Main</td><td>Move selection</td></tr>
-      <tr><td><kbd>/</kbd></td><td>Main</td><td>Fuzzy search (<kbd>Esc</kbd> clears)</td></tr>
-      <tr><td><kbd>Enter</kbd></td><td>Main</td><td>Open detail</td></tr>
-      <tr><td><kbd>r</kbd></td><td>Main</td><td>Refresh from vault</td></tr>
-      <tr><td><kbd>?</kbd></td><td>Main</td><td>Help</td></tr>
-      <tr><td><kbd>q</kbd> / <kbd>Esc</kbd></td><td>Main</td><td>Quit</td></tr>
-      <tr><td><kbd>v</kbd></td><td>Detail</td><td>Reveal / hide value</td></tr>
-      <tr><td><kbd>c</kbd></td><td>Detail</td><td>Copy value to clipboard</td></tr>
-      <tr><td><kbd>d</kbd></td><td>Detail</td><td>Delete (asks for confirmation)</td></tr>
-      <tr><td><kbd>Esc</kbd> / <kbd>q</kbd></td><td>Detail, Help</td><td>Back</td></tr>
-      <tr><td><kbd>y</kbd> / <kbd>Enter</kbd> · <kbd>n</kbd> / <kbd>Esc</kbd></td><td>Confirm</td><td>Confirm · cancel</td></tr>
-      <tr><td><kbd>Ctrl</kbd>+<kbd>C</kbd></td><td>Any</td><td>Quit immediately</td></tr>
+      <tr><th>Key</th><th>Action</th></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd> / <kbd>h</kbd> <kbd>l</kbd> / <kbd>Tab</kbd></td><td>Switch pane</td></tr>
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd> / <kbd>k</kbd> <kbd>j</kbd></td><td>Move selection</td></tr>
+      <tr><td><kbd>/</kbd></td><td>Filter variables (<kbd>Esc</kbd> clears)</td></tr>
+      <tr><td><kbd>v</kbd></td><td>Reveal value — asks for the master password unless the terminal has a live session; wiped from memory when the popup closes</td></tr>
+      <tr><td><kbd>i</kbd></td><td><code>init</code> the current directory</td></tr>
+      <tr><td><kbd>c</kbd></td><td><code>config</code> sync</td></tr>
+      <tr><td><kbd>f</kbd></td><td><code>fill</code> (session or master password)</td></tr>
+      <tr><td><kbd>s</kbd> / <kbd>S</kbd></td><td><code>sync</code> / <code>sync --global</code> (session or master password)</td></tr>
+      <tr><td><kbd>d</kbd></td><td><code>doctor</code></td></tr>
+      <tr><td><kbd>r</kbd></td><td>Reload</td></tr>
+      <tr><td><kbd>?</kbd></td><td>Help</td></tr>
+      <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
     </table></div>
-    <p>Search filters the list loaded on entry; press <kbd>r</kbd> to pick up changes made elsewhere. To switch project or environment, restart with other flags.</p>
 
     <!-- ===================== 7. MCP ===================== -->
     <h2 id="mcp"><span class="num">06</span>MCP server<a class="anchor" href="#mcp">#</a></h2>
@@ -550,7 +507,7 @@ crypt-env tui --project my-app --env production</code></pre></div>
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td colspan="3"><strong>System</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/health</code></td><td>No auth. <code>version</code>, <code>status</code>, <code>vault_locked</code>, <code>mcp_token_configured</code></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code></td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code></td></tr>
       <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings</td></tr>
       <tr><td colspan="3"><strong>Items</strong></td></tr>
@@ -566,8 +523,8 @@ crypt-env tui --project my-app --env production</code></pre></div>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/inject</code></td><td>Write to configured paths (+ <code>output_path</code> / <code>output_dir</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/example</code></td><td>Placeholder-only <code>KEY=</code> output; never decrypts</td></tr>
       <tr><td colspan="3"><strong>Projects &amp; environments</strong></td></tr>
-      <tr><td><span class="m get">GET</span></td><td><code>/projects</code></td><td>Projects with nested environments</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/projects</code></td><td>Create (<code>id: 0</code>) or update; <code>409</code> on duplicate name</td></tr>
+      <tr><td><span class="m get">GET</span></td><td><code>/projects</code></td><td>Projects with nested environments and <code>rootPath</code> (when set)</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/projects</code></td><td>Create (<code>id: 0</code>) or update; <code>409</code> on duplicate name. <code>rootPath</code>: omitted keeps, <code>""</code> clears, otherwise an absolute directory</td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/projects/:id</code></td><td>Delete with its environments; returns impact summary</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/projects/:id/preview-delete</code></td><td>Impact preview, no changes</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments</code></td><td>Create or update (requires <code>projectId</code>)</td></tr>
@@ -597,7 +554,7 @@ crypt-env tui --project my-app --env production</code></pre></div>
     <ul>
       <li>An existing file without the marker is <strong>foreign</strong>. Writing to it via <code>output_path</code>/<code>output_dir</code> returns <code>409 TARGET_EXISTS</code> unless <code>overwrite: true</code>.</li>
       <li>With <code>overwrite: true</code> the old content is copied to <code>&lt;path&gt;.bak</code> first (<code>409 BACKUP_EXISTS</code> if a backup is already there).</li>
-      <li>Paths configured on the environment itself are always written through, with the same backup, and reported in <code>unmanagedPaths</code>.</li>
+      <li>Paths configured on the environment itself are always written through, with the same backup, and reported in <code>unmanagedPaths</code>. Relative configured paths resolve against the project's <code>rootPath</code> and may not leave it; a relative path on a project without a root is an error.</li>
       <li>Names derived from <code>output_dir</code> are contained to that directory (<code>422 PATH_NOT_CONTAINED</code> otherwise).</li>
     </ul>
     <p>Add <code>*.bak</code> to <code>.gitignore</code> wherever CryptEnv writes.</p>
@@ -646,8 +603,11 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <tr><th>Symptom</th><th>Fix</th></tr>
       <tr><td>Connection refused</td><td>Start the desktop app. Run <code>crypt-env doctor</code>.</td></tr>
       <tr><td>Vault locked / 401</td><td>Unlock in the app, or run any CLI command and enter the master password.</td></tr>
-      <tr><td><code>no project found for '&lt;name&gt;'</code></td><td>Pass <code>--project</code>/<code>--env</code>, add a <code>crypt-env.json</code>, or create it with <code>crypt-env add</code>.</td></tr>
-      <tr><td><code>409 TARGET_EXISTS</code> on fill</td><td>The target wasn't created by CryptEnv. Re-run with <code>--force</code> (backup kept as <code>.bak</code>).</td></tr>
+      <tr><td><code>no .crypt-env.yaml found</code></td><td>Run <code>crypt-env init</code> in the project root (or <code>cd</code> into it).</td></tr>
+      <tr><td><code>project '…' does not exist in the vault</code></td><td>Run <code>crypt-env config</code> to register it from <code>.crypt-env.yaml</code>.</td></tr>
+      <tr><td><code>path '…' is relative but the project has no root directory</code></td><td>Set the project root in the GUI project form, or run <code>crypt-env config</code> from the project root.</td></tr>
+      <tr><td><code>authentication failed (demasiados intentos…)</code></td><td>Five unlock attempts per minute — wait a minute and retry.</td></tr>
+      <tr><td>Prompted on every command from WSL</td><td>Re-run <strong>Settings → WSL Integration → Configure</strong> so the managed <code>crypt-env</code> launcher forwards <code>CRYPTENV_TERMINAL_ID</code>.</td></tr>
       <tr><td><code>SHARED_ITEM_CONFLICT</code></td><td>The key points to an item used elsewhere. Update it globally, or use <code>on_conflict=replace</code>.</td></tr>
       <tr><td>MCP: <em>MCP token not found</em></td><td>Generate one in Settings → Integrations and restart your MCP client.</td></tr>
       <tr><td>TLS errors from WSL</td><td>Point <code>CRYPTENV_CERT_PATH</code> at the Windows cert (<code>crypt-env setup wsl</code>).</td></tr>

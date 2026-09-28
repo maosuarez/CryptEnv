@@ -32,11 +32,3 @@ pub fn format_assignment(shell: &Shell, key: &str, value: &str) -> String {
         }
     }
 }
-
-/// Returns a verification hint printed to stderr (does not expose value).
-pub fn verify_hint(shell: &Shell, key: &str) -> String {
-    match shell {
-        Shell::PowerShell => format!("echo $env:{}", key),
-        _ => format!("echo ${}", key),
-    }
-}

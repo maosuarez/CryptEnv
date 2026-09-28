@@ -206,136 +206,54 @@ Projects/environments model replaces the old workspaces. A Project contains mult
 
 ## CLI
 
-Command: `crypt-env`
+Command: `crypt-env`. Rewritten by openspec change `cli-tui-parity`; the previous command set was removed.
 
-Every command that reads or writes vault items scoped to a project (`add`, `fill`, `inject`, `set`, `search`, `exec`, `list`, `cmd list/info/run`, `sync`, `share send/receive`) accepts `--project NAME` and `--env NAME` flags. Scope is resolved once per invocation via a shared helper (`commands/scope.rs::resolve`), in this order per field:
+**Workspace resolution** (`commands/scope.rs`): the nearest `.crypt-env.yaml` from the cwd upward (a legacy `crypt-env.json` at the same or a higher level is read only when no YAML is found, with a stderr migration notice). Its directory is the project root. The project is looked up in `GET /projects` by name (case-insensitive); the environment is `--env`, else the manifest's `isDefault` environment if it exists in the vault, else the vault's default. No command auto-creates a project except `init` and `config` (push when missing).
 
-1. The command's own `--project` / `--env` flag, if given.
-2. `crypt-env.json`, found by searching from the current directory upward (same convention as `.git`/`package.json` discovery) — its `project` and optional `environment` fields.
-3. Fallback: project name = current working directory's folder name; environment = that project's default environment (`GET /projects`, `isDefault`). **Auto-creation on a resolution miss (`POST /projects`) only happens for `add`/`add --file`** — every other scoped command returns a clear error ("no project found for '<name>' — run `crypt-env add` to create one, or pass --project/--env") instead of silently creating server state. When `add` does create a project, it re-fetches the actual default-environment name from the server response rather than assuming a literal `"default"`, and if a concurrent invocation won the creation race (`POST /projects` → 409, name is case-insensitively unique), it re-fetches and reuses the existing project instead of erroring.
+**`.crypt-env.yaml`** (serializer shared with the GUI in `src-tauri/src/project/manifest.rs`): `project.{name, description?, categories? (alias tags), environments[{name, isDefault, paths[]}]}`, unknown fields rejected, at most one default, environment names unique case-insensitively. Metadata only — never a value.
 
-`crypt-env.json` schema (place at a project's root):
+**Password gate / sessions** (`client::ensure_session`, design D4): `fill`, `sync`, `inject`, `search` and the `add` collision reveal pass when this terminal's token is a live session (probed with `GET /settings`, which renews it); otherwise they prompt (`rpassword`, `Zeroizing`) and call `POST /unlock`. Server: `api::SessionStore` keeps up to 64 sessions (LRU eviction), each sliding by `auto_lock_timeout` minutes (0/"never" → 5) on every authenticated request; tokens are compared in constant time against every entry. Client: token file `<CRYPTENV_TOKEN_PATH or default>.<first 16 hex of SHA-256(terminal id)>` (`terminal.rs`); terminal id = `CRYPTENV_TERMINAL_ID`, else Unix `getsid` + tty + Linux session-leader start time, else Windows `GetConsoleWindow`. Files unused for 24 h are pruned on save. Binding is client-side only.
 
-```json
-{
-  "project": "my-app",
-  "environment": "production"
-}
-```
+**Paths**: vault paths are host paths (as the GUI process sees them). A native Linux CLI inside WSL (`WSL_DISTRO_NAME`) rewrites absolute paths `/x` ↔ `\\wsl.localhost\<distro>\x` and `/mnt/c/x` ↔ `C:\x` (`paths.rs`, pure string mapping assuming the default `/mnt` automount); `CRYPTENV_PATH_TRANSLATION=off` disables it. Relative environment paths are never translated.
 
-`project` is required; `environment` is optional (omit it to always fall through to the project's default environment).
-
-| Command | Subcommand / Flags | Description |
-|---------|-------------------|-------------|
-| `add` | `KEY=value` | Add a secret from KEY=value literal, scoped to `--project`/`--env` |
-| `add` | `$VARNAME` | Read value from system environment variable |
-| `add` | `--file [PATH]` | Bulk-import from .env file (uses dotenvy). Defaults to `./.env`. Detects duplicates via scoped GET /items before writing |
-| `add` | `--credential` | Store as credential type instead of secret |
-| `add` | `--note` | Store as note type |
-| `add` | `--name NAME` | Override the stored key name |
-| `add` | `--force` | Skip confirmation on duplicate keys |
-| `doctor` | — | Check app health, vault lock state, token files, version, and validate `crypt-env.json` if present |
-| `fill` | `[PATH] [--project] [--env] [--force/-f]` | Fill a .env template with vault secrets from the resolved environment, via `POST /fill`. No PATH: looks for `.env.example` then `.env` in cwd; if neither exists, generates a fresh `.env` from the environment's own variable keys (inverse of `add`). `--force`/`-f` sends `overwrite: true` — required the first time the target already exists and wasn't created by crypt-env, otherwise the command exits non-zero with the server's 409 message on stderr. No interactive prompt (CI/pipe-safe) |
-| `inject` | `NAME [--shell TYPE] [--project] [--env]` | Prints shell assignment to stdout (safe for eval). Supported: pwsh, bash, zsh, sh. Prints verify hint to stderr |
-| `list` | `[--project] [--env] [--scope-globals with\|without\|only]` | List saved commands in a table, with a SCOPE column (`linked`/`global`/`global+linked`). `--scope-globals` (default `with`) controls whether unlinked global commands are included |
-| `exec` | `NAME [ARGS] [--project] [--env]` | Execute a saved command by name |
-| `memory` | — | Save a command string interactively |
-| `search` | `QUERY [--project] [--env] [--scope-globals with\|without\|only]` | Search items by name/title within scope. Prints table of ID, TYPE, NAME, SCOPE (`linked`/`global`/`global+linked`), CATEGORIES. `--scope-globals` (default `with`) controls whether unlinked global items are included. No values shown |
-| `set` | `NAME [--project] [--env]` | Print export/env assignment for a secret (stdout) |
-| `cmd` | `list/info/run [--project] [--env]` | Manage saved commands (list, get info, run) |
-| `share send` | `ITEM_IDS... [--project] [--env]` | Start LAN share as sender. Items must already be linked into the resolved environment. Polls for peer, shows fingerprint, prompts confirmation |
-| `share receive` | `[--project] [--env]` | Connect as receiver. Received items are owned by `--project` and linked into `--env`, except where the sender's item name collides with a key already linked there — that item is still imported but the existing link is left alone, and the collision is warned about (`skipped_keys`). Prompts pairing code, shows fingerprint, prompts confirmation |
-| `share export` | `ITEM_IDS -o OUTPUT` | Export items as encrypted .vault file. Displays passphrase once. Unscoped (operates on item IDs directly) |
-| `share import` | `-f FILE [--project] [--env]` | Import from .vault file. Prompts passphrase via rpassword (no echo). Scoped — imported items are owned by `--project` and linked into `--env`, same collision-skip behavior as `share receive` |
-| `category list` | — | List all categories (unscoped, global) |
-| `category create` | `NAME COLOR [DESC]` | Create a new category (unscoped, global) |
-| `category edit` | `ID [fields]` | Edit category by ID (unscoped, global) |
-| `category delete` | `ID` | Delete category by ID (unscoped, global) |
-| `tui` | `[--project] [--env]` | Launch interactive TUI, scoped to the resolved project/environment |
-| `project list` | — | List all projects with their typed environments (name, template, paths, var count) |
-| `project inject` | `--id ID` or `--project NAME --environment NAME` | Inject an environment's vars into its configured .env path(s) |
-| `project delete` | `--id ID` | Delete a project and all its environments |
-| `project delete-env` | `--id ID` | Delete a single environment by ID |
-| `relay send` | `--items 1,2,3` | Send items via internet relay. Prints code + passphrase once. Unscoped |
-| `relay receive` | `--code CODE --passphrase PASS [--project] [--env]` | Receive items via relay. Scoped — imported items are owned by `--project` and linked into `--env`, same collision-skip behavior as `share receive` |
-| `sync` | `[--example PATH] [--env PATH] [--dry-run] [--project] [--environment]` | Add new variables from .env.example into .env without overwriting existing. Fills from the resolved project/environment's vault items when found. (Note: `--env` here means the target `.env` file path, pre-existing flag name — the environment-name flag is `--environment` to avoid the clash) |
-
-### Notes
-
-`add --file` loads the scoped item list via GET /items to detect duplicates, then POSTs each item sequentially — N+1 HTTP requests for a large .env file, with no batch-create optimization.
-
-`share send` polls GET /share/status with `sleep(1s)` in a loop for up to 300 iterations (5 min) for fingerprint, then another 600 iterations (10 min) for peer acceptance — blocking the terminal indefinitely if the peer crashes or never connects.
-
-`relay receive` accepts `--passphrase` as a CLI argument, which appears in shell history and `ps` output; all other secrets use `rpassword` (hidden prompt) — relay breaks this pattern.
-
-`inject` prints the value to stdout embedded in a shell assignment; on multi-user systems the value is momentarily visible in `/proc/self/fd/1` on Linux and similar process introspection on other OSes.
-
-`sync` appends new lines via `std::fs::OpenOptions::append` — if the .env file lacks a trailing newline, the first appended key appears on the same line as the last existing key.
-
-`fill` now writes through `POST /fill`, which uses the server's `TempEnvFile` RAII guard (zeros + deletes on error) instead of a raw client-side `std::fs::write`. Note this guard writes directly to the destination path (no temp-file-plus-rename), so it is still not atomic — a crash mid-write can leave the file truncated. A template key not resolvable in scope has its original line preserved unchanged rather than being blanked (fixed after an earlier version of this migration blanked unmatched keys, causing data loss on plain `.env` targets). The target is also now gated (see REST API's **Write-target gating**): an existing file not carrying the crypt-env marker causes `fill` to fail with the server's message on stderr unless `--force` is passed, in which case the prior contents are preserved in `<path>.bak`.
-
-`--project`/`--env` flags are resolved independently (each field falls through flags → `crypt-env.json` → cwd-derived default on its own), not as an all-or-nothing pair — e.g. `--env staging` alone still picks up the project name from `crypt-env.json` if present.
-
-`project inject` resolves environment by ID or by project+environment names (both case-insensitive). The environment's variables are matched via `environment_vars.item_id` (a real FK to the vault item), not by name search — the "matched by name" behavior only applies to legacy pre-migration rows still carrying a `literal` value with no `item_id`. Missing items appear as warnings but do not abort the injection. This subcommand (and `project delete-env`) still use `resolve_environment_id`/id-based lookups client-side and were intentionally left untouched by the project/environment scoping work — they were already project-scoped by construction.
-
-`add` on a key that already exists in the resolved environment now updates the existing item **in place** (`POST /items` default `?on_conflict=update`) — the previous value is destroyed, matching the "Update all conflicting keys?" prompt's wording. Confirming (or `--force`) sends the default `update` mode. Declining no longer silently drops the key client-side — it is still sent, but with `?on_conflict=error`, so a genuine remaining collision is reported as `Conflict for '<key>' [KEY_EXISTS]: ...` rather than the CLI pretending nothing was asked for it. If the existing item is shared (global, linked in another environment, or multi-owned), the update is rejected with `SHARED_ITEM_CONFLICT` instead of silently rewriting a value another environment/project also sees; the CLI prints the key and reason, not a bare `HTTP 409`.
-
-A crafted environment name (created via the GUI or with the static MCP token — CLI-driven `crypt-env.json`/cwd-derived names can't produce this) combined with `--project`/`--env` resolving to it could previously path-traverse `fill`'s/`project inject`'s `output_dir`-derived path outside the intended directory — fixed by issue #7 (see the "Environment/project name validation" note above): the name charset is now enforced on write, and `fsguard::resolve_within` independently contains any legacy row that predates the check.
-
-`project list` shows all projects with nested environment details. Projects with no environments display "(none)" for environment and var count.
-
-`doctor` no longer reports vault item count — `GET /health` stopped returning `item_count` (it leaked vault size to unauthenticated callers).
-
-`cmd`/`exec` resolve a command by name against `GET /commands`, which now defaults to unioning in unlinked global commands (issue #13). When a linked command and a global command share the same name, the linked one wins and a one-line warning naming the shadowed global's id is printed to stderr — `crypt-env cmd`/`crypt-env exec` do not take `--scope-globals` themselves (they always resolve with the default union so a global command remains runnable from any project).
+| Command | Flags | Description |
+|---------|-------|-------------|
+| `init` | `[NAME] [--path PATH]` | Creates the project (`POST /projects` with `rootPath`) or links an existing one of that name (sets its root), makes the default environment target `.env` or `--path` (dir → `<dir>/.env`), writes `.crypt-env.yaml`. Refuses to touch an existing YAML (warning, exit 0) |
+| `config` | — | Local mtime vs `max(project.updated, environments[].updated)`. Local strictly newer → push: missing categories created (`POST /categories`), `POST /projects` (rootPath = YAML dir), `POST /environments` per YAML env (matched by name, existing `vars` preserved). Vault envs absent from the YAML are kept and reported. Otherwise → pull: YAML regenerated (no write when identical), mtime set to the vault timestamp; a vault project without a root adopts the YAML dir. No YAML → error suggesting `init` |
+| `add` | `KEY=value \| $VAR \| FILE [--env] [--global]` | Collision check against the environment's keys (+ global item names with `--global`). Any collision aborts the whole batch; per colliding key, `[y/N]` then password then the value is printed (warning on stderr). New items created with `POST /items?on_conflict=error`; `--global` then `PUT /items/:id {isGlobal:true}` |
+| `fill` | `[--env]` | 🔒 `POST /environments/:id/inject` for each environment (or one) with paths; writes/extends `.env.example` (keys only, existing lines kept) in each target's directory |
+| `sync` | `[--global] [--env] [--example PATH]` | 🔒 Keys in `.env.example` (cwd, then root) missing from the environment → items with value `change-me`. `--global`: matching global item names are linked instead (`POST /environments`), then the environment is injected (configured paths, or `.env` beside the template) |
+| `inject` | `KEY... [--env] [--shell pwsh\|bash\|zsh\|sh]` | 🔒 Resolves every key (environment vars, then global items) before printing; stdout carries only the single-quoted assignments |
+| `search` | `[PATTERN] [--global]` | 🔒 KEY / ENVIRONMENT / TYPE / SCOPE (`project`, `global+linked`, `global`) — never values. `%x`/`x%` substring, otherwise case-insensitive regex (invalid regex → substring). `--global` works outside a workspace |
+| `doctor` | — | Health, vault lock, MCP token flag, TLS cert (`tls::parse_not_after_from_pem`, warn < 30 days), token file (warn if group/other-readable on Unix), MCP token file, project config, WSL status |
+| `setup wsl` | `[DISTRO] [--remove] [--cert-path] [--api-url]` | Inside WSL: local shell setup (a different `DISTRO` is an error). On Windows: `wsl.exe -l -q`; none → notice, no arg → list + instruction, known arg → bundled helper (`<exe dir>/wsl/crypt-env-setup`, same as the GUI panel) |
+| `tui` | — | See TUI |
+| `memory` `list` `exec` `cmd` `project` `share` `relay` `category` `set` | — | Removed: clap reports an unrecognized subcommand |
 
 ---
 
 ## TUI
 
-Command: `crypt-env tui [--project NAME] [--env NAME]`
+Command: `crypt-env tui` (`commands/tui.rs`, ratatui 0.29 + crossterm 0.28)
 
-Scope (which project/environment's items are listed) is resolved the same way as every scoped CLI command — see `commands/scope.rs::resolve` in the CLI section above: `--project`/`--env` flags, then `crypt-env.json`, then the cwd folder name + the project's default environment. Resolution happens once, right after authentication succeeds (either from a cached token at startup or right after Unlock), since it may issue authenticated requests (`GET`/`POST /projects`). The active `project / environment` is shown in the top bar next to the item count.
+Panes: projects · environments (+ a trailing "★ global items" entry backed by `GET /items?include_global=only`) · variables (values always masked). Starts on the cwd workspace's project. Without a cached token, a login password modal is shown first.
 
-Screens: Unlock (master password entry), Main (item list, scoped to the resolved project/environment), Detail (item metadata + controls), Help (keybinding reference), Confirm (destructive operation confirmation).
-
-| Key | Screen | Action |
-|-----|--------|--------|
-| (type) | Unlock | Enter master password |
-| Enter | Unlock | Submit password, transition to Main |
-| ↑ / k | Main | Move selection up |
-| ↓ / j | Main | Move selection down |
-| / | Main | Enter fuzzy search mode |
-| Esc | Main (search) | Exit search mode, clear filter |
-| Enter | Main | Open Detail view for selected item |
-| r | Main | Refresh item list from vault |
-| ? | Main | Open Help screen |
-| q | Main | Quit |
-| v | Detail | Reveal/hide secret value |
-| c | Detail | Copy secret value to clipboard |
-| d | Detail | Show Confirm screen for delete |
-| Esc / q | Detail | Return to Main |
-| y / Enter | Confirm | Confirm destructive action |
-| n / Esc | Confirm | Cancel |
-| Esc / q | Help | Return to previous screen |
-| Ctrl+C | Any | Quit immediately |
+| Key | Action |
+|-----|--------|
+| ←/→, h/l, Tab/Shift+Tab, Enter | Switch pane |
+| ↑/↓, j/k | Move selection (wraps) |
+| / | Filter variables (same matcher as `search`); Enter keeps, Esc clears |
+| v | Password modal only without a live terminal session → `POST /items/:id/reveal` → popup; the value is a `Zeroizing<String>` dropped on dismissal |
+| i | Name prompt → `init` on the cwd |
+| c | `config` on the cwd workspace |
+| f / s / S | Session check (password modal if none) → `fill` / `sync` / `sync --global` |
+| d | `doctor` report |
+| r | Reload projects |
+| ? / q | Help / quit |
 
 ### Notes
 
-TUI installs a panic hook (`std::panic::set_hook`) that disables raw mode and leaves the alternate screen before delegating to the default hook, so a mid-render panic restores the terminal rather than leaving it unusable.
-
-Copy-to-clipboard (`c`) relies on `tauri-plugin-clipboard-manager`, a GUI plugin designed for Tauri's webview context — clipboard integration in a standalone TUI binary is uncertain and may silently fail or panic.
-
-Reveal (`v`) calls GET /items/:id/reveal on the REST API for every toggle, generating server-side stderr logs — repeated toggling produces spam without debounce or client-side caching.
-
-Fuzzy search operates on the in-memory item list loaded at Main screen entry — no re-fetch on search, so changes made elsewhere (API, CLI) are not reflected until `r` is pressed.
-
-TUI has no auto-lock timeout despite the setting existing in vault config — the vault remains unlocked indefinitely if the user leaves the TUI open, bypassing the `auto_lock_timeout` setting entirely.
-
-Scope resolution (`--project`/`--env` → `crypt-env.json` → cwd fallback) runs once per session and is memoized in `App.scope` — switching project/environment requires restarting the TUI with different flags or a different `crypt-env.json`, there is no in-app scope switcher.
-
-If scope resolution fails after a cached token is found at startup (e.g. the vault was locked server-side, or the resolved project/environment no longer exists), the TUI falls back to the Unlock screen rather than showing a broken or partial item list.
-
-Detail view includes `detail_scroll` field in App state but scroll rendering is not confirmed functional from the source code — long secrets may be silently clipped without visual indication.
+The workspace actions reuse the CLI command cores (`init::execute`, `config::execute`, `fill::execute`, `sync::execute`, `doctor::execute`), which never print — the TUI renders their reports in a modal. A panic hook restores the terminal. There is no auto-lock timer in the TUI; the server-side session expiry still applies.
 
 ---
 

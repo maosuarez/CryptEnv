@@ -351,7 +351,11 @@ pub fn launcher_path(home: &Path) -> PathBuf {
 }
 
 /// The launcher script: a fixed template whose only variable is the
-/// single-quoted in-distro path of the Windows `crypt-env.exe`.
+/// single-quoted in-distro path of the Windows `crypt-env.exe`. It exports
+/// `CRYPTENV_TERMINAL_ID` (distro + session id + tty, computed in this Linux
+/// shell) through `WSLENV`: interop gives every Windows process a fresh
+/// console, so the Windows CLI could not otherwise tell terminals apart for
+/// its per-terminal sessions.
 pub fn launcher_script(exe: &Path) -> String {
     format!(
         "#!/bin/sh\n\
@@ -361,6 +365,12 @@ pub fn launcher_script(exe: &Path) -> String {
          \x20 echo \"crypt-env: Windows CLI not found at $exe - reinstall CryptEnv or re-run Settings > WSL Integration > Configure\" >&2\n\
          \x20 exit 127\n\
          fi\n\
+         if [ -z \"$CRYPTENV_TERMINAL_ID\" ]; then\n\
+         \x20 t=$(tty 2>/dev/null) || t=notty\n\
+         \x20 CRYPTENV_TERMINAL_ID=\"wsl:$WSL_DISTRO_NAME:$(ps -o sid= -p $$ 2>/dev/null | tr -d ' '):$t\"\n\
+         fi\n\
+         WSLENV=\"${{WSLENV:+$WSLENV:}}CRYPTENV_TERMINAL_ID\"\n\
+         export CRYPTENV_TERMINAL_ID WSLENV\n\
          exec env -u CRYPTENV_API_URL -u CRYPTENV_CERT_PATH -u CRYPTENV_TOKEN_PATH \"$exe\" \"$@\"\n",
         sh_single_quote(&exe.to_string_lossy()),
     )
@@ -843,6 +853,7 @@ mod tests {
             &exe,
             "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done\n\
              printf '|%s|%s|%s|%s' \"${CRYPTENV_API_URL-unset}\" \"${CRYPTENV_CERT_PATH-unset}\" \"${CRYPTENV_TOKEN_PATH-unset}\" \"$KEEP\"\n\
+             printf '|%s|%s' \"$CRYPTENV_TERMINAL_ID\" \"$WSLENV\"\n\
              exit 3\n",
         )
         .unwrap();
@@ -856,13 +867,28 @@ mod tests {
             .env("CRYPTENV_CERT_PATH", "/mnt/c/cert.pem")
             .env("CRYPTENV_TOKEN_PATH", "/t")
             .env("KEEP", "kept")
+            .env("WSL_DISTRO_NAME", "Deb")
+            .env("WSLENV", "USERPROFILE/p")
+            .env_remove("CRYPTENV_TERMINAL_ID")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(3));
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "[search][my key][$HOME]|unset|unset|unset|kept"
-        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let (fixed, ids) = stdout.split_at("[search][my key][$HOME]|unset|unset|unset|kept".len());
+        assert_eq!(fixed, "[search][my key][$HOME]|unset|unset|unset|kept");
+        // Terminal id forwarded to the Windows CLI through WSLENV.
+        let mut parts = ids.trim_start_matches('|').splitn(2, '|');
+        let (id, wslenv) = (parts.next().unwrap(), parts.next().unwrap());
+        assert!(id.starts_with("wsl:Deb:") && id.ends_with(":notty"), "{id}");
+        assert_eq!(wslenv, "USERPROFILE/p:CRYPTENV_TERMINAL_ID");
+
+        // An id already in the environment is kept.
+        let out = std::process::Command::new(launcher_path(home.path()))
+            .env("CRYPTENV_TERMINAL_ID", "given")
+            .env_remove("WSLENV")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8(out.stdout).unwrap().ends_with("|given|CRYPTENV_TERMINAL_ID"));
 
         // Target gone → 127 with an actionable message, no fallback.
         std::fs::remove_file(&exe).unwrap();

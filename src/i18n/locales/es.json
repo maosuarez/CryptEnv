@@ -443,6 +443,33 @@
       "owners": "Proyectos propietarios",
       "global": "Global (reutilizable entre proyectos)",
       "globalHint": "Al desmarcar un secreto compartido por varios proyectos, cada proyecto recibe su propia copia."
+    },
+    "pathsRelativeHint": "relativas a {{root}}, o absolutas",
+    "root": {
+      "label": "DIRECTORIO RAÍZ",
+      "hint": "(aquí se escribe .crypt-env.yaml)",
+      "placeholder": "C:\\proyectos\\miapp",
+      "browse": "Buscar la carpeta del proyecto",
+      "browseWsl": "Explorar el sistema de archivos de una distro WSL para la carpeta del proyecto",
+      "required": "Elige el directorio raíz del proyecto",
+      "problems": {
+        "notAbsolute": "Debe ser una ruta absoluta",
+        "notFound": "El directorio no existe",
+        "notDir": "No es un directorio",
+        "notWritable": "No se puede escribir en el directorio"
+      },
+      "manifestExists": {
+        "title": ".crypt-env.yaml ya existe",
+        "body": "Esta carpeta ya tiene un manifiesto de proyecto. Sobrescríbelo con este proyecto, o vincula el proyecto sin tocar el archivo (ejecuta `crypt-env config` después para sincronizarlo).",
+        "overwrite": "SOBRESCRIBIR",
+        "link": "SOLO VINCULAR"
+      },
+      "yamlWritten": ".crypt-env.yaml escrito en {{path}}"
+    },
+    "injectTarget": {
+      "title": "¿Dónde quieres inyectar las variables de entorno?",
+      "all": "Todas las rutas configuradas",
+      "inject": "INYECTAR"
     }
   },
   "receive": {

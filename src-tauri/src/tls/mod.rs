@@ -82,7 +82,7 @@ fn cert_is_still_valid(cert_pem: &str, min_remaining: Duration) -> bool {
 
 /// Extracts the `notAfter` field from a PEM certificate as a Unix timestamp.
 /// Uses a minimal ASN.1 DER scanner to avoid adding a full X.509 parser.
-fn parse_not_after_from_pem(cert_pem: &str) -> Option<u64> {
+pub fn parse_not_after_from_pem(cert_pem: &str) -> Option<u64> {
     let pem_block = pem::parse(cert_pem).ok()?;
     parse_not_after_from_der(pem_block.contents())
 }

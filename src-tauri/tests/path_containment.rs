@@ -186,6 +186,7 @@ async fn t2_inject_environment_sink_no_amplification() {
             None,
             Some(base_dir.to_str().unwrap().to_string()),
             false,
+            None,
         )
         .await;
     }
@@ -317,6 +318,7 @@ async fn t7_legacy_hostile_name_contained_and_vault_stays_usable() {
         None,
         Some(base_dir.to_str().unwrap().to_string()),
         false,
+        None,
     )
     .await;
     assert!(result.is_err(), "a legacy hostile name must still be rejected at layer 2");

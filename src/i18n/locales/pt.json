@@ -443,6 +443,33 @@
       "owners": "Projetos proprietários",
       "global": "Global (reutilizável entre projetos)",
       "globalHint": "Desmarcar um segredo compartilhado por vários projetos dá a cada projeto sua própria cópia."
+    },
+    "pathsRelativeHint": "relativos a {{root}}, ou absolutos",
+    "root": {
+      "label": "DIRETÓRIO RAIZ",
+      "hint": "(o .crypt-env.yaml é gravado aqui)",
+      "placeholder": "C:\\projetos\\meuapp",
+      "browse": "Procurar a pasta do projeto",
+      "browseWsl": "Navegar no sistema de arquivos de uma distro WSL pela pasta do projeto",
+      "required": "Escolha o diretório raiz do projeto",
+      "problems": {
+        "notAbsolute": "Deve ser um caminho absoluto",
+        "notFound": "O diretório não existe",
+        "notDir": "Não é um diretório",
+        "notWritable": "Não é possível gravar no diretório"
+      },
+      "manifestExists": {
+        "title": ".crypt-env.yaml já existe",
+        "body": "Esta pasta já tem um manifesto de projeto. Sobrescreva-o com este projeto, ou vincule o projeto sem alterar o arquivo (execute `crypt-env config` depois para sincronizá-lo).",
+        "overwrite": "SOBRESCREVER",
+        "link": "APENAS VINCULAR"
+      },
+      "yamlWritten": ".crypt-env.yaml gravado em {{path}}"
+    },
+    "injectTarget": {
+      "title": "Onde você quer injetar as variáveis de ambiente?",
+      "all": "Todos os caminhos configurados",
+      "inject": "INJETAR"
     }
   },
   "receive": {

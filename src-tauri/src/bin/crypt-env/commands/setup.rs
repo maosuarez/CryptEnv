@@ -32,6 +32,9 @@ enum SetupCmd {
 
 #[derive(Args)]
 pub struct WslArgs {
+    /// Distribution to configure when run on the Windows host (inside WSL the
+    /// current distribution is used)
+    distro: Option<String>,
     /// Remove the cryptenv shell block and env.sh instead of installing them
     #[arg(long)]
     remove: bool,
@@ -59,7 +62,114 @@ pub fn run(args: SetupArgs) -> Result<(), CliError> {
     }
 }
 
+/// What `setup wsl` does on the Windows host.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    NoDistros,
+    /// Ambiguous: list the distros and ask for one.
+    Choose(Vec<String>),
+    Configure(String),
+    Unknown(String, Vec<String>),
+}
+
+fn plan_windows(distros: Vec<String>, arg: Option<&str>) -> Plan {
+    match arg {
+        _ if distros.is_empty() => Plan::NoDistros,
+        None => Plan::Choose(distros),
+        Some(d) => match distros.iter().find(|x| x.eq_ignore_ascii_case(d)) {
+            Some(found) => Plan::Configure(found.clone()),
+            None => Plan::Unknown(d.to_string(), distros),
+        },
+    }
+}
+
 fn run_wsl(args: WslArgs) -> Result<(), CliError> {
+    if cfg!(target_os = "windows") {
+        return run_wsl_from_windows(args);
+    }
+    if let (Some(want), Ok(current)) = (args.distro.as_deref(), std::env::var("WSL_DISTRO_NAME")) {
+        if !want.eq_ignore_ascii_case(&current) {
+            return Err(CliError::Config(format!(
+                "this shell runs inside '{current}'; to configure '{want}' run `crypt-env setup wsl {want}` from Windows or inside that distro"
+            )));
+        }
+    }
+    if let Ok(current) = std::env::var("WSL_DISTRO_NAME") {
+        println!("crypt-env: detected WSL distribution '{current}'");
+    }
+    run_local(args)
+}
+
+fn run_wsl_from_windows(args: WslArgs) -> Result<(), CliError> {
+    use crypt_env_lib::wsl::client_setup as cs;
+    let runner = WslExe;
+    let distros = match cs::list_distros(&runner) {
+        Ok(d) => d,
+        Err(cs::WslError::NotAvailable) => Vec::new(),
+        Err(e) => return Err(CliError::Config(e.to_string())),
+    };
+    match plan_windows(distros, args.distro.as_deref()) {
+        Plan::NoDistros => {
+            println!("No WSL distributions found on this system.");
+            Ok(())
+        }
+        Plan::Choose(list) => {
+            println!("WSL distributions found:");
+            for d in &list {
+                println!("  {d}");
+            }
+            println!("Run 'crypt-env setup wsl <distro>' to configure a specific one.");
+            Ok(())
+        }
+        Plan::Unknown(d, list) => Err(CliError::Config(format!(
+            "unknown WSL distribution '{d}' (installed: {})",
+            list.join(", ")
+        ))),
+        Plan::Configure(distro) => {
+            let exe = std::env::current_exe()?;
+            let dir = exe.parent().map(PathBuf::from).unwrap_or_default();
+            let helper = dir.join(cs::HELPER_RESOURCE);
+            if !helper.is_file() {
+                return Err(CliError::Config(format!(
+                    "the WSL setup helper was not found at {} — reinstall crypt-env or use Settings → WSL in the app",
+                    helper.display()
+                )));
+            }
+            let helper = helper.to_string_lossy().into_owned();
+            let report = if args.remove {
+                cs::remove_client(&runner, &distro, &helper)
+            } else {
+                let appdata = std::env::var("APPDATA")
+                    .map_err(|_| CliError::Config("APPDATA is not set".to_string()))?;
+                cs::configure_client(&runner, &distro, &helper, &appdata, exe.to_str())
+            }
+            .map_err(|e| CliError::Config(e.to_string()))?;
+            println!("crypt-env: configured distribution '{distro}'");
+            if args.remove {
+                print_remove(&report);
+            } else {
+                print_apply(&report);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Runs `wsl.exe` with an argument vector (never a shell string).
+struct WslExe;
+
+impl crypt_env_lib::wsl::client_setup::WslRunner for WslExe {
+    fn wsl(&self, args: &[String]) -> std::io::Result<crypt_env_lib::wsl::client_setup::RunOutput> {
+        let out = std::process::Command::new("wsl.exe").args(args).env("WSL_UTF8", "1").output()?;
+        Ok(crypt_env_lib::wsl::client_setup::RunOutput {
+            success: out.status.success(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+}
+
+fn run_local(args: WslArgs) -> Result<(), CliError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| {
@@ -134,5 +244,20 @@ fn print_remove(report: &ActionReport) {
     }
     if report.env_file_changed {
         println!("crypt-env: deleted {}", report.env_file);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_windows_cases() {
+        let two = vec!["Ubuntu".to_string(), "Debian".to_string()];
+        assert_eq!(plan_windows(vec![], None), Plan::NoDistros);
+        assert_eq!(plan_windows(vec![], Some("Ubuntu")), Plan::NoDistros);
+        assert_eq!(plan_windows(two.clone(), None), Plan::Choose(two.clone()));
+        assert_eq!(plan_windows(two.clone(), Some("ubuntu")), Plan::Configure("Ubuntu".into()));
+        assert_eq!(plan_windows(two.clone(), Some("Arch")), Plan::Unknown("Arch".into(), two));
     }
 }

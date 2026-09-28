@@ -112,7 +112,8 @@ Hierarchical organization for environment variables. Projects contain multiple t
 ### 2. CLI & Interactive TUI (`crypt-env`, `crypt-env tui`)
 Terminal user interface for vault management without opening the GUI.
 - Source: `src-tauri/src/bin/crypt-env/commands/tui.rs` (ratatui 0.29 + crossterm 0.28)
-- Keybindings: `↑`/`↓`/`j`/`k` (navigate), `/` (fuzzy search), `Enter` (detail), `v` (reveal), `c` (copy), `d` (delete), `?` (help), `q` (quit).
+- Keybindings: `←`/`→`/`Tab` (pane), `↑`/`↓`/`j`/`k` (navigate), `/` (filter), `v` (password-gated reveal), `i`/`c`/`f`/`s`/`S` (init/config/fill/sync/sync --global), `d` (doctor), `?` (help), `q` (quit).
+- Project manifest: `.crypt-env.yaml` at the project root (`src-tauri/src/project/manifest.rs`, shared by CLI and GUI); `projects.root_path` anchors relative environment paths.
 - Client config: `CRYPTENV_API_URL`, `CRYPTENV_CERT_PATH`, `CRYPTENV_TOKEN_PATH` env vars (endpoint / TLS anchor / token path) resolved in `src-tauri/src/bin/crypt-env/client.rs`; `crypt-env setup wsl` (`commands/setup.rs`) persists them into the shell. See [`docs/cli.md`](docs/cli.md) and the WSL ↔ Windows topology guide [`docs/wsl-windows.md`](docs/wsl-windows.md).
 
 ### 3. Internet Relay Sharing

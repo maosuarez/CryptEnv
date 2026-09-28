@@ -522,6 +522,186 @@ function InjectConfirmModal({
   );
 }
 
+// ─── InjectTargetModal ──────────────────────────────────────────────────────────
+// Environments with several configured paths ask where to inject first; the
+// chosen subset (or `null` for all) is passed on to the preview/inject calls.
+
+export function InjectTargetModal({
+  paths,
+  onCancel,
+  onConfirm,
+}: {
+  paths:     string[];
+  onCancel:  () => void;
+  onConfirm: (targets: string[] | null) => void;
+}) {
+  const { t } = useTranslation();
+  const [selected, setSelected] = useState<Set<string>>(new Set(paths));
+  const all = selected.size === paths.length;
+
+  const toggle = (p: string) => setSelected((cur) => {
+    const next = new Set(cur);
+    if (next.has(p)) next.delete(p); else next.add(p);
+    return next;
+  });
+
+  return (
+    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+      <div className="w-full max-w-sm bg-surface border border-accent-d rounded-[4px] p-4">
+        <div className="text-[14px] font-bold text-tx mb-3">{t('projects.injectTarget.title')}</div>
+        <label className="flex items-center gap-2 text-[12px] text-tx font-ui mb-2 cursor-pointer">
+          <input type="checkbox" checked={all} onChange={() => setSelected(all ? new Set() : new Set(paths))} className="accent-accent" />
+          {t('projects.injectTarget.all')}
+        </label>
+        <ul className="mb-3 max-h-40 overflow-y-auto space-y-1 pl-5">
+          {paths.map((p) => (
+            <li key={p}>
+              <label className="flex items-center gap-2 text-[11px] font-mono text-tx cursor-pointer">
+                <input type="checkbox" checked={selected.has(p)} onChange={() => toggle(p)} className="accent-accent" />
+                <span className="truncate">{p}</span>
+              </label>
+            </li>
+          ))}
+        </ul>
+        <div className="flex gap-2">
+          <button onClick={onCancel}
+            className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
+            {t('common.cancel')}
+          </button>
+          <button
+            onClick={() => onConfirm(all ? null : paths.filter((p) => selected.has(p)))}
+            disabled={selected.size === 0}
+            className="flex-1 py-2 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
+          >
+            {t('projects.injectTarget.inject')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ManifestExistsModal ────────────────────────────────────────────────────────
+// The chosen root already holds a `.crypt-env.yaml`: overwrite it from this
+// project, or keep it and just link (the root is saved either way).
+
+function ManifestExistsModal({
+  onLink,
+  onOverwrite,
+}: {
+  onLink:      () => void;
+  onOverwrite: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [writing, setWriting] = useState(false);
+  return (
+    <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+      <div className="w-full max-w-sm bg-surface border border-accent-d rounded-[4px] p-4">
+        <div className="text-[14px] font-bold text-tx mb-2">{t('projects.root.manifestExists.title')}</div>
+        <div className="text-[12px] text-tx3 mb-3 leading-[1.6]">{t('projects.root.manifestExists.body')}</div>
+        <div className="flex gap-2">
+          <button onClick={onLink}
+            className="flex-1 py-2 bg-transparent border border-bd2 rounded-[3px] text-tx2 text-[12px] cursor-pointer font-ui">
+            {t('projects.root.manifestExists.link')}
+          </button>
+          <button
+            onClick={async () => { setWriting(true); try { await onOverwrite(); } finally { setWriting(false); } }}
+            disabled={writing}
+            className="flex-1 py-2 bg-accent border-none rounded-[3px] text-[#020504] text-[12px] font-bold cursor-pointer font-ui disabled:opacity-40"
+          >
+            {t('projects.root.manifestExists.overwrite')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── RootDirField ───────────────────────────────────────────────────────────────
+// Project root directory input + folder picker (and a WSL-seeded picker on
+// Windows). `.crypt-env.yaml` is written into this directory.
+
+function RootDirField({
+  value,
+  error,
+  onChange,
+  wslDistros,
+}: {
+  value:      string;
+  error:      string | null;
+  onChange:   (v: string) => void;
+  wslDistros: string[];
+}) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+
+  const pick = async (distro?: string) => {
+    setBusy(true);
+    try {
+      const startDir = distro ? await invoke<string>('wsl_distro_home', { distro }) : (value || undefined);
+      const picked = await invoke<string | null>('project_pick_root_dir', { startDir });
+      if (picked) onChange(picked);
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
+        {t('projects.root.label')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.root.hint')}</span>
+      </div>
+      <div className="flex gap-1.5">
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={t('projects.root.placeholder')}
+          className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[6px] outline-none focus:border-accent-d transition-colors"
+        />
+        <button
+          onClick={() => pick()}
+          disabled={busy}
+          title={t('projects.root.browse')}
+          className="px-2.5 py-[6px] rounded-[3px] text-[10px] font-bold font-ui text-tx2 border border-bd2 hover:text-tx transition-colors disabled:opacity-40"
+        >
+          <Icon name="external" size={12} />
+        </button>
+        {wslDistros.map((d) => (
+          <button
+            key={d}
+            onClick={() => pick(d)}
+            disabled={busy}
+            title={t('projects.root.browseWsl')}
+            className="px-2 py-[6px] rounded-[3px] text-[10px] font-bold font-mono text-tx2 border border-bd2 hover:text-tx transition-colors disabled:opacity-40"
+          >
+            {d}
+          </button>
+        ))}
+      </div>
+      {error && <div className="text-[10px] font-mono text-danger mt-1">{error}</div>}
+    </div>
+  );
+}
+
+/** `path` relative to `root` (with `/`) when inside it; otherwise unchanged. */
+export function relativeToRoot(root: string | undefined, path: string): string {
+  if (!root) return path;
+  const norm = (s: string) => s.replace(/\\/g, '/');
+  const r = norm(root).replace(/\/+$/, '');
+  const p = norm(path);
+  if (p.length > r.length + 1 && p.slice(0, r.length + 1).toLowerCase() === (r + '/').toLowerCase()) {
+    return p.slice(r.length + 1);
+  }
+  return path;
+}
+
+function baseName(p: string): string {
+  const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] ?? '';
+}
+
 // ─── ConfirmEnvTypeChangeModal ──────────────────────────────────────────────────
 // Changing a saved environment's type/preset changes its inject target file,
 // so the switch only takes effect after an explicit confirmation.
@@ -1358,29 +1538,49 @@ export function ProjectManager() {
   // holds the modal's display data, while the resolve/reject pair for the
   // promise `runInject` returned to its caller lives in a ref so it survives
   // re-renders without becoming React state itself.
-  const [injectConfirm, setInjectConfirm] = useState<{ id: number; foreign: string[] } | null>(null);
+  const [injectConfirm, setInjectConfirm] = useState<{ id: number; foreign: string[]; targets?: string[] } | null>(null);
+  // Multi-path environments pick their inject target(s) first.
+  const [injectTargets, setInjectTargets] = useState<{ paths: string[] } | null>(null);
+  const pendingTargetsRef = useRef<{ resolve: (t: string[] | null) => void; reject: (e: unknown) => void } | null>(null);
   const pendingInjectRef = useRef<{ resolve: (r: InjectResult) => void; reject: (e: unknown) => void } | null>(null);
 
   // Single entry point for both the project-list quick-inject button and the
   // environment editor's INJECT button: previews first, and only prompts for
   // confirmation when the preview reports a path crypt-env doesn't manage.
   const runInject = async (id: number): Promise<InjectResult> => {
-    const preview = await previewInject(id);
-    if (preview.foreign.length === 0) return inject(id, false);
+    const env = projects.flatMap((p) => p.environments).find((e) => e.id === id);
+    let targets: string[] | undefined;
+    if (env && env.paths.length > 1) {
+      const picked = await new Promise<string[] | null>((resolve, reject) => {
+        pendingTargetsRef.current = { resolve, reject };
+        setInjectTargets({ paths: env.paths });
+      });
+      targets = picked ?? undefined;
+    }
+    const preview = await previewInject(id, targets);
+    if (preview.foreign.length === 0) return inject(id, false, targets);
     return new Promise<InjectResult>((resolve, reject) => {
       pendingInjectRef.current = { resolve, reject };
-      setInjectConfirm({ id, foreign: preview.foreign });
+      setInjectConfirm({ id, foreign: preview.foreign, targets });
     });
+  };
+
+  const settleInjectTargets = (targets: string[] | null | 'cancel') => {
+    const pending = pendingTargetsRef.current;
+    pendingTargetsRef.current = null;
+    setInjectTargets(null);
+    if (targets === 'cancel') pending?.reject(new Error('cancelled'));
+    else pending?.resolve(targets);
   };
 
   const confirmPendingInject = async () => {
     if (!injectConfirm) return;
-    const { id } = injectConfirm;
+    const { id, targets } = injectConfirm;
     const pending = pendingInjectRef.current;
     pendingInjectRef.current = null;
     setInjectConfirm(null);
     try {
-      const result = await inject(id, true);
+      const result = await inject(id, true, targets);
       pending?.resolve(result);
     } catch (e) {
       pending?.reject(e);
@@ -1412,6 +1612,9 @@ export function ProjectManager() {
   const [projInitialCustom, setProjInitialCustom] = useState(false);
   const [templateVars,    setTemplateVars]    = useState<ReviewVar[]>([]);
   const [projCategories,  setProjCategories]  = useState<string[]>([]);
+  const [projRoot,        setProjRoot]        = useState('');
+  const [rootError,       setRootError]       = useState<string | null>(null);
+  const [manifestPrompt,  setManifestPrompt]  = useState<number | null>(null);
   const [isCreatingProj,  setIsCreatingProj]  = useState(false);
   const [templateModal,   setTemplateModal]   = useState(false);
   const [confirmDelProj,  setConfirmDelProj]  = useState(false);
@@ -1507,6 +1710,8 @@ export function ProjectManager() {
     setProjDescription(p.description ?? '');
     setProjTemplate(p.template as ProjectTemplate);
     setProjCategories(p.categories);
+    setProjRoot(p.rootPath ?? '');
+    setRootError(null);
     setIsCreatingProj(false);
     setConfirmDelProj(false);
     setMode('project');
@@ -1547,6 +1752,8 @@ export function ProjectManager() {
     setProjInitialEnv('');
     setProjInitialCustom(false);
     setProjCategories([]);
+    setProjRoot('');
+    setRootError(null);
     setIsCreatingProj(true);
     setConfirmDelProj(false);
     setTemplateModal(true);
@@ -1593,11 +1800,43 @@ export function ProjectManager() {
     }
   };
 
+  // Inline validation of the root field; `true` when usable.
+  const validateRoot = async (root: string): Promise<boolean> => {
+    if (!root) { setRootError(t('projects.root.required')); return false; }
+    const check = await invoke<{ problem: 'notAbsolute' | 'notFound' | 'notDir' | 'notWritable' | null; hasManifest: boolean }>('project_check_root', { root });
+    if (check.problem) { setRootError(t(`projects.root.problems.${check.problem}`)); return false; }
+    setRootError(null);
+    return true;
+  };
+
+  // Writes `.crypt-env.yaml` into the project root; an existing file opens
+  // the overwrite / link-only prompt instead.
+  const writeManifest = async (projectId: number, overwrite = false) => {
+    try {
+      const path = await invoke<string>('project_write_yaml', { projectId, overwrite });
+      showToast(t('projects.root.yamlWritten', { path }));
+    } catch (e) {
+      if (String(e) === 'manifest exists') setManifestPrompt(projectId);
+      else reportError(e);
+    }
+  };
+
+  const handleRootChange = (v: string) => {
+    setProjRoot(v);
+    setRootError(null);
+    if (isCreatingProj && !projName) {
+      const name = baseName(v);
+      if (name) setProjName(name);
+    }
+  };
+
   const handleCreateProject = async () => {
     if (!isValidProjectName(projName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.projectNameRule') }), 'error'); return; }
     if (templateVarsInvalid || !initialEnvValid) return;
+    const root = projRoot.trim();
     setSaving(true);
     try {
+      if (!(await validateRoot(root))) return;
       await ensureCategories(projCategories);
       const id = await createFromTemplates({
         name:        projName.trim(),
@@ -1605,9 +1844,11 @@ export function ProjectManager() {
         template:    templateString(projTemplateIds),
         categories:  projCategories,
         initialEnvironment: projInitialEnv.trim().toLowerCase() || undefined,
+        rootPath:    root,
         vars:        templateVars.map((v) => ({ key: v.key, value: v.value })),
       });
       await refreshVaultItems();
+      await writeManifest(id);
       const fresh = useProjectStore.getState().projects.find((p) => p.id === id);
       if (fresh) {
         setIsCreatingProj(false);
@@ -1628,20 +1869,27 @@ export function ProjectManager() {
     projName.trim() !== selectedProject.name ||
     projDescription.trim() !== (selectedProject.description ?? '') ||
     projCategories.length !== selectedProject.categories.length ||
-    projCategories.some((c) => !selectedProject.categories.includes(c))
+    projCategories.some((c) => !selectedProject.categories.includes(c)) ||
+    projRoot.trim() !== (selectedProject.rootPath ?? '')
   );
 
   const handleSaveProject = async () => {
     if (!isValidProjectName(projName.trim())) { showToast(t('projects.invalidName', { rule: t('projects.projectNameRule') }), 'error'); return; }
+    const root = projRoot.trim();
+    const rootChanged = root !== (selectedProject?.rootPath ?? '');
     setSaving(true);
     try {
+      // Clearing the root is allowed; a new root must be usable.
+      if (rootChanged && root && !(await validateRoot(root))) return;
       const id = await saveProject({
         id:          selectedProject?.id,
         name:        projName.trim(),
         description: projDescription || undefined,
         template:    projTemplate,
         categories:  projCategories,
+        rootPath:    root,
       });
+      if (rootChanged && root) await writeManifest(id);
       const fresh = useProjectStore.getState().projects.find((p) => p.id === id);
       if (fresh) {
         setIsCreatingProj(false);
@@ -1732,7 +1980,7 @@ export function ProjectManager() {
   // browse button and the WSL-seeded one (plan §3.4).
   const applyPickedEnvPath = (picked: string | null) => {
     if (!picked) return;
-    const trimmed = picked.trim();
+    const trimmed = relativeToRoot(selectedProject?.rootPath, picked.trim());
     if (!envPaths.includes(trimmed)) setEnvPaths((prev) => [...prev, trimmed]);
     if (!projName && isCreatingProj) {
       const folder = folderNameFromPath(trimmed);
@@ -2103,6 +2351,7 @@ export function ProjectManager() {
                 className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
               />
             </div>
+            <RootDirField value={projRoot} error={rootError} onChange={handleRootChange} wslDistros={isWindows ? wslDistros : []} />
             <div className="mb-3">
               <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.categories')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.categoriesHint')}</span></div>
               <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
@@ -2208,6 +2457,7 @@ export function ProjectManager() {
                     className="w-full bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[7px] outline-none focus:border-accent-d transition-colors"
                   />
                 </div>
+                <RootDirField value={projRoot} error={rootError} onChange={handleRootChange} wslDistros={isWindows ? wslDistros : []} />
                 <div className="mb-3">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">{t('projects.categories')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.categoriesHint')}</span></div>
                   <TagInput selected={projCategories} categories={cats} onChange={setProjCategories} onCreate={handleCreateCategory} />
@@ -2286,11 +2536,18 @@ export function ProjectManager() {
                 {/* Paths */}
                 <div className="mb-3">
                   <div className="text-[10px] font-semibold text-tx3 font-mono tracking-[0.06em] mb-1">
-                    {t('projects.paths')} <span className="text-tx3 normal-case tracking-normal font-normal">{t('projects.pathsHint')}</span>
+                    {t('projects.paths')} <span className="text-tx3 normal-case tracking-normal font-normal">
+                      {selectedProject?.rootPath ? t('projects.pathsRelativeHint', { root: selectedProject.rootPath }) : t('projects.pathsHint')}
+                    </span>
                   </div>
                   {envPaths.map((p, idx) => (
                     <div key={idx} className="flex items-center gap-1.5 mb-1">
-                      <span className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] truncate">{p}</span>
+                      <input
+                        value={p}
+                        onChange={(e) => { const v = e.target.value; setEnvPaths((prev) => prev.map((x, i) => (i === idx ? v : x))); }}
+                        onBlur={() => setEnvPaths((prev) => prev.map((x) => x.trim()).filter((x, i, a) => x && a.indexOf(x) === i))}
+                        className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] outline-none focus:border-accent-d transition-colors"
+                      />
                       <button
                         onClick={() => removePath(idx)}
                         className="text-tx3 hover:text-danger transition-colors shrink-0"
@@ -2304,7 +2561,7 @@ export function ProjectManager() {
                       value={newPath}
                       onChange={(e) => setNewPath(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addPath(); } }}
-                      placeholder="C:\projects\myapp\.env.production"
+                      placeholder={selectedProject?.rootPath ? 'apps/api/.env.production' : 'C:\\projects\\myapp\\.env.production'}
                       className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[6px] outline-none focus:border-accent-d transition-colors"
                     />
                     <button
@@ -2523,6 +2780,25 @@ export function ProjectManager() {
           item={itemsById.get(detailVar.itemId)!}
           onClose={() => setDetailVar(null)}
           onToggleGlobal={(global) => handleToggleVarGlobal(detailVar, global)}
+        />
+      )}
+
+      {injectTargets && (
+        <InjectTargetModal
+          paths={injectTargets.paths}
+          onCancel={() => settleInjectTargets('cancel')}
+          onConfirm={(targets) => settleInjectTargets(targets)}
+        />
+      )}
+
+      {manifestPrompt !== null && (
+        <ManifestExistsModal
+          onLink={() => setManifestPrompt(null)}
+          onOverwrite={async () => {
+            const id = manifestPrompt;
+            setManifestPrompt(null);
+            await writeManifest(id, true);
+          }}
         />
       )}
 

@@ -33,10 +33,67 @@ struct RateLimitState {
     window_start: Instant,
 }
 
+/// Live CLI sessions issued by `POST /unlock` (cli-tui-parity design D4).
+/// Each session slides: every successful use pushes its expiry a full `ttl`
+/// ahead. Several coexist (one per terminal), bounded by [`MAX_SESSIONS`].
+#[derive(Default)]
+pub(crate) struct SessionStore {
+    entries: Vec<Session>,
+}
+
+struct Session {
+    token: String,
+    expires: Instant,
+    ttl: Duration,
+    last_used: Instant,
+}
+
+/// Upper bound on concurrently live sessions; the least recently used one
+/// is evicted beyond it.
+const MAX_SESSIONS: usize = 64;
+
+/// Session lifetime for an `auto_lock_timeout` setting in minutes. `0` means
+/// "never auto-lock" in the GUI; a password session must still lapse, so it
+/// falls back to the 5-minute default.
+fn session_ttl(minutes: u64) -> Duration {
+    Duration::from_secs(if minutes == 0 { 5 } else { minutes } * 60)
+}
+
+impl SessionStore {
+    fn insert(&mut self, token: String, ttl: Duration, now: Instant) {
+        self.entries.retain(|e| e.expires > now);
+        if self.entries.len() >= MAX_SESSIONS {
+            if let Some(i) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].last_used) {
+                self.entries.swap_remove(i);
+            }
+        }
+        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now });
+    }
+
+    /// `true` when `provided` is a live session; renews it. Every entry is
+    /// compared in constant time (no early exit on a match).
+    fn touch(&mut self, provided: &str, now: Instant) -> bool {
+        let mut hit: Option<usize> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if bool::from(e.token.as_bytes().ct_eq(provided.as_bytes())) && now < e.expires {
+                hit = Some(i);
+            }
+        }
+        match hit {
+            Some(i) => {
+                let e = &mut self.entries[i];
+                e.expires = now + e.ttl;
+                e.last_used = now;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 pub struct ApiState {
     vault: SharedState,
-    session_token: Arc<Mutex<Option<String>>>,
-    token_expires: Arc<Mutex<Option<Instant>>>,
+    sessions: Mutex<SessionStore>,
     unlock_rate: Mutex<RateLimitState>,
     share: Arc<ShareState>,
 }
@@ -50,8 +107,7 @@ impl ApiState {
     pub(crate) fn new(vault: SharedState) -> Self {
         ApiState {
             vault,
-            session_token: Arc::new(Mutex::new(None)),
-            token_expires: Arc::new(Mutex::new(None)),
+            sessions: Mutex::new(SessionStore::default()),
             unlock_rate: Mutex::new(RateLimitState {
                 attempts: 0,
                 window_start: Instant::now(),
@@ -180,17 +236,10 @@ async fn verify_token(headers: &HeaderMap, state: &ApiState) -> Result<(), Statu
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // --- Verificar session token (con expiración) ---
-    {
-        let stored = state.session_token.lock().await;
-        let expires = state.token_expires.lock().await;
-
-        if let (Some(s), Some(exp)) = (stored.as_deref(), *expires) {
-            if Instant::now() < exp && bool::from(s.as_bytes().ct_eq(provided.as_bytes())) {
-                let vault = state.vault.lock().await;
-                return if vault.key.is_some() { Ok(()) } else { Err(StatusCode::FORBIDDEN) };
-            }
-        }
+    // --- Verificar session token (expiración deslizante) ---
+    if state.sessions.lock().await.touch(provided, Instant::now()) {
+        let vault = state.vault.lock().await;
+        return if vault.key.is_some() { Ok(()) } else { Err(StatusCode::FORBIDDEN) };
     }
 
     // --- Fallback: MCP token estático (sin expiración) ---
@@ -606,10 +655,11 @@ async fn handle_unlock(
     rand::thread_rng().fill_bytes(&mut token_bytes);
     let session_token: String = token_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
-    let expires = Instant::now() + Duration::from_secs(minutes * 60);
-
-    *state.session_token.lock().await = Some(session_token.clone());
-    *state.token_expires.lock().await = Some(expires);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_token.clone(), session_ttl(minutes), Instant::now());
 
     (StatusCode::OK, Json(UnlockResponse { token: session_token })).into_response()
 }
@@ -2512,7 +2562,7 @@ async fn handle_inject_environment(
         }
     };
 
-    match project::inject_environment(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite).await {
+    match project::inject_environment(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite, None).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) if e == "environment not found" => {
             err_json(StatusCode::NOT_FOUND, &e, "NOT_FOUND").into_response()

@@ -1,6 +1,12 @@
+//! `crypt-env tui` — keyboard-driven terminal UI (ratatui) mirroring the CLI
+//! project workflow: browse projects → environments → variables (values
+//! masked), `/` filter, password-gated reveal (`v`), and the workspace
+//! actions `init`, `config`, `fill`, `sync` and `doctor` on the current
+//! directory's `.crypt-env.yaml`.
+
 use clap::Args;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,14 +15,16 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::client::{self, CliError, ItemSummary};
-use crate::commands::scope::{self, ResolvedScope};
+use crate::client::{self, CliError, ItemSummary, Project};
+use crate::commands::{config, doctor, fill, init, scope, search, sync};
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
 
@@ -28,183 +36,179 @@ const TX: Color = Color::Rgb(220, 220, 225);
 const TX2: Color = Color::Rgb(150, 150, 160);
 const TX3: Color = Color::Rgb(90, 90, 100);
 const DANGER: Color = Color::Rgb(240, 80, 80);
+const WARN: Color = Color::Rgb(255, 200, 60);
 
-fn type_color(t: &str) -> Color {
-    match t {
-        "secret" => Color::Rgb(100, 160, 255),
-        "credential" => Color::Rgb(255, 200, 60),
-        "note" => Color::Rgb(160, 160, 170),
-        "link" => Color::Rgb(80, 200, 220),
-        "command" => Color::Rgb(200, 100, 255),
-        _ => TX2,
-    }
+#[derive(Args)]
+pub struct TuiArgs {}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Projects,
+    Environments,
+    Variables,
 }
 
-// ─── App state ────────────────────────────────────────────────────────────────
+/// What a password prompt unlocks once verified.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gated {
+    Login,
+    Reveal,
+    Fill,
+    Sync { global: bool },
+}
 
-#[derive(PartialEq)]
-enum Screen {
-    Unlock,
-    Main,
-    Detail,
+enum Modal {
+    None,
+    Password { purpose: Gated, input: String, error: Option<String> },
+    Input { title: &'static str, value: String },
+    Reveal { key: String, value: Zeroizing<String> },
+    Report { title: String, lines: Vec<(String, Color)> },
     Help,
-    Confirm,
+}
+
+/// One row of the variables pane.
+struct VarRow {
+    key: String,
+    item_id: i64,
+    detail: String,
 }
 
 struct App {
-    screen: Screen,
-    // Unlock screen
-    password: String,
-    pw_error: Option<String>,
-    // Main screen
-    items: Vec<ItemSummary>,
-    list_state: ListState,
-    search: String,
-    search_mode: bool,
-    filtered: Vec<usize>,
-    // Detail screen
-    revealed_value: Option<String>,
-    detail_scroll: u16,
-    // Confirm screen
-    confirm_msg: String,
-    confirm_action: ConfirmAction,
-    // Status
-    status: Option<(String, bool)>, // (msg, is_error)
-    should_quit: bool,
-    token: Option<String>,
-    // Project/environment scope (resolved once authenticated — see
-    // `resolve_and_load`)
-    project_flag: Option<String>,
-    env_flag: Option<String>,
-    scope: Option<ResolvedScope>,
-}
-
-#[derive(Clone)]
-enum ConfirmAction {
-    DeleteItem(i64),
-    None,
+    projects: Vec<Project>,
+    globals: Vec<ItemSummary>,
+    pane: Pane,
+    proj_state: ListState,
+    env_state: ListState,
+    var_state: ListState,
+    filter: String,
+    filtering: bool,
+    modal: Modal,
+    status: Option<(String, bool)>,
+    quit: bool,
+    workspace_dir: PathBuf,
 }
 
 impl App {
-    fn new(project_flag: Option<String>, env_flag: Option<String>) -> Self {
-        let token = client::read_token();
-        let screen = if token.is_some() { Screen::Main } else { Screen::Unlock };
+    fn new(workspace_dir: PathBuf) -> Self {
         App {
-            screen,
-            password: String::new(),
-            pw_error: None,
-            items: Vec::new(),
-            list_state: ListState::default(),
-            search: String::new(),
-            search_mode: false,
-            filtered: Vec::new(),
-            revealed_value: None,
-            detail_scroll: 0,
-            confirm_msg: String::new(),
-            confirm_action: ConfirmAction::None,
+            projects: Vec::new(),
+            globals: Vec::new(),
+            pane: Pane::Projects,
+            proj_state: ListState::default(),
+            env_state: ListState::default(),
+            var_state: ListState::default(),
+            filter: String::new(),
+            filtering: false,
+            modal: Modal::None,
             status: None,
-            should_quit: false,
-            token,
-            project_flag,
-            env_flag,
-            scope: None,
+            quit: false,
+            workspace_dir,
         }
     }
 
-    /// Resolves project/environment scope once (memoized in `self.scope`) —
-    /// called after authentication succeeds, since resolution may issue
-    /// authenticated requests (GET/POST /projects).
-    fn resolve_scope(&mut self) -> Result<(), CliError> {
-        if self.scope.is_none() {
-            self.scope = Some(scope::resolve(self.project_flag.as_deref(), self.env_flag.as_deref(), false)?);
+    fn project(&self) -> Option<&Project> {
+        self.proj_state.selected().and_then(|i| self.projects.get(i))
+    }
+
+    /// Environments pane entries: the project's environments plus a trailing
+    /// "global" pseudo-entry listing reusable global items.
+    fn env_labels(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .project()
+            .map(|p| {
+                p.environments
+                    .iter()
+                    .map(|e| {
+                        let n = if e.name.is_empty() { "(root .env)".to_string() } else { e.name.clone() };
+                        if e.is_default { format!("{n} *") } else { n }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.push("★ global items".into());
+        v
+    }
+
+    fn global_selected(&self) -> bool {
+        let n = self.project().map(|p| p.environments.len()).unwrap_or(0);
+        self.env_state.selected() == Some(n)
+    }
+
+    fn rows(&self) -> Vec<VarRow> {
+        let m = search::Matcher::new(if self.filter.is_empty() { None } else { Some(&self.filter) });
+        if self.global_selected() {
+            return self
+                .globals
+                .iter()
+                .filter_map(|g| {
+                    let key = g.name.clone().or(g.title.clone())?;
+                    m.is_match(&key).then(|| VarRow { key, item_id: g.id, detail: g.item_type.clone() })
+                })
+                .collect();
         }
+        let Some(env) = self.project().and_then(|p| self.env_state.selected().and_then(|i| p.environments.get(i))) else {
+            return Vec::new();
+        };
+        env.vars
+            .iter()
+            .filter(|v| m.is_match(&v.key))
+            .map(|v| VarRow { key: v.key.clone(), item_id: v.item_id, detail: format!("item #{}", v.item_id) })
+            .collect()
+    }
+
+    fn reload(&mut self) -> Result<(), CliError> {
+        let selected = self.project().map(|p| p.id);
+        self.projects = client::fetch_projects()?;
+        let ws_name = scope::find_config(&self.workspace_dir)
+            .and_then(|p| scope::load_config(&p).ok())
+            .map(|w| w.project.to_lowercase());
+        let idx = selected
+            .and_then(|id| self.projects.iter().position(|p| p.id == id))
+            .or_else(|| ws_name.and_then(|n| self.projects.iter().position(|p| p.name.to_lowercase() == n)))
+            .or(if self.projects.is_empty() { None } else { Some(0) });
+        self.proj_state.select(idx);
+        self.globals = match self.projects.iter().find(|p| !p.environments.is_empty()) {
+            Some(p) => {
+                let env = p.environments.iter().find(|e| e.is_default).unwrap_or(&p.environments[0]);
+                client::list_items(&p.name, &env.name, "only")?
+            }
+            None => Vec::new(),
+        };
+        self.reset_env();
         Ok(())
     }
 
-    /// Loads items for the resolved scope. Panics-free: returns the error
-    /// for the caller to surface as pw_error / status.
-    fn load_items(&mut self) -> Result<Vec<ItemSummary>, CliError> {
-        self.resolve_scope()?;
-        let query = self.scope.as_ref().expect("scope resolved above").to_query_string();
-        client::api_list_items(&query)
+    fn reset_env(&mut self) {
+        let default = self.project().and_then(|p| p.environments.iter().position(|e| e.is_default)).unwrap_or(0);
+        self.env_state.select(Some(default));
+        self.reset_vars();
     }
 
-    /// "project / environment" for display in the UI chrome, before scope is
-    /// resolved (e.g. still on the Unlock screen).
-    fn scope_label(&self) -> String {
-        match &self.scope {
-            Some(s) => format!("{} / {}", s.project, s.environment),
-            None => "—".to_string(),
-        }
+    fn reset_vars(&mut self) {
+        let n = self.rows().len();
+        self.var_state.select(if n == 0 { None } else { Some(0) });
     }
 
-    fn visible_items(&self) -> Vec<&ItemSummary> {
-        if self.filtered.is_empty() && self.search.is_empty() {
-            self.items.iter().collect()
-        } else {
-            self.filtered.iter().filter_map(|i| self.items.get(*i)).collect()
-        }
+    fn report(&mut self, title: impl Into<String>, lines: Vec<(String, Color)>) {
+        self.modal = Modal::Report { title: title.into(), lines };
     }
 
-    fn selected_item(&self) -> Option<&ItemSummary> {
-        let sel = self.list_state.selected()?;
-        let visible = self.visible_items();
-        visible.get(sel).copied()
-    }
-
-    fn apply_search(&mut self) {
-        if self.search.is_empty() {
-            self.filtered.clear();
-            return;
-        }
-        let q = self.search.to_lowercase();
-        self.filtered = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                item.name.as_deref().map(|n| n.to_lowercase().contains(&q)).unwrap_or(false)
-                    || item.title.as_deref().map(|t| t.to_lowercase().contains(&q)).unwrap_or(false)
-                    || item.item_type.to_lowercase().contains(&q)
-                    || item.categories.iter().any(|c| c.to_lowercase().contains(&q))
-            })
-            .map(|(i, _)| i)
-            .collect();
-        // Reset selection if out of bounds
-        let len = self.filtered.len();
-        if len == 0 {
-            self.list_state.select(None);
-        } else if self.list_state.selected().map(|s| s >= len).unwrap_or(true) {
-            self.list_state.select(Some(0));
-        }
-    }
-
-    fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
-        self.status = Some((msg.into(), is_error));
+    fn error(&mut self, e: CliError) {
+        self.report("Error", vec![(e.to_string(), DANGER)]);
     }
 }
 
-// ─── CLI entry point ──────────────────────────────────────────────────────────
+// ─── Entry / loop ─────────────────────────────────────────────────────────────
 
-#[derive(Args)]
-pub struct TuiArgs {
-    /// Project to browse (defaults to crypt-env.json or the cwd folder name)
-    #[arg(long)]
-    pub project: Option<String>,
-
-    /// Environment to browse (defaults to crypt-env.json or the project's default environment)
-    #[arg(long = "env")]
-    pub env: Option<String>,
-}
-
-pub fn run(args: TuiArgs) -> Result<(), CliError> {
-    enable_raw_mode().map_err(|e| CliError::Io(e))?;
+pub fn run(_args: TuiArgs) -> Result<(), CliError> {
+    let cwd = std::env::current_dir()?;
+    enable_raw_mode().map_err(CliError::Io)?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|e| CliError::Io(e))?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| CliError::Api(e.to_string()))?;
+    execute!(stdout, EnterAlternateScreen).map_err(CliError::Io)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(|e| CliError::Api(e.to_string()))?;
 
-    // Ensure terminal is restored even on panic
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -212,306 +216,299 @@ pub fn run(args: TuiArgs) -> Result<(), CliError> {
         default_hook(info);
     }));
 
-    let mut app = App::new(args.project, args.env);
-
-    // Try to resolve scope and load items if already authenticated
-    if app.screen == Screen::Main {
-        match app.load_items() {
-            Ok(items) => {
-                let len = items.len();
-                app.items = items;
-                if len > 0 {
-                    app.list_state.select(Some(0));
-                }
-            }
-            Err(_) => {
-                // Token may be stale, or scope resolution failed — fall
-                // back to unlock rather than showing a broken item list.
-                client::clear_token();
-                app.token = None;
-                app.scope = None;
-                app.screen = Screen::Unlock;
-            }
-        }
+    let mut app = App::new(cwd);
+    if !matches!(client::session_alive(), Ok(true)) || app.reload().is_err() {
+        app.modal = Modal::Password { purpose: Gated::Login, input: String::new(), error: None };
     }
-
     let result = run_loop(&mut terminal, &mut app);
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
-
     result
 }
 
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<(), CliError> {
-    loop {
+fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<(), CliError> {
+    while !app.quit {
         terminal.draw(|f| render(f, app)).map_err(|e| CliError::Api(e.to_string()))?;
-
-        if event::poll(Duration::from_millis(80)).map_err(|e| CliError::Io(e))? {
+        if event::poll(Duration::from_millis(100)).map_err(CliError::Io)? {
             if let Ok(Event::Key(key)) = event::read() {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+                if key.kind == KeyEventKind::Press {
+                    handle_key(app, key.code);
                 }
-                handle_key(app, key.code, key.modifiers);
             }
-        }
-
-        if app.should_quit {
-            break;
         }
     }
     Ok(())
 }
 
-// ─── Input handling ───────────────────────────────────────────────────────────
+// ─── Input ────────────────────────────────────────────────────────────────────
 
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-    match app.screen {
-        Screen::Unlock => handle_unlock(app, code),
-        Screen::Main => handle_main(app, code, mods),
-        Screen::Detail => handle_detail(app, code),
-        Screen::Help => {
-            app.screen = Screen::Main;
-        }
-        Screen::Confirm => handle_confirm(app, code),
-    }
-}
-
-fn handle_unlock(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Char(c) => {
-            app.password.push(c);
-            app.pw_error = None;
-        }
-        KeyCode::Backspace => {
-            app.password.pop();
-        }
-        KeyCode::Enter => {
-            let pw = app.password.clone();
-            match client::api_unlock(&pw) {
-                Ok(token) => {
-                    client::save_token(&token);
-                    app.token = Some(token);
-                    app.password.clear();
-                    app.pw_error = None;
-                    // Resolve project/environment scope and load its items
-                    match app.load_items() {
-                        Ok(items) => {
-                            let len = items.len();
-                            app.items = items;
-                            if len > 0 {
-                                app.list_state.select(Some(0));
-                            }
-                            app.screen = Screen::Main;
-                        }
-                        Err(e) => {
-                            app.pw_error = Some(e.to_string());
-                        }
-                    }
+fn handle_key(app: &mut App, code: KeyCode) {
+    match &mut app.modal {
+        Modal::None => {}
+        Modal::Password { input, purpose, .. } => {
+            match code {
+                KeyCode::Char(c) => input.push(c),
+                KeyCode::Backspace => {
+                    input.pop();
                 }
-                Err(e) => {
-                    app.pw_error = Some(e.to_string());
-                    app.password.clear();
+                KeyCode::Esc if *purpose == Gated::Login => app.quit = true,
+                KeyCode::Esc => {
+                    input.zeroize();
+                    app.modal = Modal::None;
                 }
+                KeyCode::Enter => {
+                    let purpose = *purpose;
+                    let pw = Zeroizing::new(std::mem::take(input));
+                    submit_password(app, purpose, &pw);
+                }
+                _ => {}
             }
+            return;
         }
-        KeyCode::Esc => {
-            app.should_quit = true;
+        Modal::Input { value, .. } => {
+            match code {
+                KeyCode::Char(c) => value.push(c),
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Esc => app.modal = Modal::None,
+                KeyCode::Enter => {
+                    let name = std::mem::take(value);
+                    app.modal = Modal::None;
+                    run_init(app, &name);
+                }
+                _ => {}
+            }
+            return;
         }
-        _ => {}
+        // Reveal / report / help: any key dismisses (the revealed value is
+        // zeroized on drop).
+        _ => {
+            app.modal = Modal::None;
+            return;
+        }
     }
-}
 
-fn handle_main(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
-    if app.search_mode {
+    if app.filtering {
         match code {
-            KeyCode::Esc => {
-                app.search_mode = false;
-                app.search.clear();
-                app.filtered.clear();
-                if !app.items.is_empty() {
-                    app.list_state.select(Some(0));
-                }
-            }
+            KeyCode::Char(c) => app.filter.push(c),
             KeyCode::Backspace => {
-                app.search.pop();
-                app.apply_search();
+                app.filter.pop();
             }
-            KeyCode::Char(c) => {
-                app.search.push(c);
-                app.apply_search();
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.filtering = false;
             }
-            KeyCode::Enter | KeyCode::Down => {
-                app.search_mode = false;
-                let len = app.visible_items().len();
-                if len > 0 && app.list_state.selected().is_none() {
-                    app.list_state.select(Some(0));
-                }
-            }
+            KeyCode::Enter => app.filtering = false,
             _ => {}
         }
+        app.reset_vars();
         return;
     }
 
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('?') => app.modal = Modal::Help,
         KeyCode::Char('/') => {
-            app.search_mode = true;
-            app.search.clear();
+            app.pane = Pane::Variables;
+            app.filtering = true;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let len = app.visible_items().len();
-            if len > 0 {
-                let next = match app.list_state.selected() {
-                    Some(i) => (i + 1).min(len - 1),
-                    None => 0,
-                };
-                app.list_state.select(Some(next));
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            app.pane = match app.pane {
+                Pane::Projects => Pane::Environments,
+                _ => Pane::Variables,
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            let len = app.visible_items().len();
-            if len > 0 {
-                let prev = match app.list_state.selected() {
-                    Some(i) => i.saturating_sub(1),
-                    None => 0,
-                };
-                app.list_state.select(Some(prev));
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            app.pane = match app.pane {
+                Pane::Variables => Pane::Environments,
+                _ => Pane::Projects,
             }
         }
+        KeyCode::Down | KeyCode::Char('j') => step(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => step(app, -1),
         KeyCode::Enter => {
-            if app.selected_item().is_some() {
-                app.revealed_value = None;
-                app.detail_scroll = 0;
-                app.screen = Screen::Detail;
+            app.pane = match app.pane {
+                Pane::Projects => Pane::Environments,
+                _ => Pane::Variables,
+            }
+        }
+        KeyCode::Char('v') => {
+            if app.var_state.selected().is_some() && !app.rows().is_empty() {
+                gate(app, Gated::Reveal);
             }
         }
         KeyCode::Char('r') => {
-            // Refresh (within the already-resolved scope)
-            match app.load_items() {
-                Ok(items) => {
-                    let len = items.len();
-                    app.items = items;
-                    app.apply_search();
-                    if len > 0 && app.list_state.selected().is_none() {
-                        app.list_state.select(Some(0));
-                    }
-                    app.set_status("Refreshed", false);
-                }
-                Err(e) => app.set_status(e.to_string(), true),
+            if let Err(e) = app.reload() {
+                app.error(e);
+            } else {
+                app.status = Some(("Reloaded".into(), false));
             }
         }
+        KeyCode::Char('i') => {
+            let default = app.workspace_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            app.modal = Modal::Input { title: " init — project name (Enter to confirm) ", value: default };
+        }
+        KeyCode::Char('c') => run_config(app),
+        KeyCode::Char('f') => gate(app, Gated::Fill),
+        KeyCode::Char('s') => gate(app, Gated::Sync { global: false }),
+        KeyCode::Char('S') => gate(app, Gated::Sync { global: true }),
         KeyCode::Char('d') => {
-            if let Some(item) = app.selected_item() {
-                let id = item.id;
-                let name = item.name.clone().or(item.title.clone()).unwrap_or_else(|| format!("#{id}"));
-                app.confirm_msg = format!("Delete '{name}'?");
-                app.confirm_action = ConfirmAction::DeleteItem(id);
-                app.screen = Screen::Confirm;
-            }
+            let lines = doctor::execute()
+                .into_iter()
+                .map(|c| {
+                    let color = match c.level {
+                        doctor::Level::Ok => ACCENT,
+                        doctor::Level::Warn => WARN,
+                        doctor::Level::Fail => DANGER,
+                    };
+                    (format!("{:<18} {}", c.name, c.detail), color)
+                })
+                .collect();
+            app.report("doctor", lines);
         }
         _ => {}
     }
 }
 
-fn handle_detail(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.revealed_value = None;
-            app.screen = Screen::Main;
+fn step(app: &mut App, delta: i32) {
+    let (state, len) = match app.pane {
+        Pane::Projects => (&mut app.proj_state, app.projects.len()),
+        Pane::Environments => {
+            let n = app.env_labels().len();
+            (&mut app.env_state, n)
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.detail_scroll = app.detail_scroll.saturating_add(1);
+        Pane::Variables => {
+            let n = app.rows().len();
+            (&mut app.var_state, n)
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.detail_scroll = app.detail_scroll.saturating_sub(1);
-        }
-        KeyCode::Char('v') => {
-            if let Some(item) = app.selected_item() {
-                let id = item.id;
-                if let Some(token) = &app.token.clone() {
-                    match client::api_reveal(id, token) {
-                        Ok(v) => {
-                            app.revealed_value = Some(v);
-                            app.set_status("Value revealed", false);
-                        }
-                        Err(e) => app.set_status(e.to_string(), true),
-                    }
-                }
-            }
-        }
-        KeyCode::Char('c') => {
-            if let Some(val) = &app.revealed_value {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("clip")
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                        .and_then(|mut child| {
-                            use std::io::Write;
-                            child.stdin.as_mut().unwrap().write_all(val.as_bytes())?;
-                            child.wait()
-                        });
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = std::process::Command::new("pbcopy")
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                        .or_else(|_| {
-                            std::process::Command::new("xclip")
-                                .args(["-selection", "clipboard"])
-                                .stdin(std::process::Stdio::piped())
-                                .spawn()
-                        })
-                        .and_then(|mut child| {
-                            use std::io::Write;
-                            child.stdin.as_mut().unwrap().write_all(val.as_bytes())?;
-                            child.wait()
-                        });
-                }
-                app.set_status("Copied to clipboard", false);
-            }
-        }
-        _ => {}
+    };
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0) as i32;
+    state.select(Some((cur + delta).rem_euclid(len as i32) as usize));
+    match app.pane {
+        Pane::Projects => app.reset_env(),
+        Pane::Environments => app.reset_vars(),
+        Pane::Variables => {}
     }
 }
 
-fn handle_confirm(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Char('y') | KeyCode::Enter => {
-            let action = app.confirm_action.clone();
-            match action {
-                ConfirmAction::DeleteItem(id) => {
-                    let url = format!("{}/items/{}", client::api_base(), id);
-                    match client::authenticated_delete(&url) {
-                        Ok(_) => {
-                            app.items.retain(|i| i.id != id);
-                            app.apply_search();
-                            let len = app.visible_items().len();
-                            if len == 0 {
-                                app.list_state.select(None);
-                            } else if app.list_state.selected().map(|s| s >= len).unwrap_or(false) {
-                                app.list_state.select(Some(len - 1));
-                            }
-                            app.set_status("Item deleted", false);
-                        }
-                        Err(e) => app.set_status(e.to_string(), true),
-                    }
-                }
-                ConfirmAction::None => {}
+/// Runs a gated action directly while this terminal's session is live (the
+/// check renews it); otherwise asks for the master password first.
+fn gate(app: &mut App, purpose: Gated) {
+    match client::session_alive() {
+        Ok(true) => run_gated(app, purpose),
+        Ok(false) => app.modal = Modal::Password { purpose, input: String::new(), error: None },
+        Err(e) => app.error(e),
+    }
+}
+
+fn submit_password(app: &mut App, purpose: Gated, pw: &str) {
+    if let Err(e) = client::authenticate(pw) {
+        app.modal = Modal::Password { purpose, input: String::new(), error: Some(e.to_string()) };
+        return;
+    }
+    app.modal = Modal::None;
+    run_gated(app, purpose);
+}
+
+fn run_gated(app: &mut App, purpose: Gated) {
+    match purpose {
+        Gated::Login => {
+            if let Err(e) = app.reload() {
+                app.error(e);
             }
-            app.screen = Screen::Main;
         }
-        KeyCode::Char('n') | KeyCode::Esc => {
-            app.screen = Screen::Main;
+        Gated::Reveal => {
+            let rows = app.rows();
+            let Some(row) = app.var_state.selected().and_then(|i| rows.get(i)) else { return };
+            match client::reveal_item(row.item_id) {
+                Ok(value) => app.modal = Modal::Reveal { key: row.key.clone(), value },
+                Err(e) => app.error(e),
+            }
         }
-        _ => {}
+        Gated::Fill => match workspace(app).and_then(|ws| fill::execute(&ws, None)) {
+            Ok(r) => {
+                let mut lines: Vec<(String, Color)> = r.lines.into_iter().map(|l| (l, TX)).collect();
+                lines.extend(r.examples.into_iter().map(|e| (format!("wrote {}", e.display()), TX2)));
+                app.report("fill", lines);
+            }
+            Err(e) => app.error(e),
+        },
+        Gated::Sync { global } => {
+            let result = workspace(app).and_then(|ws| {
+                let example = sync::locate_example(None, &ws.root)?;
+                sync::execute(&ws, &example, None, global)
+            });
+            match result {
+                Ok(r) => {
+                    let mut lines = vec![(format!("read {}", r.example.display()), TX2)];
+                    lines.push((format!("created (change-me): {}", join_or_none(&r.created)), TX));
+                    lines.push((format!("linked to globals: {}", join_or_none(&r.linked)), TX));
+                    if !r.written.is_empty() {
+                        lines.push((format!("wrote {}", r.written.join(", ")), TX));
+                    }
+                    app.report(if global { "sync --global" } else { "sync" }, lines);
+                    let _ = app.reload();
+                }
+                Err(e) => app.error(e),
+            }
+        }
+    }
+}
+
+fn join_or_none(v: &[String]) -> String {
+    if v.is_empty() { "none".into() } else { v.join(", ") }
+}
+
+/// The cwd workspace, without the legacy-notice `eprintln!` of
+/// `scope::workspace` (which would corrupt the alternate screen).
+fn workspace(app: &App) -> Result<scope::Workspace, CliError> {
+    let path = scope::find_config(&app.workspace_dir).ok_or_else(|| {
+        CliError::Config(format!("no {} here — press `i` to init", scope::manifest::FILE_NAME))
+    })?;
+    scope::load_config(&path)
+}
+
+fn run_init(app: &mut App, name: &str) {
+    let dir = app.workspace_dir.clone();
+    match init::execute(&dir, Some(name), None) {
+        Ok(r) => {
+            let verb = if r.created { "created" } else { "linked" };
+            app.report(
+                "init",
+                vec![
+                    (format!("{verb} project '{}' → {}", r.project, r.target), TX),
+                    (format!("wrote {}", r.manifest_path.display()), TX2),
+                ],
+            );
+            let _ = app.reload();
+        }
+        Err(e) => app.error(e),
+    }
+}
+
+fn run_config(app: &mut App) {
+    let result = workspace(app).and_then(|ws| match ws.manifest.clone() {
+        Some(m) => config::execute(&ws.root, &ws.config_path, &m),
+        None => Err(CliError::Config("legacy crypt-env.json — press `i` to init".into())),
+    });
+    match result {
+        Ok(config::Outcome::Pushed { untracked_envs, .. }) => {
+            let mut lines = vec![("vault updated from .crypt-env.yaml".to_string(), TX)];
+            if !untracked_envs.is_empty() {
+                lines.push((format!("kept vault-only environments: {}", untracked_envs.join(", ")), WARN));
+            }
+            app.report("config", lines);
+            let _ = app.reload();
+        }
+        Ok(config::Outcome::Pulled) => app.report("config", vec![(".crypt-env.yaml updated from the vault".into(), TX)]),
+        Ok(config::Outcome::InSync) => app.report("config", vec![("already in sync".into(), TX)]),
+        Err(e) => app.error(e),
     }
 }
 
@@ -519,390 +516,179 @@ fn handle_confirm(app: &mut App, code: KeyCode) {
 
 fn render(f: &mut Frame, app: &App) {
     let area = f.area();
-    // Background
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    let [top, body, bottom] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
 
-    match app.screen {
-        Screen::Unlock => render_unlock(f, app, area),
-        Screen::Main => render_main(f, app, area),
-        Screen::Detail => render_detail(f, app, area),
-        Screen::Help => render_help(f, area),
-        Screen::Confirm => {
-            render_main(f, app, area);
-            render_confirm_overlay(f, app, area);
-        }
-    }
-}
-
-fn render_unlock(f: &mut Frame, app: &App, area: Rect) {
-    let vertical = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(10),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-
-    let horizontal = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Min(40),
-        Constraint::Max(54),
-        Constraint::Fill(1),
-    ])
-    .split(vertical[1]);
-
-    let inner = horizontal[2];
-
-    let block = Block::default()
-        .title(Line::from(vec![
-            Span::styled(" CRYPTENV ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    let ws = scope::find_config(&app.workspace_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "no .crypt-env.yaml here".into());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" crypt-env ", Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {ws}"), Style::default().fg(TX2)),
         ]))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(SURFACE));
+        .style(Style::default().bg(SURFACE)),
+        top,
+    );
 
-    let inner_area = block.inner(inner);
-    f.render_widget(block, inner);
-
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner_area);
-
-    let label = Paragraph::new("  Master Password:")
-        .style(Style::default().fg(TX2));
-    f.render_widget(label, rows[1]);
-
-    let pw_display = "•".repeat(app.password.len());
-    let pw_style = if app.pw_error.is_some() {
-        Style::default().fg(DANGER)
-    } else {
-        Style::default().fg(TX)
-    };
-    let pw = Paragraph::new(format!("  {}_", pw_display)).style(pw_style);
-    f.render_widget(pw, rows[2]);
-
-    if let Some(err) = &app.pw_error {
-        let err_text = Paragraph::new(format!("  ✗ {}", err))
-            .style(Style::default().fg(DANGER));
-        f.render_widget(err_text, rows[3]);
-    } else {
-        let hint = Paragraph::new("  [Enter] unlock · [Esc] quit")
-            .style(Style::default().fg(TX3));
-        f.render_widget(hint, rows[4]);
-    }
-}
-
-fn render_main(f: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    // Top bar
-    render_topbar(f, app, rows[0]);
-
-    // Split: list left, detail right
-    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).split(rows[1]);
-
-    render_item_list(f, app, cols[0]);
-    render_item_preview(f, app, cols[1]);
-
-    // Bottom status bar
-    render_statusbar(f, app, rows[2]);
-}
-
-fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
-    let search_text = if app.search_mode {
-        format!(" / {} ", app.search)
-    } else if !app.search.is_empty() {
-        format!(" /{} ", app.search)
-    } else {
-        " CRYPTENV ".to_string()
-    };
-    let total = app.items.len();
-    let shown = if app.search.is_empty() { total } else { app.filtered.len() };
-    let count = format!(" {}/{} ", shown, total);
-    let scope_text = format!(" [{}] ", app.scope_label());
-
-    let bar = Paragraph::new(Line::from(vec![
-        Span::styled(search_text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(scope_text, Style::default().fg(TX2)),
-        Span::styled(count, Style::default().fg(TX3)),
-    ]))
-    .style(Style::default().bg(RAISED));
-    f.render_widget(bar, area);
-}
-
-fn render_item_list(f: &mut Frame, app: &App, area: Rect) {
-    let visible = app.visible_items();
-    let items: Vec<ListItem> = visible
-        .iter()
-        .map(|item| {
-            let name = item.name.as_deref().or(item.title.as_deref()).unwrap_or("(unnamed)");
-            let type_badge = format!("{:<10}", item.item_type.to_uppercase());
-            let cats = if item.categories.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", item.categories.join(", "))
-            };
+    let [left, mid, right] =
+        Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(24), Constraint::Percentage(48)]).areas(body);
+    let proj_items: Vec<ListItem> = app.projects.iter().map(|p| ListItem::new(p.name.clone())).collect();
+    render_list(f, left, " Projects ", proj_items, &app.proj_state, app.pane == Pane::Projects);
+    let env_items: Vec<ListItem> = app.env_labels().into_iter().map(ListItem::new).collect();
+    render_list(f, mid, " Environments ", env_items, &app.env_state, app.pane == Pane::Environments);
+    let var_items: Vec<ListItem> = app
+        .rows()
+        .into_iter()
+        .map(|r| {
             ListItem::new(Line::from(vec![
-                Span::styled(type_badge, Style::default().fg(type_color(&item.item_type))),
-                Span::styled(name, Style::default().fg(TX)),
-                Span::styled(cats, Style::default().fg(TX3)),
+                Span::styled(format!("{:<28}", r.key), Style::default().fg(TX)),
+                Span::styled("••••••••  ", Style::default().fg(TX3)),
+                Span::styled(r.detail, Style::default().fg(TX3)),
             ]))
         })
         .collect();
+    let title = if app.filter.is_empty() && !app.filtering {
+        " Variables ".to_string()
+    } else {
+        format!(" Variables  /{}{} ", app.filter, if app.filtering { "▏" } else { "" })
+    };
+    render_list(f, right, &title, var_items, &app.var_state, app.pane == Pane::Variables);
 
-    let selected_style = Style::default()
-        .bg(Color::Rgb(30, 35, 45))
-        .fg(ACCENT)
-        .add_modifier(Modifier::BOLD);
+    let hint = match &app.status {
+        Some((m, true)) => Span::styled(format!(" {m}"), Style::default().fg(DANGER)),
+        Some((m, false)) => Span::styled(format!(" {m}"), Style::default().fg(ACCENT)),
+        None => Span::styled(
+            " ←/→ pane  ↑/↓ move  / filter  v reveal  i init  c config  f fill  s/S sync  d doctor  r reload  ? help  q quit",
+            Style::default().fg(TX3),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(hint)).style(Style::default().bg(SURFACE)), bottom);
 
+    render_modal(f, app, area);
+}
+
+fn render_list(f: &mut Frame, area: Rect, title: &str, items: Vec<ListItem>, state: &ListState, focused: bool) {
+    let border = if focused { ACCENT } else { TX3 };
     let list = List::new(items)
         .block(
             Block::default()
-                .title(Span::styled(" Vault ", Style::default().fg(TX2)))
+                .title(Span::styled(title.to_string(), Style::default().fg(if focused { ACCENT } else { TX2 })))
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(50, 50, 60)))
-                .style(Style::default().bg(BG)),
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(border))
+                .style(Style::default().bg(SURFACE)),
         )
-        .highlight_style(selected_style)
-        .highlight_symbol("▶ ");
-
-    let mut state = app.list_state.clone();
-    f.render_stateful_widget(list, area, &mut state);
+        .style(Style::default().fg(TX))
+        .highlight_style(Style::default().bg(RAISED).fg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("› ");
+    let mut s = state.clone();
+    f.render_stateful_widget(list, area, &mut s);
 }
 
-fn render_item_preview(f: &mut Frame, app: &App, area: Rect) {
-    let content = if let Some(item) = app.selected_item() {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("  Type:  ", Style::default().fg(TX3)),
-                Span::styled(item.item_type.to_uppercase(), Style::default().fg(type_color(&item.item_type)).add_modifier(Modifier::BOLD)),
-            ]),
-        ];
-        if let Some(name) = &item.name {
-            lines.push(Line::from(vec![
-                Span::styled("  Name:  ", Style::default().fg(TX3)),
-                Span::styled(name.clone(), Style::default().fg(TX)),
-            ]));
-        }
-        if let Some(title) = &item.title {
-            lines.push(Line::from(vec![
-                Span::styled("  Title: ", Style::default().fg(TX3)),
-                Span::styled(title.clone(), Style::default().fg(TX)),
-            ]));
-        }
-        if !item.categories.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("  Tags:  ", Style::default().fg(TX3)),
-                Span::styled(item.categories.join(", "), Style::default().fg(ACCENT)),
-            ]));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  [Enter] detail   [v] reveal   [d] delete", Style::default().fg(TX3)),
-        ]));
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "  No item selected",
-            Style::default().fg(TX3),
-        ))]
-    };
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(2));
+    let h = h.min(area.height.saturating_sub(2));
+    Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
+}
 
-    let block = Block::default()
-        .title(Span::styled(" Preview ", Style::default().fg(TX2)))
+fn modal_block(title: &str, color: Color) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(title.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(50, 50, 60)))
-        .style(Style::default().bg(BG));
-
-    let paragraph = Paragraph::new(content).block(block).wrap(Wrap { trim: false });
-    f.render_widget(paragraph, area);
+        .border_style(Style::default().fg(color))
+        .style(Style::default().bg(RAISED))
 }
 
-fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
-    let msg = if let Some((msg, is_err)) = &app.status {
-        let style = if *is_err {
-            Style::default().fg(DANGER)
-        } else {
-            Style::default().fg(ACCENT)
-        };
-        Span::styled(format!(" {}", msg), style)
-    } else {
-        Span::styled(" [↑↓/jk] nav  [/] search  [Enter] detail  [v] reveal  [d] delete  [r] refresh  [?] help  [q] quit", Style::default().fg(TX3))
-    };
-
-    let bar = Paragraph::new(Line::from(vec![msg]))
-        .style(Style::default().bg(RAISED));
-    f.render_widget(bar, area);
-}
-
-fn render_detail(f: &mut Frame, app: &App, area: Rect) {
-    if let Some(item) = app.selected_item() {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("  ID:    ", Style::default().fg(TX3)),
-                Span::styled(item.id.to_string(), Style::default().fg(TX2)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Type:  ", Style::default().fg(TX3)),
-                Span::styled(item.item_type.to_uppercase(), Style::default().fg(type_color(&item.item_type)).add_modifier(Modifier::BOLD)),
-            ]),
-        ];
-        if let Some(name) = &item.name {
-            lines.push(Line::from(vec![
-                Span::styled("  Name:  ", Style::default().fg(TX3)),
-                Span::styled(name.clone(), Style::default().fg(TX)),
-            ]));
+fn render_modal(f: &mut Frame, app: &App, area: Rect) {
+    match &app.modal {
+        Modal::None => {}
+        Modal::Password { purpose, input, error } => {
+            let r = centered(area, 60, 7);
+            let what = match purpose {
+                Gated::Login => "open a session in this terminal",
+                Gated::Reveal => "reveal this value",
+                Gated::Fill => "fill .env files",
+                Gated::Sync { global: false } => "sync .env.example",
+                Gated::Sync { global: true } => "sync --global",
+            };
+            let mut lines = vec![
+                Line::from(Span::styled(format!("Master password to {what}:"), Style::default().fg(TX2))),
+                Line::from(Span::styled(format!("{}▏", "•".repeat(input.chars().count())), Style::default().fg(ACCENT))),
+            ];
+            if let Some(e) = error {
+                lines.push(Line::from(Span::styled(e.clone(), Style::default().fg(DANGER))));
+            }
+            lines.push(Line::from(Span::styled("Enter confirm · Esc cancel", Style::default().fg(TX3))));
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(lines).block(modal_block(" password ", ACCENT)).wrap(Wrap { trim: true }), r);
         }
-        if let Some(title) = &item.title {
-            lines.push(Line::from(vec![
-                Span::styled("  Title: ", Style::default().fg(TX3)),
-                Span::styled(title.clone(), Style::default().fg(TX)),
-            ]));
+        Modal::Input { title, value } => {
+            let r = centered(area, 60, 5);
+            f.render_widget(Clear, r);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(format!("{value}▏"), Style::default().fg(TX))),
+                    Line::from(Span::styled(
+                        format!("root: {}", app.workspace_dir.display()),
+                        Style::default().fg(TX3),
+                    )),
+                ])
+                .block(modal_block(title, ACCENT)),
+                r,
+            );
         }
-        if !item.categories.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("  Tags:  ", Style::default().fg(TX3)),
-                Span::styled(item.categories.join(", "), Style::default().fg(ACCENT)),
-            ]));
+        Modal::Reveal { key, value } => {
+            let r = centered(area, 72, 7);
+            f.render_widget(Clear, r);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(key.clone(), Style::default().fg(TX2))),
+                    Line::from(Span::styled(value.as_str().to_string(), Style::default().fg(WARN))),
+                    Line::from(Span::styled("any key to hide (value is wiped from memory)", Style::default().fg(TX3))),
+                ])
+                .block(modal_block(" revealed ", WARN))
+                .wrap(Wrap { trim: false }),
+                r,
+            );
         }
-        lines.push(Line::from(""));
-        if let Some(val) = &app.revealed_value {
-            lines.push(Line::from(vec![
-                Span::styled("  Value: ", Style::default().fg(TX3)),
-                Span::styled(val.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            ]));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  [c] copy to clipboard", Style::default().fg(TX3))));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("  Value: ", Style::default().fg(TX3)),
-                Span::styled("••••••••••••", Style::default().fg(TX3)),
-            ]));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  [v] reveal value", Style::default().fg(TX3))));
+        Modal::Report { title, lines } => {
+            let h = (lines.len() as u16 + 3).min(area.height.saturating_sub(2));
+            let r = centered(area, 96, h);
+            let mut body: Vec<Line> =
+                lines.iter().map(|(l, c)| Line::from(Span::styled(l.clone(), Style::default().fg(*c)))).collect();
+            body.push(Line::from(Span::styled("any key to close", Style::default().fg(TX3))));
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(body).block(modal_block(&format!(" {title} "), ACCENT)).wrap(Wrap { trim: false }), r);
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  [Esc/q] back", Style::default().fg(TX3))));
-
-        let block = Block::default()
-            .title(Span::styled(" Item Detail ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
-            .style(Style::default().bg(SURFACE));
-
-        let para = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll, 0));
-        f.render_widget(para, area);
+        Modal::Help => {
+            let rows = [
+                ("←/→ h/l, Tab", "switch pane (projects · environments · variables)"),
+                ("↑/↓ j/k", "move selection"),
+                ("/", "filter variables (regex, or %substring)"),
+                ("v", "reveal value (master password)"),
+                ("i", "init: register this directory as a project"),
+                ("c", "config: sync .crypt-env.yaml ⇄ vault"),
+                ("f", "fill .env + .env.example (master password)"),
+                ("s / S", "sync from .env.example / with --global (master password)"),
+                ("d", "doctor diagnostics"),
+                ("r", "reload"),
+                ("q", "quit"),
+            ];
+            let r = centered(area, 76, rows.len() as u16 + 3);
+            let body: Vec<Line> = rows
+                .iter()
+                .map(|(k, d)| {
+                    Line::from(vec![
+                        Span::styled(format!("{k:<14}"), Style::default().fg(ACCENT)),
+                        Span::styled(d.to_string(), Style::default().fg(TX)),
+                    ])
+                })
+                .collect();
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(body).block(modal_block(" help ", ACCENT)), r);
+        }
     }
-}
-
-fn render_help(f: &mut Frame, area: Rect) {
-    let rows = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(20),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    let cols = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(52),
-        Constraint::Fill(1),
-    ])
-    .split(rows[1]);
-
-    let lines = vec![
-        Line::from(Span::styled("  Navigation", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-        Line::from(vec![Span::styled("  ↑↓ / j k   ", Style::default().fg(TX2)), Span::styled("Move selection", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  /          ", Style::default().fg(TX2)), Span::styled("Start fuzzy search", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  Esc        ", Style::default().fg(TX2)), Span::styled("Clear search / go back", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  Enter      ", Style::default().fg(TX2)), Span::styled("Open item detail", Style::default().fg(TX))]),
-        Line::from(""),
-        Line::from(Span::styled("  Item Actions", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-        Line::from(vec![Span::styled("  v          ", Style::default().fg(TX2)), Span::styled("Reveal secret value", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  c          ", Style::default().fg(TX2)), Span::styled("Copy revealed value to clipboard", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  d          ", Style::default().fg(TX2)), Span::styled("Delete item (confirm required)", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  r          ", Style::default().fg(TX2)), Span::styled("Refresh vault items", Style::default().fg(TX))]),
-        Line::from(""),
-        Line::from(Span::styled("  Global", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-        Line::from(vec![Span::styled("  ?          ", Style::default().fg(TX2)), Span::styled("Toggle this help", Style::default().fg(TX))]),
-        Line::from(vec![Span::styled("  q / Esc    ", Style::default().fg(TX2)), Span::styled("Quit TUI", Style::default().fg(TX))]),
-    ];
-
-    let block = Block::default()
-        .title(Span::styled(" Help ", Style::default().fg(ACCENT)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(SURFACE));
-
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
-    f.render_widget(para, cols[1]);
-
-    let dismiss = Paragraph::new("  Press any key to close")
-        .style(Style::default().fg(TX3).bg(RAISED));
-    f.render_widget(
-        dismiss,
-        Rect {
-            x: cols[1].x,
-            y: cols[1].y + cols[1].height,
-            width: cols[1].width,
-            height: 1,
-        },
-    );
-}
-
-fn render_confirm_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(5),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    let cols = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(46),
-        Constraint::Fill(1),
-    ])
-    .split(rows[1]);
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", app.confirm_msg),
-            Style::default().fg(TX),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  [y] confirm   ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
-            Span::styled("[n/Esc] cancel", Style::default().fg(TX3)),
-        ]),
-    ];
-
-    let block = Block::default()
-        .title(Span::styled(" Confirm ", Style::default().fg(DANGER)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DANGER))
-        .style(Style::default().bg(SURFACE));
-
-    let para = Paragraph::new(lines).block(block);
-    f.render_widget(para, cols[1]);
 }

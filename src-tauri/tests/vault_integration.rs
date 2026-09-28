@@ -20,6 +20,7 @@ async fn setup_project_with_one_var(db: &VaultDb) -> ([u8; 32], i64) {
         template: "generic".into(),
         categories: vec![],
         initial_environment: None,
+        root_path: None,
     }).await.unwrap();
 
     let projects = project::list_projects(db).await.unwrap();
@@ -85,7 +86,7 @@ async fn test_inject_environment_aborts_on_non_not_found_read_error() {
     std::fs::create_dir(&existing_dir).unwrap();
     let bad_path = existing_dir.to_str().unwrap().to_string();
 
-    let result = project::inject_environment(&db, &key, env_id, Some(bad_path), None, false).await;
+    let result = project::inject_environment(&db, &key, env_id, Some(bad_path), None, false, None).await;
     assert!(
         result.is_err(),
         "a non-NotFound read error must abort the write, not be treated as an empty file"
@@ -104,7 +105,7 @@ async fn test_inject_environment_creates_new_file_on_not_found() {
     let target = dir.path().join(".env.new");
     let good_path = target.to_str().unwrap().to_string();
 
-    let result = project::inject_environment(&db, &key, env_id, Some(good_path.clone()), None, false).await;
+    let result = project::inject_environment(&db, &key, env_id, Some(good_path.clone()), None, false, None).await;
     assert!(result.is_ok(), "NotFound must still be treated as an empty starting file: {:?}", result.err());
 
     let content = std::fs::read_to_string(&good_path).unwrap();

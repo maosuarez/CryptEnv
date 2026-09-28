@@ -48,6 +48,11 @@ pub struct DbProject {
     pub template: String,
     pub created: String,
     pub updated: String,
+    /// Project root directory as the vault host sees it (the directory
+    /// holding `.crypt-env.yaml`). Relative `environments.paths` resolve
+    /// against it. `None` for projects created before it existed.
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -430,6 +435,11 @@ impl VaultDb {
         // without also being recorded, even if a later step in this function
         // (e.g. the second `CREATE UNIQUE INDEX`) fails or the process is
         // killed mid-migration.
+        // Additive: project root directory (cli-tui-parity, design D8).
+        let _ = sqlx::query("ALTER TABLE projects ADD COLUMN root_path TEXT")
+            .execute(&self.pool)
+            .await;
+
         self.dedupe_project_names_nocase().await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name_nocase ON projects(name COLLATE NOCASE)")
             .execute(&self.pool)
@@ -1215,7 +1225,7 @@ impl VaultDb {
 
     pub async fn list_projects(&self) -> Result<Vec<DbProject>, String> {
         let rows = sqlx::query(
-            "SELECT id, name, description, template, created, updated FROM projects ORDER BY id ASC",
+            "SELECT id, name, description, template, created, updated, root_path FROM projects ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
         .await
@@ -1229,8 +1239,32 @@ impl VaultDb {
                 template: r.get(3),
                 created: r.get(4),
                 updated: r.get(5),
+                root_path: r.get(6),
             })
             .collect())
+    }
+
+    /// Sets (or clears, with `None`) a project's root directory and bumps
+    /// its `updated` timestamp.
+    pub async fn set_project_root(&self, project_id: i64, root_path: Option<&str>) -> Result<(), String> {
+        sqlx::query("UPDATE projects SET root_path = ?1, updated = ?2 WHERE id = ?3")
+            .bind(root_path)
+            .bind(now_ts())
+            .bind(project_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Root directory of one project (`None` when unset or no such project).
+    pub async fn get_project_root(&self, project_id: i64) -> Result<Option<String>, String> {
+        let row = sqlx::query("SELECT root_path FROM projects WHERE id = ?1")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>(0)))
     }
 
     /// id = 0 → INSERT, returns new id. id > 0 → UPDATE, returns same id.

@@ -443,6 +443,33 @@
       "owners": "Owning projects",
       "global": "Global (reusable across projects)",
       "globalHint": "Un-marking a secret shared by several projects gives each project its own copy."
+    },
+    "pathsRelativeHint": "relative to {{root}}, or absolute",
+    "root": {
+      "label": "ROOT DIRECTORY",
+      "hint": "(.crypt-env.yaml is written here)",
+      "placeholder": "C:\\projects\\myapp",
+      "browse": "Browse for the project folder",
+      "browseWsl": "Browse a WSL distro's filesystem for the project folder",
+      "required": "Choose the project's root directory",
+      "problems": {
+        "notAbsolute": "Must be an absolute path",
+        "notFound": "Directory does not exist",
+        "notDir": "Not a directory",
+        "notWritable": "Directory is not writable"
+      },
+      "manifestExists": {
+        "title": ".crypt-env.yaml already exists",
+        "body": "This folder already has a project manifest. Overwrite it with this project, or link the project without touching the file (run `crypt-env config` later to sync it).",
+        "overwrite": "OVERWRITE",
+        "link": "LINK ONLY"
+      },
+      "yamlWritten": ".crypt-env.yaml written to {{path}}"
+    },
+    "injectTarget": {
+      "title": "Where do you want to inject environment variables?",
+      "all": "All configured paths",
+      "inject": "INJECT"
     }
   },
   "receive": {

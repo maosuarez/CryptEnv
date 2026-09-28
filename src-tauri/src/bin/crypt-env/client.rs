@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -17,7 +16,6 @@ pub enum CliError {
     Api(String),
     Io(std::io::Error),
     ConnectionRefused,
-    Unauthorized,
     NotFound(String),
     VaultLocked,
     /// Invalid runtime configuration (malformed `CRYPTENV_API_URL`, unreadable
@@ -35,7 +33,6 @@ impl std::fmt::Display for CliError {
                 f,
                 "Error: vault is not running. Open the application and try again."
             ),
-            CliError::Unauthorized => write!(f, "Error: unauthorized (invalid token)"),
             CliError::NotFound(name) => write!(f, "Error: '{}' not found in vault", name),
             CliError::VaultLocked => write!(f, "Error: vault is locked"),
             CliError::Config(msg) => write!(f, "Configuration error: {msg}"),
@@ -187,68 +184,10 @@ pub struct ItemSummary {
     pub name: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
-    pub categories: Vec<String>,
     /// Present on `/items` responses since issue #13 (defaults to `false`
     /// when absent, e.g. responses from before this change).
     #[serde(default, rename = "isGlobal")]
     pub is_global: bool,
-    /// `true` iff this item is linked into the queried environment. Also
-    /// new since issue #13 — defaults to `false` when absent.
-    #[serde(default)]
-    pub linked: bool,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-pub struct CommandDetail {
-    pub id: i64,
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub shell: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub placeholders: Vec<String>,
-    /// Present on `/commands` list responses since issue #13. `GET
-    /// /commands/:id` (unscoped, untouched by this change) omits it, so this
-    /// defaults to `false` there.
-    #[serde(default, rename = "isGlobal")]
-    pub is_global: bool,
-    /// `true` iff this command is linked into the queried environment.
-    /// Meaningless outside a scoped `/commands` list — defaults to `false`.
-    #[serde(default)]
-    pub linked: bool,
-}
-
-/// Given the full `/commands` list for a scope, finds the command matching
-/// `name` case-insensitively. When both a linked command and a global
-/// (unlinked) command share the same name, the linked one wins — matching
-/// `/fill`'s and `/inject`'s materialization-only semantics — and a warning
-/// naming the shadowed global's id is printed to stderr.
-pub fn resolve_command_by_name(commands: Vec<CommandDetail>, name: &str) -> Option<CommandDetail> {
-    let name_lower = name.to_lowercase();
-    let mut matches: Vec<CommandDetail> = commands
-        .into_iter()
-        .filter(|c| c.name.to_lowercase() == name_lower)
-        .collect();
-
-    if matches.len() > 1 {
-        if let Some(linked_idx) = matches.iter().position(|c| c.linked) {
-            let linked = matches.remove(linked_idx);
-            for shadowed in matches.iter().filter(|c| !c.linked) {
-                eprintln!(
-                    "warning: command '{}' also exists as a global item (id {}) — using the linked one",
-                    name, shadowed.id
-                );
-            }
-            return Some(linked);
-        }
-    }
-
-    matches.into_iter().next()
 }
 
 #[derive(Deserialize, Debug)]
@@ -257,6 +196,13 @@ struct RevealResponse {
 }
 
 // ─── Session token ────────────────────────────────────────────────────────────
+
+/// This terminal's session-token file: `<token path>.<terminal hash>` (see
+/// `terminal`). `CRYPTENV_TOKEN_PATH` / the platform default only choose the
+/// base location.
+pub fn token_file_path() -> Option<PathBuf> {
+    token_path().map(|base| crate::terminal::per_terminal_path(&base, &crate::terminal::terminal_id()))
+}
 
 fn token_path() -> Option<PathBuf> {
     token_path_from(
@@ -299,11 +245,16 @@ fn token_path_from(
 }
 
 pub fn read_token() -> Option<String> {
-    let path = token_path()?;
-    std::fs::read_to_string(&path)
+    let path = token_file_path()?;
+    let token = std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())?;
+    // Mark it recently used so stale-file pruning leaves it alone.
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    Some(token)
 }
 
 /// Writes `content` to `path` and restricts permissions to owner-only on Unix.
@@ -350,7 +301,10 @@ fn harden_token_permissions(path: &Path) {
 }
 
 pub fn save_token(token: &str) {
-    if let Some(path) = token_path() {
+    if let Some(base) = token_path() {
+        crate::terminal::prune_stale(&base, std::time::SystemTime::now());
+    }
+    if let Some(path) = token_file_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -359,7 +313,7 @@ pub fn save_token(token: &str) {
 }
 
 pub fn clear_token() {
-    if let Some(path) = token_path() {
+    if let Some(path) = token_file_path() {
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -418,6 +372,14 @@ fn classify_cert_source(explicit: Option<&str>, probed: Option<PathBuf>) -> Cert
     match explicit {
         Some(v) if !v.trim().is_empty() => CertSource::Explicit(PathBuf::from(v.trim())),
         _ => CertSource::Probed(probed),
+    }
+}
+
+/// The TLS trust-anchor path this invocation uses (explicit or probed).
+pub fn cert_path_in_use() -> Option<PathBuf> {
+    match resolve_cert_source() {
+        CertSource::Explicit(p) => Some(p),
+        CertSource::Probed(p) => p,
     }
 }
 
@@ -508,6 +470,51 @@ pub fn api_unlock(password: &str) -> Result<String, CliError> {
         let err: ApiError = resp.json().unwrap_or(ApiError { error: "unknown error".into() });
         Err(CliError::Api(err.error))
     }
+}
+
+/// Password gate for secret operations (`fill`, `sync`, `inject`, `search`,
+/// collision reveal): passes when this terminal holds a live session (which
+/// the check itself renews server-side), otherwise prompts for the master
+/// password and opens a new session. The password lives only in a
+/// `Zeroizing` buffer.
+pub fn ensure_session() -> Result<(), CliError> {
+    if session_alive()? {
+        return Ok(());
+    }
+    let password = zeroize::Zeroizing::new(
+        rpassword::prompt_password("Master password: ").map_err(CliError::Io)?,
+    );
+    authenticate(&password)
+}
+
+/// Whether this terminal's cached token is a live session. A successful
+/// probe slides its expiry; a rejected token is deleted. Never prompts.
+pub fn session_alive() -> Result<bool, CliError> {
+    let Some(token) = read_token() else { return Ok(false) };
+    let resp = http_client()?
+        .get(format!("{}/settings", api_base()))
+        .header("X-Vault-Token", &token)
+        .send()
+        .map_err(|e| if e.is_connect() { CliError::ConnectionRefused } else { CliError::Api(e.to_string()) })?;
+    match resp.status() {
+        s if s.is_success() => Ok(true),
+        reqwest::StatusCode::FORBIDDEN => Err(CliError::VaultLocked),
+        _ => {
+            clear_token();
+            Ok(false)
+        }
+    }
+}
+
+/// Verifies `password` and caches the resulting session token. A wrong
+/// password is an "authentication failed" error with no side effects.
+pub fn authenticate(password: &str) -> Result<(), CliError> {
+    let token = api_unlock(password).map_err(|e| match e {
+        CliError::Api(msg) => CliError::Api(format!("authentication failed ({msg})")),
+        other => other,
+    })?;
+    save_token(&token);
+    Ok(())
 }
 
 /// Returns a valid token: uses saved one or prompts for password.
@@ -610,7 +617,6 @@ pub fn authenticated_post(
 }
 
 /// Authenticated PUT with JSON body. Handles 401 with one retry.
-#[allow(dead_code)]
 pub fn authenticated_put(
     url: &str,
     body: &serde_json::Value,
@@ -698,25 +704,6 @@ pub fn authenticated_delete(url: &str) -> Result<reqwest::blocking::Response, Cl
     Ok(resp)
 }
 
-/// GET /items, scoped to a project+environment — the API requires scope
-/// params on every call now. `scope_query` is a pre-built query string
-/// (e.g. `project=<enc>&environment=<enc>`, see
-/// `commands::scope::ResolvedScope::to_query_string`), without a leading
-/// `?`. Used for duplicate detection and for listing/browsing items.
-pub fn api_list_items(scope_query: &str) -> Result<Vec<ItemSummary>, CliError> {
-    let url = format!("{}/items?{scope_query}", api_base());
-    let resp = authenticated_get(&url)?;
-
-    if resp.status() == reqwest::StatusCode::FORBIDDEN {
-        return Err(CliError::VaultLocked);
-    }
-    if !resp.status().is_success() {
-        return Err(CliError::Api(format!("HTTP {}", resp.status())));
-    }
-
-    resp.json().map_err(|e| CliError::Api(e.to_string()))
-}
-
 /// POST /items/:id/reveal — returns the secret value of an item.
 pub fn api_reveal(item_id: i64, token: &str) -> Result<String, CliError> {
     let client = http_client()?;
@@ -746,56 +733,130 @@ pub fn api_reveal(item_id: i64, token: &str) -> Result<String, CliError> {
     }
 }
 
-/// Searches for an item by exact name (case-insensitive) within a
-/// project+environment scope and returns (id, secret value). `scope_query`
-/// is a pre-built query string (see `commands::scope::ResolvedScope`),
-/// without a leading `?`.
-pub fn find_and_reveal(name: &str, scope_query: &str) -> Result<(i64, String), CliError> {
-    let token = get_auth_token()?;
-    let url = format!("{}/items?search={}&{scope_query}", api_base(), urlencod(name));
+// ─── Typed project API ──────────────────────────────────────────────────────
 
-    let client = http_client()?;
-    let resp = client
-        .get(&url)
-        .header("X-Vault-Token", &token)
-        .send()
-        .map_err(|e| {
-            if e.is_connect() {
-                CliError::ConnectionRefused
-            } else {
-                CliError::Api(e.to_string())
-            }
-        })?;
+pub use crypt_env_lib::project::{Environment, Project};
 
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(CliError::Unauthorized);
-    }
-    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+fn check_status(resp: reqwest::blocking::Response, what: &str) -> Result<reqwest::blocking::Response, CliError> {
+    let status = resp.status();
+    if status == reqwest::StatusCode::FORBIDDEN {
         return Err(CliError::VaultLocked);
     }
-    if !resp.status().is_success() {
-        let code = resp.status();
-        return Err(CliError::Api(format!("HTTP error {code}")));
+    if status.is_success() {
+        return Ok(resp);
     }
+    let msg = resp
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| format!("HTTP {status}"));
+    Err(CliError::Api(format!("{what}: {msg}")))
+}
 
-    let items: Vec<ItemSummary> = resp.json().map_err(|e| CliError::Api(e.to_string()))?;
-    let name_lower = name.to_lowercase();
+/// `GET /projects` — every project with environments, vars and root path.
+pub fn fetch_projects() -> Result<Vec<Project>, CliError> {
+    let resp = check_status(authenticated_get(&format!("{}/projects", api_base()))?, "list projects")?;
+    resp.json().map_err(|e| CliError::Api(e.to_string()))
+}
 
-    let found = items.into_iter().find(|item| {
-        item.name
-            .as_deref()
-            .map(|n| n.to_lowercase() == name_lower)
-            .unwrap_or(false)
-            || item
-                .title
-                .as_deref()
-                .map(|t| t.to_lowercase() == name_lower)
-                .unwrap_or(false)
-    });
+/// Case-insensitive project lookup by name.
+pub fn find_project(name: &str) -> Result<Option<Project>, CliError> {
+    let lower = name.to_lowercase();
+    Ok(fetch_projects()?.into_iter().find(|p| p.name.to_lowercase() == lower))
+}
 
-    let item = found.ok_or_else(|| CliError::NotFound(name.to_string()))?;
-    let value = api_reveal(item.id, &token)?;
-    Ok((item.id, value))
+/// `POST /projects` (create when `id == 0`, else update). Returns the id.
+pub fn save_project(body: &serde_json::Value) -> Result<i64, CliError> {
+    let resp = check_status(authenticated_post(&format!("{}/projects", api_base()), body)?, "save project")?;
+    let v: serde_json::Value = resp.json().map_err(|e| CliError::Api(e.to_string()))?;
+    v.get("id").and_then(|i| i.as_i64()).ok_or_else(|| CliError::Api("save project: missing id".into()))
+}
+
+/// Creates any of `names` missing from the vault's categories (projects only
+/// store references to existing categories). Colors cycle the GUI preset.
+pub fn ensure_categories(names: &[String]) -> Result<(), CliError> {
+    const PRESET: [&str; 4] = ["#FF9900", "#10a37f", "#635bff", "#c9d1d9"];
+    if names.is_empty() {
+        return Ok(());
+    }
+    let url = format!("{}/categories", api_base());
+    let existing: Vec<serde_json::Value> =
+        check_status(authenticated_get(&url)?, "list categories")?.json().map_err(|e| CliError::Api(e.to_string()))?;
+    let known: Vec<&str> = existing.iter().filter_map(|c| c.get("name").and_then(|n| n.as_str())).collect();
+    let missing: Vec<&String> = names.iter().filter(|n| !known.contains(&n.as_str())).collect();
+    for (i, name) in missing.into_iter().enumerate() {
+        let color = PRESET[(known.len() + i) % PRESET.len()];
+        check_status(
+            authenticated_post(&url, &serde_json::json!({ "name": name, "color": color }))?,
+            "create category",
+        )?;
+    }
+    Ok(())
+}
+
+/// `POST /environments` — full replace of name/default/paths/vars.
+pub fn save_environment(body: &serde_json::Value) -> Result<i64, CliError> {
+    let resp = check_status(authenticated_post(&format!("{}/environments", api_base()), body)?, "save environment")?;
+    let v: serde_json::Value = resp.json().map_err(|e| CliError::Api(e.to_string()))?;
+    v.get("id").and_then(|i| i.as_i64()).ok_or_else(|| CliError::Api("save environment: missing id".into()))
+}
+
+/// Body for [`save_environment`] that keeps `env`'s current vars and
+/// replaces only its paths (and default flag).
+pub fn environment_body(env: &Environment, is_default: bool, paths: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "id": env.id,
+        "projectId": env.project_id,
+        "name": env.name,
+        "isDefault": is_default,
+        "paths": paths,
+        "vars": env.vars.iter().map(|v| serde_json::json!({"key": v.key, "itemId": v.item_id})).collect::<Vec<_>>(),
+    })
+}
+
+/// Result of `POST /environments/:id/inject`.
+#[derive(Deserialize, Debug)]
+pub struct InjectResult {
+    pub paths: Vec<String>,
+    pub written: Vec<String>,
+    #[serde(default)]
+    pub backups: Vec<String>,
+}
+
+/// Materializes an environment into its configured target files (written by
+/// the vault host). `output_path` adds a caller-supplied target, which the
+/// server refuses to overwrite when it is an unmanaged file.
+pub fn inject_environment(env_id: i64, output_path: Option<&str>) -> Result<InjectResult, CliError> {
+    let body = serde_json::json!({ "output_path": output_path, "overwrite": false });
+    let resp = authenticated_post(&format!("{}/environments/{env_id}/inject", api_base()), &body)?;
+    check_status(resp, "inject")?.json().map_err(|e| CliError::Api(e.to_string()))
+}
+
+/// Marks an item as global (reusable across projects) via `PUT /items/:id`;
+/// only `isGlobal` is sent, every other field is kept server-side.
+pub fn set_item_global(item_id: i64) -> Result<(), CliError> {
+    let body = serde_json::json!({ "id": item_id, "type": "", "created": "", "isGlobal": true });
+    check_status(authenticated_put(&format!("{}/items/{item_id}", api_base()), &body)?, "mark global")?;
+    Ok(())
+}
+
+/// Reveals one item's value with the cached session token.
+pub fn reveal_item(item_id: i64) -> Result<zeroize::Zeroizing<String>, CliError> {
+    let token = get_auth_token()?;
+    api_reveal(item_id, &token).map(zeroize::Zeroizing::new)
+}
+
+/// `GET /items` in a project/environment scope with an `include_global`
+/// mode (`with` | `without` | `only`).
+pub fn list_items(project: &str, environment: &str, include_global: &str) -> Result<Vec<ItemSummary>, CliError> {
+    let url = format!(
+        "{}/items?project={}&environment={}&include_global={}",
+        api_base(),
+        urlencod(project),
+        urlencod(environment),
+        urlencod(include_global)
+    );
+    check_status(authenticated_get(&url)?, "list items")?.json().map_err(|e| CliError::Api(e.to_string()))
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -817,21 +878,6 @@ pub fn urlencod(s: &str) -> String {
     out
 }
 
-/// Parses --VAR=value style arguments into a HashMap.
-pub fn parse_vars(vars: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for var in vars {
-        let stripped = var.trim_start_matches('-');
-        if let Some(eq_pos) = stripped.find('=') {
-            let key = stripped[..eq_pos].to_string();
-            let value = stripped[eq_pos + 1..].to_string();
-            if !key.is_empty() {
-                map.insert(key, value);
-            }
-        }
-    }
-    map
-}
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,7 @@ use crate::db::{DbEnvironmentVar, ProjectDeleteImpact, VaultDb};
 use crate::envfile;
 use crate::vault::SharedState;
 
+pub mod manifest;
 pub mod relay;
 pub mod relay_commands;
 
@@ -73,6 +74,11 @@ pub struct Project {
     /// the existing categories table for project tags/language.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Project root directory as the vault host sees it — the directory
+    /// holding `.crypt-env.yaml`. Relative environment paths resolve
+    /// against it (see [`resolve_env_path`]).
+    #[serde(rename = "rootPath", default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +95,10 @@ pub struct ProjectInput {
     /// omitted means "default"; ignored when updating an existing project.
     #[serde(default, rename = "initialEnvironment")]
     pub initial_environment: Option<String>,
+    /// Project root directory. Omitted = keep the current one, `""` =
+    /// clear it, anything else must be an absolute path (host view).
+    #[serde(default, rename = "rootPath")]
+    pub root_path: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -168,6 +178,7 @@ pub async fn list_projects(db: &VaultDb) -> Result<Vec<Project>, String> {
             updated: p.updated,
             environments,
             categories,
+            root_path: p.root_path,
         });
     }
     Ok(result)
@@ -314,6 +325,11 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
 /// project always gets one 'default' environment so it's immediately usable.
 pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, String> {
     validate_project_name(&input.name)?;
+    let root = match input.root_path.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(r) => Some(Some(validate_root_path(r)?)),
+    };
     let is_new = input.id == 0;
     let initial_env = input
         .initial_environment
@@ -335,11 +351,63 @@ pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, Stri
         // single choke point for the case-insensitivity rule rather than
         // special-casing the auto-created initial environment.
         ensure_no_case_collision(db, project_id, 0, &initial_env).await?;
-        db.upsert_environment(0, project_id, &initial_env, true).await?;
+        let env_id = db.upsert_environment(0, project_id, &initial_env, true).await?;
+        // A project born with a root is injectable immediately: its initial
+        // environment targets the conventional file at the root.
+        if matches!(root, Some(Some(_))) {
+            db.set_environment_paths(env_id, &[environment_filename(&initial_env)]).await?;
+        }
+    }
+    if let Some(r) = &root {
+        db.set_project_root(project_id, r.as_deref()).await?;
     }
     let category_ids = category_names_to_ids(db, &input.categories).await?;
     db.set_project_categories(project_id, &category_ids).await?;
     Ok(project_id)
+}
+
+/// A project root must be an absolute path as the vault host sees it (a
+/// `\\wsl.localhost\…` UNC path counts on Windows). Trailing separators are
+/// trimmed so the stored form is canonical for display and comparison.
+pub fn validate_root_path(root: &str) -> Result<String, String> {
+    if root.contains('\0') || root.chars().any(|c| c.is_control()) {
+        return Err("rootPath: must not contain control characters".into());
+    }
+    if !Path::new(root).is_absolute() {
+        return Err("rootPath: must be an absolute directory path".into());
+    }
+    let trimmed = root.trim_end_matches(['/', '\\']);
+    Ok(if trimmed.is_empty() || trimmed.ends_with(':') { root.to_string() } else { trimmed.to_string() })
+}
+
+/// Resolves one configured environment path to the path actually written.
+/// Absolute paths are returned unchanged (legacy behavior). Relative paths
+/// (`.env`, `apps/api/.env`, `./x`, either separator) are joined onto the
+/// project `root`; they may not climb out of it (`..`) and require a root.
+pub fn resolve_env_path(root: Option<&str>, path: &str) -> Result<String, String> {
+    if Path::new(path).is_absolute() || path.starts_with("\\\\") {
+        return Ok(path.to_string());
+    }
+    let root = root.ok_or_else(|| {
+        format!("path '{path}' is relative but the project has no root directory — set one in the project settings")
+    })?;
+    let mut out = PathBuf::from(root);
+    let mut pushed = 0usize;
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => continue,
+            ".." => return Err(format!("path '{path}' must stay inside the project root")),
+            p if p.contains(':') => return Err(format!("path '{path}' is not a valid relative path")),
+            p => {
+                out.push(p);
+                pushed += 1;
+            }
+        }
+    }
+    if pushed == 0 {
+        return Err(format!("path '{path}' does not name a file"));
+    }
+    Ok(out.to_string_lossy().into_owned())
 }
 
 pub async fn delete_project(db: &VaultDb, id: i64) -> Result<ProjectDeleteImpact, String> {
@@ -542,19 +610,40 @@ async fn get_environment_full(db: &VaultDb, id: i64) -> Result<Option<Environmen
 /// one via `envfile::inspect`, without decrypting anything or writing a
 /// byte. Shared by `inject_environment` (phases 1-2 below) and
 /// `inject_environment_preview` (which stops here).
+///
+/// `targets`, when given, restricts the configured paths to that subset
+/// (matched against the stored strings, e.g. the GUI's inject-target
+/// picker); naming a path that is not configured is an error. Relative
+/// configured paths are resolved against the project root first.
 async fn resolve_and_inspect(
     db: &VaultDb,
     environment_id: i64,
     output_path: Option<String>,
     output_dir: Option<String>,
+    targets: Option<&[String]>,
 ) -> Result<(crate::db::DbEnvironment, Vec<(String, PathOrigin)>, HashMap<String, envfile::Target>), String> {
     let env = db
         .get_environment(environment_id)
         .await?
         .ok_or("environment not found")?;
 
-    let mut resolved: Vec<(String, PathOrigin)> =
-        env.paths.iter().cloned().map(|p| (p, PathOrigin::Configured)).collect();
+    let configured: Vec<&String> = match targets {
+        None => env.paths.iter().collect(),
+        Some(t) => {
+            if let Some(unknown) = t.iter().find(|p| !env.paths.contains(p)) {
+                return Err(format!("target '{unknown}' is not a configured path of this environment"));
+            }
+            env.paths.iter().filter(|p| t.contains(p)).collect()
+        }
+    };
+    let root = if configured.is_empty() { None } else { db.get_project_root(env.project_id).await? };
+    let mut resolved: Vec<(String, PathOrigin)> = Vec::with_capacity(configured.len());
+    for p in configured {
+        let r = resolve_env_path(root.as_deref(), p)?;
+        if !resolved.iter().any(|(existing, _)| existing == &r) {
+            resolved.push((r, PathOrigin::Configured));
+        }
+    }
 
     if let Some(p) = output_path {
         if !resolved.iter().any(|(existing, _)| existing == &p) {
@@ -588,8 +677,12 @@ async fn resolve_and_inspect(
 /// for the GUI's pre-inject confirm dialog: lists every configured path
 /// that is currently `Foreign` (would be reported in `unmanaged_paths` on
 /// an actual inject) so the user can be asked before anything is touched.
-pub async fn inject_environment_preview(db: &VaultDb, environment_id: i64) -> Result<InjectPreview, String> {
-    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None).await?;
+pub async fn inject_environment_preview(
+    db: &VaultDb,
+    environment_id: i64,
+    targets: Option<&[String]>,
+) -> Result<InjectPreview, String> {
+    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None, targets).await?;
 
     let paths: Vec<String> = resolved.iter().map(|(p, _)| p.clone()).collect();
     let foreign: Vec<String> = resolved
@@ -627,10 +720,11 @@ pub async fn inject_environment(
     output_path: Option<String>,
     output_dir: Option<String>,
     overwrite: bool,
+    targets: Option<&[String]>,
 ) -> Result<InjectResult, String> {
     // Phase 1 — resolve, tracking provenance.
     let (env, resolved, mut cached) =
-        resolve_and_inspect(db, environment_id, output_path, output_dir).await?;
+        resolve_and_inspect(db, environment_id, output_path, output_dir, targets).await?;
 
     if resolved.is_empty() {
         return Err("environment has no paths configured".into());
@@ -814,11 +908,12 @@ pub async fn environment_inject(
     state: State<'_, SharedState>,
     id: i64,
     overwrite: bool,
+    targets: Option<Vec<String>>,
 ) -> Result<InjectResult, String> {
     let s = state.lock().await;
     let key = s.key.as_ref().ok_or("vault is locked")?;
     let vault_key: [u8; 32] = **key;
-    inject_environment(&s.db, &vault_key, id, None, None, overwrite).await
+    inject_environment(&s.db, &vault_key, id, None, None, overwrite, targets.as_deref()).await
 }
 
 /// Dry run for the GUI's pre-inject confirm dialog — see
@@ -829,9 +924,10 @@ pub async fn environment_inject(
 pub async fn environment_inject_preview(
     state: State<'_, SharedState>,
     id: i64,
+    targets: Option<Vec<String>>,
 ) -> Result<InjectPreview, String> {
     let s = state.lock().await;
-    inject_environment_preview(&s.db, id).await
+    inject_environment_preview(&s.db, id, targets.as_deref()).await
 }
 
 #[tauri::command]
@@ -850,6 +946,90 @@ pub async fn project_pick_env_path(start_dir: Option<String>) -> Result<Option<S
     .map_err(|e| e.to_string())?;
 
     Ok(result.map(|p| p.to_string_lossy().into_owned()))
+}
+
+// ─── Project root & `.crypt-env.yaml` (gui-project-yaml-paths) ──────────────
+
+#[tauri::command]
+pub async fn project_pick_root_dir(start_dir: Option<String>) -> Result<Option<String>, String> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("Select project root directory");
+        if let Some(dir) = start_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.pick_folder()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(result.map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Inline validation for the project form's root field.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootCheck {
+    /// `None` when usable; otherwise `notAbsolute` | `notFound` | `notDir` | `notWritable`.
+    pub problem: Option<String>,
+    pub has_manifest: bool,
+}
+
+pub fn check_root(root: &str) -> RootCheck {
+    let problem = |p: &str| RootCheck { problem: Some(p.to_string()), has_manifest: false };
+    if validate_root_path(root).is_err() {
+        return problem("notAbsolute");
+    }
+    let dir = Path::new(root);
+    match std::fs::metadata(dir) {
+        Err(_) => return problem("notFound"),
+        Ok(m) if !m.is_dir() => return problem("notDir"),
+        Ok(_) => {}
+    }
+    // Probe writability with a throwaway file (a read-only flag on the
+    // directory is not reliable across Windows/WSL shares).
+    let probe = dir.join(format!(".crypt-env-write-test-{}", std::process::id()));
+    if std::fs::write(&probe, b"").is_err() {
+        return problem("notWritable");
+    }
+    let _ = std::fs::remove_file(&probe);
+    RootCheck { problem: None, has_manifest: dir.join(manifest::FILE_NAME).is_file() }
+}
+
+#[tauri::command]
+pub async fn project_check_root(root: String) -> Result<RootCheck, String> {
+    tokio::task::spawn_blocking(move || check_root(root.trim())).await.map_err(|e| e.to_string())
+}
+
+/// Writes `.crypt-env.yaml` for `project_id` into its root from vault state
+/// (same serializer as `crypt-env init`/`config`). Refuses to replace an
+/// existing file unless `overwrite`; that refusal is the stable error
+/// `"manifest exists"` so the GUI can offer overwrite / link.
+pub async fn write_project_manifest(db: &VaultDb, project_id: i64, overwrite: bool) -> Result<String, String> {
+    let project = list_projects(db)
+        .await?
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or("project not found")?;
+    let root = project.root_path.clone().ok_or("project has no root directory")?;
+    let dir = PathBuf::from(&root);
+    if !dir.is_dir() {
+        return Err("root directory does not exist".into());
+    }
+    if dir.join(manifest::FILE_NAME).exists() && !overwrite {
+        return Err("manifest exists".into());
+    }
+    let m = manifest::from_project(&project, &|p| p.to_string());
+    let path = manifest::write_file(&dir, &m)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn project_write_yaml(
+    state: State<'_, SharedState>,
+    project_id: i64,
+    overwrite: bool,
+) -> Result<String, String> {
+    let s = state.lock().await;
+    write_project_manifest(&s.db, project_id, overwrite).await
 }
 
 // ─── Export / Import ──────────────────────────────────────────────────────────
@@ -970,6 +1150,7 @@ mod tests {
             template: "generic".to_string(),
             categories: vec![],
             initial_environment: initial_environment.map(str::to_string),
+            root_path: None,
         }
     }
 
@@ -1134,6 +1315,110 @@ mod tests {
         assert_eq!(env.id, env_id);
     }
 
+    // ─── project root / relative paths ──────────────────────────────────
+
+    #[test]
+    fn resolve_env_path_rules() {
+        assert_eq!(resolve_env_path(None, "/abs/.env").unwrap(), "/abs/.env");
+        assert_eq!(resolve_env_path(Some("/r"), ".env").unwrap(), "/r/.env");
+        assert_eq!(resolve_env_path(Some("/r"), "./apps\\api/.env").unwrap(), "/r/apps/api/.env");
+        assert!(resolve_env_path(None, ".env").is_err(), "relative needs a root");
+        assert!(resolve_env_path(Some("/r"), "../x/.env").is_err(), "no escaping the root");
+        assert!(resolve_env_path(Some("/r"), "./").is_err(), "must name a file");
+    }
+
+    #[test]
+    fn validate_root_path_rules() {
+        assert_eq!(validate_root_path("/a/b/").unwrap(), "/a/b");
+        assert_eq!(validate_root_path("/").unwrap(), "/");
+        assert!(validate_root_path("rel/dir").is_err());
+    }
+
+    #[tokio::test]
+    async fn save_project_with_root_sets_root_and_initial_env_path() {
+        let (_dir, db) = test_db().await;
+        let mut input = new_project("rooted", None);
+        input.root_path = Some("/work/rooted/".into());
+        let id = save_project(&db, input).await.unwrap();
+        let p = list_projects(&db).await.unwrap().into_iter().find(|p| p.id == id).unwrap();
+        assert_eq!(p.root_path.as_deref(), Some("/work/rooted"));
+        assert_eq!(p.environments[0].paths, vec![".env".to_string()]);
+
+        // Omitted keeps, "" clears.
+        let mut keep = new_project("rooted", None);
+        keep.id = id;
+        save_project(&db, keep).await.unwrap();
+        assert_eq!(db.get_project_root(id).await.unwrap().as_deref(), Some("/work/rooted"));
+        let mut clear = new_project("rooted", None);
+        clear.id = id;
+        clear.root_path = Some(String::new());
+        save_project(&db, clear).await.unwrap();
+        assert_eq!(db.get_project_root(id).await.unwrap(), None);
+
+        let mut bad = new_project("bad-root", None);
+        bad.root_path = Some("relative".into());
+        assert!(save_project(&db, bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn inject_resolves_relative_paths_and_honors_targets() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let project_id = db.get_environment(env_id).await.unwrap().unwrap().project_id;
+        db.set_project_root(project_id, Some(dir.path().to_str().unwrap())).await.unwrap();
+        std::fs::create_dir_all(dir.path().join("web")).unwrap();
+        db.set_environment_paths(env_id, &["web/.env".to_string(), ".env".to_string()]).await.unwrap();
+
+        let only = vec!["web/.env".to_string()];
+        let result = inject_environment(&db, &key, env_id, None, None, false, Some(&only)).await.unwrap();
+        assert_eq!(result.paths, vec![dir.path().join("web").join(".env").to_str().unwrap().to_string()]);
+        assert!(dir.path().join("web/.env").exists());
+        assert!(!dir.path().join(".env").exists(), "non-selected target untouched");
+
+        let bogus = vec!["nope/.env".to_string()];
+        assert!(inject_environment(&db, &key, env_id, None, None, false, Some(&bogus)).await.is_err());
+
+        let all = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
+        assert_eq!(all.paths.len(), 2);
+        assert!(dir.path().join(".env").exists());
+    }
+
+    #[test]
+    fn check_root_reports_problems() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert_eq!(check_root(root), RootCheck { problem: None, has_manifest: false });
+        assert_eq!(check_root("relative").problem.as_deref(), Some("notAbsolute"));
+        assert_eq!(check_root(&format!("{root}/missing")).problem.as_deref(), Some("notFound"));
+        let file = dir.path().join("f");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(check_root(file.to_str().unwrap()).problem.as_deref(), Some("notDir"));
+        std::fs::write(dir.path().join(manifest::FILE_NAME), "project:\n  name: x\n").unwrap();
+        assert!(check_root(root).has_manifest);
+    }
+
+    #[tokio::test]
+    async fn write_project_manifest_respects_overwrite() {
+        let (dir, db) = test_db().await;
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut input = new_project("gui-app", None);
+        input.root_path = Some(root.to_str().unwrap().to_string());
+        let id = save_project(&db, input).await.unwrap();
+
+        let path = write_project_manifest(&db, id, false).await.unwrap();
+        let m = manifest::read_file(Path::new(&path)).unwrap();
+        assert_eq!(m.project.name, "gui-app");
+        assert_eq!(m.project.environments[0].paths, vec![".env".to_string()]);
+
+        assert_eq!(write_project_manifest(&db, id, false).await.unwrap_err(), "manifest exists");
+        assert!(write_project_manifest(&db, id, true).await.is_ok());
+
+        let no_root = save_project(&db, new_project("no-root", None)).await.unwrap();
+        assert!(write_project_manifest(&db, no_root, false).await.is_err());
+    }
+
     // ─── inject_environment ─────────────────────────────────────────────
 
     async fn seeded_env_with_item(db: &VaultDb, key: &[u8; 32], var_key: &str, value: &str) -> i64 {
@@ -1155,7 +1440,7 @@ mod tests {
         let path = dir.path().join(".env");
         db.set_environment_paths(env_id, &[path.to_str().unwrap().to_string()]).await.unwrap();
 
-        let result = inject_environment(&db, &key, env_id, None, None, false).await.unwrap();
+        let result = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
 
         assert_eq!(result.written, vec!["DB_HOST".to_string()]);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1182,7 +1467,7 @@ mod tests {
         std::fs::write(&path, "PORT=3000\nDB_HOST=old-value\n").unwrap();
         db.set_environment_paths(env_id, &[path.to_str().unwrap().to_string()]).await.unwrap();
 
-        let result = inject_environment(&db, &key, env_id, None, None, false).await.unwrap();
+        let result = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
 
         // Reported once as unmanaged, with the backup that preserves the
         // original contents.
@@ -1198,7 +1483,7 @@ mod tests {
 
         // Second inject: the file now carries the marker, so it is Managed —
         // no longer reported unmanaged, no second backup, and a real merge.
-        let again = inject_environment(&db, &key, env_id, None, None, false).await.unwrap();
+        let again = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
         assert!(again.unmanaged_paths.is_empty(), "marker must make it Managed");
         assert!(again.backups.is_empty(), "Managed targets are never backed up");
     }
@@ -1212,7 +1497,7 @@ mod tests {
         db.set_environment_paths(env_id, &[configured.to_str().unwrap().to_string()]).await.unwrap();
         let extra = dir.path().join(".env.extra");
 
-        let result = inject_environment(&db, &key, env_id, Some(extra.to_str().unwrap().to_string()), None, false)
+        let result = inject_environment(&db, &key, env_id, Some(extra.to_str().unwrap().to_string()), None, false, None)
             .await
             .unwrap();
 
@@ -1228,7 +1513,7 @@ mod tests {
         let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
         // no configured paths, no output_path
 
-        let result = inject_environment(&db, &key, env_id, None, Some(dir.path().to_str().unwrap().to_string()), false)
+        let result = inject_environment(&db, &key, env_id, None, Some(dir.path().to_str().unwrap().to_string()), false, None)
             .await
             .unwrap();
 
@@ -1241,7 +1526,7 @@ mod tests {
     async fn inject_unknown_environment_errors_not_found() {
         let (_dir, db) = test_db().await;
         let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
-        let err = inject_environment(&db, &key, 999_999, None, None, false).await.unwrap_err();
+        let err = inject_environment(&db, &key, 999_999, None, None, false, None).await.unwrap_err();
         assert_eq!(err, "environment not found");
     }
 
@@ -1252,7 +1537,7 @@ mod tests {
         let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
         let env_id = db.upsert_environment(0, project_id, "production", true).await.unwrap();
 
-        let err = inject_environment(&db, &key, env_id, None, None, false).await.unwrap_err();
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
         assert_eq!(err, "environment has no paths configured");
     }
 
@@ -1406,7 +1691,7 @@ mod tests {
         db.add_item_owner(item_id, project_id).await.unwrap();
         db.upsert_environment_var(env_id, "DB_HOST", item_id).await.unwrap();
 
-        let result = inject_environment(&db, &key, env_id, None, Some(dir.path().to_str().unwrap().to_string()), false)
+        let result = inject_environment(&db, &key, env_id, None, Some(dir.path().to_str().unwrap().to_string()), false, None)
             .await
             .unwrap();
 

@@ -18,6 +18,8 @@ export interface ProjectFromTemplatesInput {
   categories:   string[];
   /** Name of the auto-created environment; blank → "default". */
   initialEnvironment?: string;
+  /** Project root directory (absolute, host view). */
+  rootPath?:   string;
   vars:         Array<{ key: string; value: string }>;
 }
 
@@ -27,14 +29,16 @@ interface ProjectStore {
   error:    string | null;
 
   load:              () => Promise<void>;
-  saveProject:       (input: { id?: number; name: string; description?: string; template: string; categories: string[] }) => Promise<number>;
+  /** `rootPath`: omitted keeps the current root, `''` clears it. */
+  saveProject:       (input: { id?: number; name: string; description?: string; template: string; categories: string[]; rootPath?: string }) => Promise<number>;
   createFromTemplates: (input: ProjectFromTemplatesInput) => Promise<number>;
   removeProject:     (id: number) => Promise<ProjectDeleteImpact>;
   previewDelete:     (id: number) => Promise<ProjectDeleteImpact>;
   saveEnvironment:   (input: EnvironmentInput) => Promise<number>;
   removeEnvironment: (id: number) => Promise<void>;
-  inject:            (environmentId: number, overwrite?: boolean) => Promise<InjectResult>;
-  previewInject:     (environmentId: number) => Promise<InjectPreview>;
+  /** `targets`: subset of the environment's configured paths; omitted = all. */
+  inject:            (environmentId: number, overwrite?: boolean, targets?: string[]) => Promise<InjectResult>;
+  previewInject:     (environmentId: number, targets?: string[]) => Promise<InjectPreview>;
   createProjectItem: (projectId: number, item: Omit<VaultItem, 'id' | 'created'>) => Promise<VaultItem>;
   clearError:        () => void;
 }
@@ -62,6 +66,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         description: input.description ?? null,
         template:    input.template,
         categories:  input.categories,
+        rootPath:    input.rootPath ?? null,
       },
     });
     await get().load();
@@ -78,6 +83,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
           template:    input.template,
           categories:  input.categories,
           initialEnvironment: input.initialEnvironment ?? null,
+          rootPath:    input.rootPath ?? null,
         },
         vars: input.vars,
       },
@@ -114,12 +120,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     await get().load();
   },
 
-  inject: async (environmentId, overwrite = false) => {
-    return invoke<InjectResult>('environment_inject', { id: environmentId, overwrite });
+  inject: async (environmentId, overwrite = false, targets) => {
+    return invoke<InjectResult>('environment_inject', { id: environmentId, overwrite, targets: targets ?? null });
   },
 
-  previewInject: (environmentId) => {
-    return invoke<InjectPreview>('environment_inject_preview', { id: environmentId });
+  previewInject: (environmentId, targets) => {
+    return invoke<InjectPreview>('environment_inject_preview', { id: environmentId, targets: targets ?? null });
   },
 
   createProjectItem: (projectId, item) => {

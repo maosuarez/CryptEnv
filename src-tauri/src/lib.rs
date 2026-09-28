@@ -37,7 +37,7 @@ use vault::share_commands::{
 use project::{
     environment_delete, environment_inject, environment_inject_preview, environment_save,
     project_delete, project_export, project_import, project_list, project_pick_env_path,
-    project_preview_delete, project_save,
+    project_preview_delete, project_save, project_check_root, project_pick_root_dir, project_write_yaml,
 };
 use project::relay_commands::{project_relay_receive, project_relay_send};
 use wsl::{wsl_configure_client, wsl_detect, wsl_distro_home, wsl_list_distros, wsl_remove_client};
@@ -235,6 +235,9 @@ pub fn run() {
             project_export,
             project_import,
             project_pick_env_path,
+            project_pick_root_dir,
+            project_check_root,
+            project_write_yaml,
             environment_save,
             environment_delete,
             environment_inject,

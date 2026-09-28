@@ -1470,23 +1470,24 @@ pub async fn biometric_enroll(
 
     // 3. DPAPI-protect the password bytes, then hex-encode for DB storage.
     #[cfg(target_os = "windows")]
-    let hex_blob = {
-        use zeroize::Zeroizing;
-        let pw_bytes = Zeroizing::new(password.into_bytes());
-        let blob = biometric::dpapi_protect(&pw_bytes)?;
-        crypto::hex_encode(&blob)
-    };
+    {
+        let hex_blob = {
+            use zeroize::Zeroizing;
+            let pw_bytes = Zeroizing::new(password.into_bytes());
+            let blob = biometric::dpapi_protect(&pw_bytes)?;
+            crypto::hex_encode(&blob)
+        };
+
+        let s = state.lock().await;
+        s.db.set_setting("biometric_blob", &hex_blob).await?;
+        Ok(())
+    }
 
     #[cfg(not(target_os = "windows"))]
-    let hex_blob: String = {
-        return Err("biometric unlock is not available on this platform".to_string());
-        #[allow(unreachable_code)]
-        String::new()
-    };
-
-    let s = state.lock().await;
-    s.db.set_setting("biometric_blob", &hex_blob).await?;
-    Ok(())
+    {
+        let _ = (state, password);
+        Err("biometric unlock is not available on this platform".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1824,6 +1825,7 @@ mod tests {
                 template: "node,postgres".to_string(),
                 categories: vec![],
                 initial_environment: None,
+                root_path: None,
             },
             vars: vars
                 .iter()

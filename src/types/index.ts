@@ -86,6 +86,9 @@ export interface Project {
   /** Category names — same convention as VaultItem.categories. Language is
    *  just another tag value here (e.g. "Python"). */
   categories:   string[];
+  /** Project root directory as the vault host sees it (holds
+   *  `.crypt-env.yaml`); relative environment paths resolve against it. */
+  rootPath?:    string;
 }
 
 /** Comma-joined template ids from `src/data/projectTemplates.ts`, or
