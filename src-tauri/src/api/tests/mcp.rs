@@ -340,6 +340,51 @@ async fn generated_env_is_private_gated_and_deleted_on_lock() {
     assert!(!path.exists(), "lock deletes generated files");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_env_quotes_multiline_and_special_values() {
+    let v = unlocked_vault().await;
+    let app = router(&v);
+    {
+        let s = v.state.lock().await;
+        let key = s.key.clone().unwrap();
+        for (name, value) in [("PEM_KEY", "line1\nline2"), ("WITH_SPACE", "a b #c")] {
+            let item = crate::vault::VaultItem {
+                id: 0,
+                item_type: "secret".to_string(),
+                name: Some(name.to_string()),
+                value: Some(value.to_string()),
+                url: None,
+                username: None,
+                password: None,
+                title: None,
+                description: None,
+                command: None,
+                shell: None,
+                categories: None,
+                notes: None,
+                content: None,
+                created: "0".to_string(),
+                is_global: Some(true),
+            };
+            let enc = crate::vault::encrypt_item(&key, &item).unwrap();
+            s.db.upsert_item(0, "secret", &enc, "0", true).await.unwrap();
+        }
+    }
+    let body = json!({"keys": ["PEM_KEY", "WITH_SPACE"], "environment_id": v.env_id});
+    let (_, accepted) = req(&app, "POST", "/generate-env", Some(&v.mcp_token), Some(body)).await;
+    let id = accepted.get("approvalId").and_then(|s| s.as_str()).unwrap().to_string();
+    v.api.resolve_approval(&id, true).await.unwrap();
+    let (_, poll) = req(&app, "GET", &format!("/approvals/{id}"), Some(&v.mcp_token), None).await;
+    let content = std::fs::read_to_string(poll["meta"]["path"].as_str().unwrap()).unwrap();
+
+    assert_eq!(poll["meta"]["count"], 2, "{poll:?}");
+    let parsed = crate::envfile::parse_dotenv(&content);
+    assert!(parsed.contains(&("PEM_KEY".to_string(), "line1\nline2".to_string())), "{content}");
+    assert!(parsed.contains(&("WITH_SPACE".to_string(), "a b #c".to_string())), "{content}");
+    assert_eq!(parsed.len(), 2, "a multi-line value must not inject variables");
+}
+
 // ─── POST /exec ───────────────────────────────────────────────────────────────
 
 /// Seeds a global command item and returns its id.

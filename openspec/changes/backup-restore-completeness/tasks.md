@@ -20,3 +20,5 @@
 - [ ] 4.1 Settings Backup/Restore: current-password field for replace, disabled while locked, restore summary (including the v1 "projects not included" note), i18n. Verify with `pnpm build` and a manual round trip in `pnpm tauri dev`.
 - [x] 4.2 Update the backup section in `docs/index.html`. Verify by review.
 - [x] 4.3 Run `cargo clippy --all-targets && cargo test`. All pass.
+- [x] 4.4 `VaultState::set_key` cancels share sessions when a live key is replaced by a different one (replace restore, re-key). Verify with `share::tests::changing_the_vault_key_cancels_the_session_and_drops_its_key`.
+- [x] 4.5 After a merge restore the GUI re-reads items and categories (`vault_get_items`, `vault_get_categories`) into the store. Verify with `tsc --noEmit`.

@@ -118,9 +118,16 @@ impl VaultState {
         if self.key.is_none() && key.is_some() {
             self.db.discard_pre_restore();
         }
+        // A different key replacing a live one (re-key, replace restore) makes
+        // any share session's key copy stale or foreign: end it. Lock/unlock
+        // transitions are handled by `lock_vault`.
+        let swapped = self.key.is_some() && key.is_some() && !unchanged;
         self.key = key;
         if !unchanged {
             self.epoch = self.epoch.wrapping_add(1);
+        }
+        if swapped {
+            crate::share::cancel_all_blocking(&self.share);
         }
     }
 

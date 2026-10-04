@@ -6089,7 +6089,6 @@ dependencies = [
  "crossterm 0.28.1",
  "crypt-env-setup",
  "dialoguer",
- "dotenvy",
  "hkdf",
  "hmac",
  "libc",

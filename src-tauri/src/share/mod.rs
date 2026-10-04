@@ -911,7 +911,11 @@ pub async fn confirm_fingerprint(
 /// key copies. A session that already finished keeps its result state.
 pub async fn cancel_session(share_state: &Arc<ShareState>) -> Result<(), ShareError> {
     let mut guard = share_state.session.lock().await;
-    match guard.as_mut() {
+    cancel_locked(guard.as_mut())
+}
+
+fn cancel_locked(session: Option<&mut ShareSession>) -> Result<(), ShareError> {
+    match session {
         None => Err(ShareError::InvalidState("no active session".into())),
         Some(s) => {
             s.cancel.store(true, Ordering::Relaxed);
@@ -923,6 +927,20 @@ pub async fn cancel_session(share_state: &Arc<ShareState>) -> Result<(), ShareEr
             }
             Ok(())
         }
+    }
+}
+
+/// Synchronous variant for `VaultState::set_key` (which cannot await): cancels
+/// immediately when the session slot is free, otherwise hands the cancel to the
+/// runtime. Needed when the vault key changes while a session holds a key copy.
+pub fn cancel_all_blocking(share_state: &Arc<ShareState>) {
+    if let Ok(mut guard) = share_state.session.try_lock() {
+        let _ = cancel_locked(guard.as_mut());
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let share = share_state.clone();
+        handle.spawn(async move { cancel_all(&share).await });
     }
 }
 
