@@ -154,6 +154,14 @@ export function BackupModal({ onClose }: BackupModalProps) {
           { password: restorePw },
         );
         await unlockWithPayload(payload);
+      } else {
+        // Merge keeps the unlocked session and key: re-read what the store holds
+        // (screens that list projects fetch them when opened).
+        const [items, categories] = await Promise.all([
+          invoke<VaultItem[]>('vault_get_items'),
+          invoke<Category[]>('vault_get_categories'),
+        ]);
+        useVaultStore.setState({ items, cats: categories });
       }
       showToast(
         t(restoreMode === 'merge' ? 'backup.toastMergedFull' : 'backup.toastRestoredFull', {
