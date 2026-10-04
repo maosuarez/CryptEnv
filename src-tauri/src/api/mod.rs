@@ -2812,7 +2812,7 @@ async fn handle_relay_send(
     let code = relay::generate_share_code();
     let passphrase = crate::share::crypto::generate_passphrase();
 
-    let relay_key = match relay::derive_relay_key(&code, &passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&code, &passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(
@@ -2921,7 +2921,7 @@ async fn handle_relay_receive(
     };
 
     // Derive relay key before spawning blocking tasks (no I/O needed)
-    let relay_key = match relay::derive_relay_key(&body.code, &body.passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(
@@ -2984,7 +2984,7 @@ async fn handle_relay_receive(
     let key_clone = anon_key.clone();
     let code_clone = body.code.clone();
     let download_result = tokio::task::spawn_blocking(move || {
-        relay::relay_download(&url_clone, &key_clone, &code_clone)
+        relay::relay_claim(&url_clone, &key_clone, &code_clone)
     })
     .await;
 
@@ -3019,15 +3019,6 @@ async fn handle_relay_receive(
             .into_response()
         }
     };
-
-    // Delete after first use (burn-after-read, best-effort)
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = body.code.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)
-    })
-    .await;
 
     // Import items into the vault, owned by and linked into the resolved
     // project/environment — reuses the exact same helper LAN share and
@@ -3171,7 +3162,7 @@ async fn handle_project_relay_send(
     let code = relay::generate_share_code();
     let passphrase = crate::share::crypto::generate_passphrase();
 
-    let relay_key = match relay::derive_relay_key(&code, &passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&code, &passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
@@ -3266,7 +3257,7 @@ async fn handle_project_relay_receive(
         .into_response();
     }
 
-    let relay_key = match relay::derive_relay_key(&body.code, &body.passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
@@ -3320,7 +3311,7 @@ async fn handle_project_relay_receive(
     let key_clone = anon_key.clone();
     let code_clone = body.code.clone();
     let download_result = tokio::task::spawn_blocking(move || {
-        relay::relay_download(&url_clone, &key_clone, &code_clone)
+        relay::relay_claim(&url_clone, &key_clone, &code_clone)
     })
     .await;
     let payload = match download_result {
@@ -3354,15 +3345,6 @@ async fn handle_project_relay_receive(
             .into_response()
         }
     };
-
-    // Burn-after-read (best-effort).
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = body.code.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)
-    })
-    .await;
 
     let vault = state.vault.lock().await;
     let result = project::relay::receive_project_bundle(&vault.db, &vault_key, bundle, body.project_name_override)

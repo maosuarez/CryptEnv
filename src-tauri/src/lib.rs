@@ -31,7 +31,7 @@ use vault::{
 };
 use vault::share_commands::{
     share_cancel, share_confirm_fingerprint, share_export_file, share_import_file,
-    share_poll_status, share_relay_receive, share_relay_send, share_start_receive,
+    share_poll_status, relay_schema_version, share_relay_receive, share_relay_send, share_start_receive,
     share_start_send, SharedShareState,
 };
 use project::{
@@ -227,6 +227,7 @@ pub fn run() {
             share_import_file,
             share_relay_send,
             share_relay_receive,
+            relay_schema_version,
             project_list,
             project_save,
             project_create_from_templates,

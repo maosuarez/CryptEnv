@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { RelayCodeDisplay } from './ui/RelayCodeDisplay';
+import { RelaySchemaOutdatedNotice, isRelaySchemaOutdated } from './ui/RelaySql';
 import { useTranslation } from '../i18n';
 import type { Project, VaultItem } from '../types';
 
@@ -84,6 +85,7 @@ function BtnSecondary({ children, onClick, disabled }: { children: React.ReactNo
 }
 
 function InlineError({ msg }: { msg: string }) {
+  if (isRelaySchemaOutdated(msg)) return <RelaySchemaOutdatedNotice />;
   return (
     <div className="text-[12px] text-danger font-mono bg-danger-b border border-danger rounded-[3px] px-3 py-2 mb-3">
       {msg}
