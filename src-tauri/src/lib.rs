@@ -6,6 +6,7 @@ pub mod cli;
 pub mod crypto;
 pub mod db;
 pub mod envfile;
+pub mod exec;
 pub mod fsguard;
 pub mod hotkey;
 pub mod mcp;
@@ -29,6 +30,7 @@ use vault::{
     vault_get_item_owners, vault_list_orphan_items, vault_prune_orphan_items, project_create_from_templates,
     vault_pause_hotkey, vault_touch, SharedState, VaultState,
 };
+use api::approvals::{approval_list, approval_resolve};
 use vault::share_commands::{
     share_cancel, share_confirm_fingerprint, share_export_file, share_import_file,
     share_poll_status, relay_schema_version, share_relay_receive, share_relay_send, share_start_receive,
@@ -118,14 +120,36 @@ pub fn run() {
 
             app.manage(PendingUpdate(std::sync::Mutex::new(None)));
 
-            let api_state = state.clone();
+            // Private directory for plaintext files generated for MCP; anything a
+            // previous run left behind is swept here.
+            let generated =
+                tauri::async_runtime::block_on(async { state.lock().await.generated.clone() });
+            generated.init(app_dir.join("mcp-tmp"));
+
+            let api_state = std::sync::Arc::new(api::ApiState::new(state.clone()));
+            app.manage(api_state.clone());
+
+            // A pending MCP approval must be seen by the user: tell the webview and
+            // bring the window forward (it may be hidden to the tray).
+            let approval_handle = app.handle().clone();
+            api_state.set_approval_notifier(move |view| {
+                let _ = approval_handle.emit("approval://requested", view);
+                if let Some(window) = approval_handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+                }
+            });
+
             let api_app_dir = app_dir.clone();
-            tauri::async_runtime::spawn(api::start_server(api_state, api_app_dir));
+            tauri::async_runtime::spawn(api::start_server(api_state.clone(), api_app_dir));
 
             // Background auto-lock: every 30 s, check idle time against the
             // configured timeout. Timeout = 0 means "never lock".
             let auto_lock_state = state.clone();
             let auto_lock_handle = app.handle().clone();
+            let maintenance_state = api_state.clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(30));
@@ -135,6 +159,9 @@ pub fn run() {
 
                 loop {
                     interval.tick().await;
+
+                    // Expire stale MCP approvals and delete expired generated files.
+                    maintenance_state.maintenance().await;
 
                     // Acquire lock, compute whether we should auto-lock, then
                     // release before calling lock_vault (which re-acquires).
@@ -257,7 +284,18 @@ pub fn run() {
             app_complete_setup,
             app_generate_mcp_config,
             app_get_system_info,
+            approval_list,
+            approval_resolve,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Plaintext files generated for MCP must not outlive the app.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<SharedState>();
+                tauri::async_runtime::block_on(async {
+                    state.lock().await.generated.purge_all();
+                });
+            }
+        });
 }
