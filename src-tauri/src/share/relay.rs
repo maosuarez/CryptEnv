@@ -3,9 +3,11 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use super::package::PlainItem;
 use super::ShareError;
+use crate::crypto::VaultKey;
 use crate::share::crypto::{decrypt_message, encrypt_message};
 
 // ─── Relay session structs ────────────────────────────────────────────────────
@@ -38,16 +40,16 @@ pub const RELAY_SCHEMA_VERSION: i32 = 2;
 
 /// Derive a 32-byte relay encryption key from (code, passphrase) deterministically.
 /// salt = SHA-256(code) so both sides can reproduce without extra transmission.
-pub fn derive_relay_key(code: &str, passphrase: &str) -> Result<[u8; 32], ShareError> {
-    let salt: [u8; 32] = Sha256::digest(code.as_bytes()).into();
+pub fn derive_relay_key(code: &str, passphrase: &str) -> Result<VaultKey, ShareError> {
+    let salt: [u8; 32] = Sha256::digest(code.as_bytes()).into(); // key-hygiene: not-a-key (salt)
     let params = Params::new(32768, 2, 2, Some(32))
         .map_err(|e| ShareError::Crypto(e.to_string()))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut *key)
         .map_err(|e| ShareError::Crypto(e.to_string()))?;
-    Ok(key)
+    Ok(VaultKey::new(key))
 }
 
 /// Runs `f` on a blocking thread after acquiring a permit from `sem`, so at
@@ -68,9 +70,9 @@ where
 
 /// Async, bounded wrapper around `derive_relay_key`. All async callers MUST use
 /// this one: it keeps Argon2id off the runtime workers and caps concurrency at 2.
-pub async fn derive_relay_key_async(code: &str, passphrase: &str) -> Result<[u8; 32], ShareError> {
+pub async fn derive_relay_key_async(code: &str, passphrase: &str) -> Result<VaultKey, ShareError> {
     let code = code.to_owned();
-    let passphrase = passphrase.to_owned();
+    let passphrase = Zeroizing::new(passphrase.to_owned());
     run_bounded(&RELAY_KDF, move || derive_relay_key(&code, &passphrase)).await
 }
 
@@ -86,13 +88,15 @@ pub fn code_hash(code: &str) -> String {
 
 // ─── Payload encryption ───────────────────────────────────────────────────────
 
-pub fn encrypt_items(items: &[PlainItem], key: &[u8; 32]) -> Result<String, ShareError> {
-    let json = serde_json::to_vec(items).map_err(|e| ShareError::Protocol(e.to_string()))?;
+pub fn encrypt_items(items: &[PlainItem], key: &VaultKey) -> Result<String, ShareError> {
+    let json = Zeroizing::new(
+        serde_json::to_vec(items).map_err(|e| ShareError::Protocol(e.to_string()))?,
+    );
     let ciphertext = encrypt_message(key, &json);
     Ok(B64.encode(&ciphertext))
 }
 
-pub fn decrypt_payload(payload: &str, key: &[u8; 32]) -> Result<Vec<PlainItem>, ShareError> {
+pub fn decrypt_payload(payload: &str, key: &VaultKey) -> Result<Vec<PlainItem>, ShareError> {
     let ciphertext = B64
         .decode(payload)
         .map_err(|e| ShareError::Protocol(format!("base64 decode: {e}")))?;
@@ -156,8 +160,10 @@ impl ProjectBundle {
     pub const VERSION: u32 = 1;
 }
 
-pub fn encrypt_project(bundle: &ProjectBundle, key: &[u8; 32]) -> Result<String, ShareError> {
-    let json = serde_json::to_vec(bundle).map_err(|e| ShareError::Protocol(e.to_string()))?;
+pub fn encrypt_project(bundle: &ProjectBundle, key: &VaultKey) -> Result<String, ShareError> {
+    let json = Zeroizing::new(
+        serde_json::to_vec(bundle).map_err(|e| ShareError::Protocol(e.to_string()))?,
+    );
     let ciphertext = encrypt_message(key, &json);
     Ok(B64.encode(&ciphertext))
 }
@@ -165,7 +171,7 @@ pub fn encrypt_project(bundle: &ProjectBundle, key: &[u8; 32]) -> Result<String,
 /// Decrypts and validates a project bundle: rejects a wrong `kind` (e.g. a
 /// payload produced by `encrypt_items`) and an unknown `version` before
 /// returning, so a format change never has to repeat this discriminator dance.
-pub fn decrypt_project(payload: &str, key: &[u8; 32]) -> Result<ProjectBundle, ShareError> {
+pub fn decrypt_project(payload: &str, key: &VaultKey) -> Result<ProjectBundle, ShareError> {
     let ciphertext = B64
         .decode(payload)
         .map_err(|e| ShareError::Protocol(format!("base64 decode: {e}")))?;
@@ -463,7 +469,7 @@ mod tests {
         let h = code_hash("ABCD-1234");
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
-        let salt: [u8; 32] = Sha256::digest(b"ABCD-1234").into();
+        let salt: [u8; 32] = Sha256::digest(b"ABCD-1234").into(); // key-hygiene: not-a-key (salt)
         let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
         assert_ne!(h, salt_hex);
         assert!(!h.contains("ABCD"));

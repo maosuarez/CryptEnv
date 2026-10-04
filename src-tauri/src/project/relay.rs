@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::crypto::VaultKey;
 use crate::db::{ReceivedEnvironment, ReceivedProjectItem, ReceivedVar, VaultDb};
 use crate::share::package::PlainItem;
 use crate::share::relay::{EnvironmentBundle, ProjectBundle, ProjectBundleVar};
@@ -36,7 +37,7 @@ fn now_ts() -> String {
 /// failing the whole send (mirrors the pre-existing item-relay behaviour).
 pub async fn build_project_bundle(
     db: &VaultDb,
-    vault_key: &[u8; 32],
+    vault_key: &VaultKey,
     project_id: i64,
     environment_ids: &[i64],
 ) -> Result<ProjectBundle, String> {
@@ -111,7 +112,7 @@ pub async fn build_project_bundle(
         items: bundled.into_values().collect(),
     };
 
-    let json_len = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?.len();
+    let json_len = zeroize::Zeroizing::new(serde_json::to_vec(&bundle).map_err(|e| e.to_string())?).len();
     if json_len > MAX_BUNDLE_BYTES {
         return Err(format!(
             "project bundle too large ({} KiB, max {} KiB) — share fewer environments",
@@ -142,7 +143,7 @@ pub struct ReceivedProject {
 /// with a project that has no default environment.
 pub async fn receive_project_bundle(
     db: &VaultDb,
-    vault_key: &[u8; 32],
+    vault_key: &VaultKey,
     bundle: ProjectBundle,
     name_override: Option<String>,
 ) -> Result<ReceivedProject, String> {

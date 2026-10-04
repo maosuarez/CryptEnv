@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::crypto::{decrypt_message, encrypt_message};
+use crate::crypto::VaultKey;
 use super::package::PlainItem;
 use super::ShareError;
 
@@ -190,11 +191,12 @@ pub fn recv_plain(stream: &mut TcpStream, guard: &IoGuard) -> Result<ShareMessag
 /// Send a message encrypted with the session key.
 pub fn send_encrypted(
     stream: &mut TcpStream,
-    key: &[u8; 32],
+    key: &VaultKey,
     msg: &ShareMessage,
 ) -> Result<(), ShareError> {
-    let json =
-        serde_json::to_vec(msg).map_err(|e| ShareError::Protocol(e.to_string()))?;
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_vec(msg).map_err(|e| ShareError::Protocol(e.to_string()))?,
+    );
     let ct = encrypt_message(key, &json);
     write_frame(stream, &ct)
 }
@@ -202,7 +204,7 @@ pub fn send_encrypted(
 /// Receive and decrypt a message with the session key.
 pub fn recv_encrypted(
     stream: &mut TcpStream,
-    key: &[u8; 32],
+    key: &VaultKey,
     guard: &IoGuard,
 ) -> Result<ShareMessage, ShareError> {
     let frame = read_frame(stream, guard, MAX_FRAME)?;

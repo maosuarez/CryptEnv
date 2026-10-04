@@ -167,7 +167,7 @@ async fn t2_inject_environment_sink_no_amplification() {
     let root = tempdir().unwrap();
     let base_dir = root.path().join("base");
     fs::create_dir_all(&base_dir).unwrap();
-    let vault_key = [0u8; 32];
+    let vault_key = crypt_env_lib::crypto::VaultKey::from_slice(&[0u8; 32]).unwrap();
 
     for name in MALICIOUS {
         // Bypass layer 1 (`db::upsert_environment` directly) to exercise
@@ -309,7 +309,7 @@ async fn t7_legacy_hostile_name_contained_and_vault_stays_usable() {
     let output_root = tempdir().unwrap();
     let base_dir = output_root.path().join("base");
     fs::create_dir_all(&base_dir).unwrap();
-    let vault_key = [0u8; 32];
+    let vault_key = crypt_env_lib::crypto::VaultKey::from_slice(&[0u8; 32]).unwrap();
 
     let result = project::inject_environment(
         &db,

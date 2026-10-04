@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::{HelloError, HelloSigner};
-use crate::crypto::{self, CryptoKey};
+use crate::crypto::{self, VaultKey};
 
 const VERSION: u32 = 2;
 const CHALLENGE_LEN: usize = 32;
@@ -44,40 +44,37 @@ impl Enrollment {
     }
 }
 
-fn derive_wrap_key(signature: &[u8], challenge: &[u8]) -> Result<Zeroizing<CryptoKey>, HelloError> {
+fn derive_wrap_key(signature: &[u8], challenge: &[u8]) -> Result<VaultKey, HelloError> {
     let mut key = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(challenge), signature)
         .expand(HKDF_INFO, key.as_mut_slice())
         .map_err(|_| HelloError::Unusable)?;
-    Ok(key)
+    Ok(VaultKey::new(key))
 }
 
 /// Wraps `vault_key` under a key derived from `signature` over `challenge`.
 fn wrap(
     signature: &[u8],
     challenge: &[u8],
-    vault_key: &CryptoKey,
+    vault_key: &VaultKey,
 ) -> Result<Enrollment, HelloError> {
     let wrap_key = derive_wrap_key(signature, challenge)?;
-    let wrapped = crypto::encrypt(&wrap_key, vault_key).map_err(|_| HelloError::Unusable)?;
+    let wrapped = crypto::encrypt(&wrap_key, vault_key.expose()).map_err(|_| HelloError::Unusable)?;
     Ok(Enrollment { v: VERSION, challenge: crypto::hex_encode(challenge), wrapped })
 }
 
 /// Inverse of [`wrap`]; fails for any other signature.
-fn unwrap(signature: &[u8], enrollment: &Enrollment) -> Result<Zeroizing<CryptoKey>, HelloError> {
+fn unwrap(signature: &[u8], enrollment: &Enrollment) -> Result<VaultKey, HelloError> {
     let challenge = crypto::hex_decode(&enrollment.challenge).map_err(|_| HelloError::Unusable)?;
     let wrap_key = derive_wrap_key(signature, &challenge)?;
-    let plain = Zeroizing::new(
-        crypto::decrypt(&wrap_key, &enrollment.wrapped).map_err(|_| HelloError::Unusable)?,
-    );
-    let key: CryptoKey = plain.as_slice().try_into().map_err(|_| HelloError::Unusable)?;
-    Ok(Zeroizing::new(key))
+    let plain = crypto::decrypt(&wrap_key, &enrollment.wrapped).map_err(|_| HelloError::Unusable)?;
+    VaultKey::from_slice(&plain).map_err(|_| HelloError::Unusable)
 }
 
 /// Creates the Hello credential, checks that its signature is deterministic
 /// and returns the blob JSON to store. Blocks (Hello prompts). On any failure
 /// the credential is deleted again so nothing is left half-enrolled.
-pub fn enroll(signer: &dyn HelloSigner, vault_key: &CryptoKey) -> Result<String, HelloError> {
+pub fn enroll(signer: &dyn HelloSigner, vault_key: &VaultKey) -> Result<String, HelloError> {
     signer.create()?;
     let result = enroll_with_credential(signer, vault_key);
     if result.is_err() {
@@ -88,7 +85,7 @@ pub fn enroll(signer: &dyn HelloSigner, vault_key: &CryptoKey) -> Result<String,
 
 fn enroll_with_credential(
     signer: &dyn HelloSigner,
-    vault_key: &CryptoKey,
+    vault_key: &VaultKey,
 ) -> Result<String, HelloError> {
     let mut challenge = [0u8; CHALLENGE_LEN];
     rand::thread_rng().fill_bytes(&mut challenge);
@@ -108,7 +105,7 @@ pub fn unlock_key(
     signer: &dyn HelloSigner,
     enrollment: &Enrollment,
     verify_token: &str,
-) -> Result<Zeroizing<CryptoKey>, HelloError> {
+) -> Result<VaultKey, HelloError> {
     let challenge = crypto::hex_decode(&enrollment.challenge).map_err(|_| HelloError::Unusable)?;
     let signature = signer.sign(&challenge)?;
     let key = unwrap(&signature, enrollment)?;
@@ -168,26 +165,28 @@ pub(crate) mod tests {
         }
     }
 
-    const KEY: CryptoKey = [0x11; 32];
+    fn test_key() -> VaultKey {
+        VaultKey::from_slice(&[0x11; 32]).unwrap()
+    }
 
     #[test]
     fn wrap_round_trips() {
-        let e = wrap(b"signature-a", &[1u8; 32], &KEY).unwrap();
+        let e = wrap(b"signature-a", &[1u8; 32], &test_key()).unwrap();
         let back = unwrap(b"signature-a", &e).unwrap();
-        assert_eq!(*back, KEY);
+        assert!(back.ct_eq(&test_key()));
     }
 
     #[test]
     fn different_signature_does_not_unwrap() {
-        let e = wrap(b"signature-a", &[1u8; 32], &KEY).unwrap();
+        let e = wrap(b"signature-a", &[1u8; 32], &test_key()).unwrap();
         assert_eq!(unwrap(b"signature-b", &e).unwrap_err(), HelloError::Unusable);
     }
 
     #[test]
     fn blob_does_not_contain_the_key() {
-        let e = wrap(b"signature-a", &[1u8; 32], &KEY).unwrap();
+        let e = wrap(b"signature-a", &[1u8; 32], &test_key()).unwrap();
         let json = e.to_json().unwrap();
-        assert!(!json.contains(&crypto::hex_encode(&KEY)));
+        assert!(!json.contains(&crypto::hex_encode(test_key().expose())));
         assert!(Enrollment::parse(&json).is_some());
     }
 
@@ -205,14 +204,14 @@ pub(crate) mod tests {
         let hello = FakeHello::new();
         let blob = enroll(&hello, &key).unwrap();
         let e = Enrollment::parse(&blob).unwrap();
-        assert_eq!(*unlock_key(&hello, &e, &token).unwrap(), key);
+        assert!(unlock_key(&hello, &e, &token).unwrap().ct_eq(&key));
     }
 
     #[test]
     fn enroll_refuses_non_deterministic_signatures_and_cleans_up() {
         let mut hello = FakeHello::new();
         hello.randomized = true;
-        assert_eq!(enroll(&hello, &KEY).unwrap_err(), HelloError::NotDeterministic);
+        assert_eq!(enroll(&hello, &test_key()).unwrap_err(), HelloError::NotDeterministic);
         assert_eq!(*hello.deletes.lock().unwrap(), 1);
     }
 
@@ -220,7 +219,7 @@ pub(crate) mod tests {
     fn enroll_cancelled_stores_nothing() {
         let mut hello = FakeHello::new();
         hello.cancel = true;
-        assert_eq!(enroll(&hello, &KEY).unwrap_err(), HelloError::Cancelled);
+        assert_eq!(enroll(&hello, &test_key()).unwrap_err(), HelloError::Cancelled);
     }
 
     #[test]

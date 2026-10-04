@@ -9,6 +9,7 @@ use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
 use super::ShareError;
+use crate::crypto::VaultKey;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -53,7 +54,7 @@ pub struct PakeStart {
 /// Result of a completed SPAKE2 exchange. The keys are only trustworthy after
 /// `verify_peer_confirmation` succeeds.
 pub struct PakeKeys {
-    pub session_key: Zeroizing<[u8; 32]>,
+    pub session_key: VaultKey,
     confirm_key: Zeroizing<[u8; 32]>,
     transcript: Vec<u8>,
     role: PairRole,
@@ -97,15 +98,15 @@ impl PakeStart {
                 .map_err(|_| ShareError::Protocol("invalid pairing message".into()))?,
         );
         let hk = Hkdf::<Sha256>::new(None, &shared);
-        let mut session = [0u8; 32];
-        let mut confirm = [0u8; 32];
-        hk.expand(SESSION_KEY_INFO, &mut session)
+        let mut session = Zeroizing::new([0u8; 32]);
+        let mut confirm = Zeroizing::new([0u8; 32]);
+        hk.expand(SESSION_KEY_INFO, &mut *session)
             .map_err(|_| ShareError::Crypto("HKDF expand failed".into()))?;
-        hk.expand(CONFIRM_KEY_INFO, &mut confirm)
+        hk.expand(CONFIRM_KEY_INFO, &mut *confirm)
             .map_err(|_| ShareError::Crypto("HKDF expand failed".into()))?;
         Ok(PakeKeys {
-            session_key: Zeroizing::new(session),
-            confirm_key: Zeroizing::new(confirm),
+            session_key: VaultKey::new(session),
+            confirm_key: confirm,
             transcript,
             role,
         })
@@ -148,8 +149,8 @@ impl PakeKeys {
 }
 
 /// AES-256-GCM encrypt. Prepends 12-byte random nonce to ciphertext.
-pub fn encrypt_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key is always valid");
+pub fn encrypt_message(key: &VaultKey, plaintext: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new_from_slice(key.expose()).expect("32-byte key is always valid");
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -162,39 +163,40 @@ pub fn encrypt_message(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 }
 
 /// AES-256-GCM decrypt. Expects nonce (12 bytes) prepended to ciphertext.
-pub fn decrypt_message(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, ShareError> {
+pub fn decrypt_message(key: &VaultKey, data: &[u8]) -> Result<Zeroizing<Vec<u8>>, ShareError> {
     if data.len() < 12 {
         return Err(ShareError::Protocol("message too short to contain nonce".into()));
     }
     let nonce = Nonce::from_slice(&data[..12]);
-    let cipher = Aes256Gcm::new_from_slice(key)
+    let cipher = Aes256Gcm::new_from_slice(key.expose())
         .map_err(|e| ShareError::Crypto(e.to_string()))?;
     cipher
         .decrypt(nonce, &data[12..])
+        .map(Zeroizing::new)
         .map_err(|_| ShareError::Crypto("decryption failed — message may be tampered".into()))
 }
 
 /// Derive a package encryption key from a passphrase using Argon2id.
 /// Uses lighter parameters than the vault KDF because the passphrase is a
 /// random 12-char string (high entropy), so lower work factors are acceptable.
-pub fn derive_package_key(passphrase: &str, salt: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub fn derive_package_key(passphrase: &str, salt: &[u8; 32]) -> VaultKey { // key-hygiene: not-a-key (salt)
     let params = Params::new(32768, 2, 2, Some(32)).expect("valid Argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .expect("Argon2id key derivation failed");
-    Zeroizing::new(key)
+    VaultKey::new(key)
 }
 
 /// Generate a 12-character random passphrase from [a-zA-Z0-9].
-pub fn generate_passphrase() -> String {
+pub fn generate_passphrase() -> Zeroizing<String> {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
-    let mut out = String::with_capacity(12);
-    let mut buf = [0u8; 12];
-    rng.fill_bytes(&mut buf);
-    for byte in buf {
+    let mut out = Zeroizing::new(String::with_capacity(12));
+    let mut buf = Zeroizing::new([0u8; 12]);
+    rng.fill_bytes(&mut *buf);
+    for byte in buf.iter().copied() {
         out.push(ALPHABET[(byte as usize) % ALPHABET.len()] as char);
     }
     out
@@ -215,7 +217,7 @@ mod tests {
     #[test]
     fn same_code_gives_same_key_fingerprint_and_valid_confirmations() {
         let (s, r) = pair("123456", "123456");
-        assert_eq!(*s.session_key, *r.session_key);
+        assert!(s.session_key.ct_eq(&r.session_key));
         assert_eq!(s.fingerprint(), r.fingerprint());
         r.verify_peer_confirmation(&s.our_confirmation().unwrap()).unwrap();
         s.verify_peer_confirmation(&r.our_confirmation().unwrap()).unwrap();
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn wrong_code_fails_confirmation_both_ways() {
         let (s, r) = pair("123456", "654321");
-        assert_ne!(*s.session_key, *r.session_key);
+        assert!(!s.session_key.ct_eq(&r.session_key));
         assert!(matches!(
             r.verify_peer_confirmation(&s.our_confirmation().unwrap()),
             Err(ShareError::PairingFailed)

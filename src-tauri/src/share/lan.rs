@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
+use crate::crypto::VaultKey;
 
 use super::crypto::{PairRole, PakeStart};
 use super::package::PlainItem;
@@ -147,7 +147,7 @@ pub fn pair_handshake(
     pairing_code: &str,
     role: PairRole,
     cfg: &LanConfig,
-) -> Result<(Zeroizing<[u8; 32]>, String), ShareError> {
+) -> Result<(VaultKey, String), ShareError> {
     configure_stream(stream, cfg.io_timeout)?;
     let mut guard = cfg.io_guard();
     guard.deadline = Some(Instant::now() + cfg.handshake_timeout);
@@ -204,7 +204,7 @@ pub fn connect_and_pair(
     pairing_code: &str,
     timeout_secs: u64,
     cfg: &LanConfig,
-) -> Result<(TcpStream, Zeroizing<[u8; 32]>, String), ShareError> {
+) -> Result<(TcpStream, VaultKey, String), ShareError> {
     let mdns = ServiceDaemon::new()
         .map_err(|e| ShareError::Discovery(format!("mdns daemon: {e}")))?;
 
@@ -289,18 +289,18 @@ pub fn connect_and_pair(
 /// `items_to_send` are already-decrypted PlainItem values.
 pub fn sender_send_items(
     mut stream: TcpStream,
-    shared_key: &Zeroizing<[u8; 32]>,
+    shared_key: &VaultKey,
     items: Vec<PlainItem>,
     cfg: &LanConfig,
 ) -> Result<usize, ShareError> {
     send_encrypted(
         &mut stream,
-        &**shared_key,
+        shared_key,
         &ShareMessage::Items { items },
     )?;
 
     // Wait for Ack
-    let ack = recv_encrypted(&mut stream, &**shared_key, &cfg.io_guard())?;
+    let ack = recv_encrypted(&mut stream, shared_key, &cfg.io_guard())?;
     match ack {
         ShareMessage::Ack { received } => Ok(received),
         ShareMessage::Error { message, .. } => Err(ShareError::Remote(message)),
@@ -311,12 +311,12 @@ pub fn sender_send_items(
 /// Send an Error message and close the connection.
 pub fn sender_reject(
     mut stream: TcpStream,
-    shared_key: &Zeroizing<[u8; 32]>,
+    shared_key: &VaultKey,
     reason: &str,
 ) -> Result<(), ShareError> {
     send_encrypted(
         &mut stream,
-        &**shared_key,
+        shared_key,
         &ShareMessage::Error {
             code: "REJECTED".into(),
             message: reason.to_string(),
@@ -333,7 +333,7 @@ pub fn sender_reject(
 /// `io_timeout` applies. Returns the list of received PlainItems.
 pub fn receiver_receive_items(
     mut stream: TcpStream,
-    shared_key: &Zeroizing<[u8; 32]>,
+    shared_key: &VaultKey,
     cfg: &LanConfig,
     sender_wait: Duration,
 ) -> Result<Vec<PlainItem>, ShareError> {
@@ -341,14 +341,14 @@ pub fn receiver_receive_items(
     wait_guard.cancel = cfg.cancel.clone();
     wait_readable(&stream, &wait_guard)?;
 
-    let msg = recv_encrypted(&mut stream, &**shared_key, &cfg.io_guard())?;
+    let msg = recv_encrypted(&mut stream, shared_key, &cfg.io_guard())?;
     match msg {
         ShareMessage::Items { items } => {
             let count = items.len();
             // Send acknowledgement
             send_encrypted(
                 &mut stream,
-                &**shared_key,
+                shared_key,
                 &ShareMessage::Ack { received: count },
             )?;
             Ok(items)
@@ -383,8 +383,8 @@ mod tests {
         sender_code: &'static str,
         receiver_code: &'static str,
     ) -> (
-        Result<(Zeroizing<[u8; 32]>, String), ShareError>,
-        Result<(Zeroizing<[u8; 32]>, String), ShareError>,
+        Result<(VaultKey, String), ShareError>,
+        Result<(VaultKey, String), ShareError>,
     ) {
         let (mut a, mut b) = socket_pair();
         let t = std::thread::spawn(move || {
@@ -399,7 +399,7 @@ mod tests {
         let (s, r) = run_pair("111111", "111111");
         let (sk, sfp) = s.unwrap();
         let (rk, rfp) = r.unwrap();
-        assert_eq!(*sk, *rk);
+        assert!(sk.ct_eq(&rk));
         assert_eq!(sfp, rfp);
     }
 

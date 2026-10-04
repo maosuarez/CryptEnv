@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tauri::State;
 use zeroize::Zeroizing;
 
+use crate::crypto::VaultKey;
 use crate::db::{DbEnvironmentVar, ProjectDeleteImpact, VaultDb};
 use crate::envfile;
 use crate::vault::SharedState;
@@ -128,8 +129,8 @@ pub struct InjectResult {
 
 /// Decrypts one stored item and returns its injectable value, zeroizing the
 /// intermediate plaintext. The error carries no item content.
-fn decrypt_item_value(vault_key: &[u8; 32], data: &str) -> Result<Zeroizing<String>, String> {
-    let json = Zeroizing::new(crate::crypto::decrypt(vault_key, data)?);
+fn decrypt_item_value(vault_key: &VaultKey, data: &str) -> Result<Zeroizing<String>, String> {
+    let json = crate::crypto::decrypt(vault_key, data)?;
     let item: crate::vault::VaultItem =
         serde_json::from_slice(&json).map_err(|_| "parse item".to_string())?;
     Ok(Zeroizing::new(item.value.or(item.password).or(item.content).unwrap_or_default()))
@@ -764,7 +765,7 @@ pub async fn inject_environment_preview(
 /// this first touch, and self-heals (becomes `Managed`) from then on.
 pub async fn inject_environment(
     db: &VaultDb,
-    vault_key: &[u8; 32],
+    vault_key: &VaultKey,
     environment_id: i64,
     output_path: Option<String>,
     output_dir: Option<String>,
@@ -999,7 +1000,7 @@ pub async fn environment_inject(
 ) -> Result<InjectResult, String> {
     let s = state.lock().await;
     let key = s.key.as_ref().ok_or("vault is locked")?;
-    let vault_key: [u8; 32] = **key;
+    let vault_key = key.clone();
     inject_environment(&s.db, &vault_key, id, None, None, overwrite, targets.as_deref()).await
 }
 
@@ -1553,7 +1554,7 @@ mod tests {
 
     // ─── inject_environment ─────────────────────────────────────────────
 
-    async fn seeded_env_with_item(db: &VaultDb, key: &[u8; 32], var_key: &str, value: &str) -> i64 {
+    async fn seeded_env_with_item(db: &VaultDb, key: &VaultKey, var_key: &str, value: &str) -> i64 {
         let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
         let env_id = db.upsert_environment(0, project_id, "production", true).await.unwrap();
         let item = plain_secret(var_key, value);

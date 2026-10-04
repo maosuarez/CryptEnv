@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
+use crate::crypto::VaultKey;
 
 use crypto::PairRole;
 use package::PlainItem;
@@ -137,10 +137,10 @@ pub struct ShareSession {
     pub id: u64,
     pub pairing_code: String,
     /// Session key from the PAKE handshake, wrapped in Zeroizing — cleared on drop.
-    pub shared_key: Option<Zeroizing<[u8; 32]>>,
+    pub shared_key: Option<VaultKey>,
     /// Copy of the vault key used to read/import items. Dropped (and zeroized)
     /// when the session ends, is cancelled, or the vault locks.
-    pub vault_key: Option<Zeroizing<[u8; 32]>>,
+    pub vault_key: Option<VaultKey>,
     /// Set on cancel so blocking socket reads in background threads abort.
     pub cancel: Arc<AtomicBool>,
     /// Pairing attempts that failed key confirmation (sender side).
@@ -219,7 +219,7 @@ async fn begin_session(
     direction: ShareDirection,
     state: ShareSessionState,
     items_to_send: Vec<i64>,
-    vault_key: Zeroizing<[u8; 32]>,
+    vault_key: VaultKey,
     project_id: Option<i64>,
     environment_id: Option<i64>,
 ) -> Result<(u64, Arc<AtomicBool>), ShareError> {
@@ -287,7 +287,7 @@ async fn set_awaiting_fingerprint(
     share_state: &Arc<ShareState>,
     id: u64,
     fingerprint: &str,
-    shared_key: &Zeroizing<[u8; 32]>,
+    shared_key: &VaultKey,
 ) -> bool {
     with_session(share_state, id, |s| {
         if s.state.is_terminal() {
@@ -334,7 +334,7 @@ async fn wait_for_confirmation(
 async fn session_vault_key(
     share_state: &Arc<ShareState>,
     id: u64,
-) -> Option<Zeroizing<[u8; 32]>> {
+) -> Option<VaultKey> {
     with_session(share_state, id, |s| s.vault_key.clone())
         .await
         .flatten()
@@ -370,7 +370,7 @@ pub fn generate_pairing_code() -> String {
 pub async fn start_listen_session(
     share_state: Arc<ShareState>,
     item_ids: Vec<i64>,
-    vault_key: Zeroizing<[u8; 32]>,
+    vault_key: VaultKey,
     db: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
     environment_id: Option<i64>,
@@ -417,7 +417,7 @@ async fn accept_and_pair(
     pairing_code: &str,
     cfg: &lan::LanConfig,
     accept_timeout: Duration,
-) -> Result<Option<(std::net::TcpStream, Zeroizing<[u8; 32]>, String)>, ShareError> {
+) -> Result<Option<(std::net::TcpStream, VaultKey, String)>, ShareError> {
     // Non-blocking so we can poll with cancellation checks.
     listener
         .set_nonblocking(true)
@@ -633,7 +633,7 @@ async fn run_send_background(
 pub async fn connect_to_peer(
     share_state: Arc<ShareState>,
     pairing_code: String,
-    vault_key: Zeroizing<[u8; 32]>,
+    vault_key: VaultKey,
     db: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
     environment_id: Option<i64>,
@@ -701,7 +701,7 @@ async fn run_receive_background(
     id: u64,
     cfg: lan::LanConfig,
     stream: std::net::TcpStream,
-    shared_key: Zeroizing<[u8; 32]>,
+    shared_key: VaultKey,
     fingerprint: String,
     db_state: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
@@ -767,7 +767,7 @@ async fn run_receive_background(
 /// sees the vault key or a `PlainItem`, only the ciphertext this returns.
 pub(crate) fn build_encrypted_item(
     plain: &PlainItem,
-    vault_key: &[u8; 32],
+    vault_key: &VaultKey,
     created: &str,
 ) -> Result<(String, String), ShareError> {
     let vault_item = crate::vault::VaultItem {
@@ -789,7 +789,9 @@ pub(crate) fn build_encrypted_item(
         is_global: None,
     };
 
-    let json = serde_json::to_vec(&vault_item).map_err(|e| ShareError::Protocol(e.to_string()))?;
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_vec(&vault_item).map_err(|e| ShareError::Protocol(e.to_string()))?,
+    );
     let encrypted = crate::crypto::encrypt(vault_key, &json).map_err(ShareError::Vault)?;
     Ok((vault_item.item_type, encrypted))
 }
@@ -820,7 +822,7 @@ pub struct ImportOutcome {
 /// is `None` only when the caller has no project+environment context.
 pub(crate) async fn import_plain_items_into_vault(
     items: &[PlainItem],
-    vault_key: &[u8; 32],
+    vault_key: &VaultKey,
     db: &crate::db::VaultDb,
     link: Option<(i64, i64)>,
 ) -> Result<ImportOutcome, ShareError> {
@@ -955,7 +957,7 @@ pub async fn export_package(
     item_ids: &[i64],
     output_path: &std::path::Path,
     vault_state: &Arc<Mutex<crate::vault::VaultState>>,
-) -> Result<String, ShareError> {
+) -> Result<zeroize::Zeroizing<String>, ShareError> {
     let passphrase = crypto::generate_passphrase();
 
     let (vault_key, raw_items) = {
@@ -964,7 +966,7 @@ pub async fn export_package(
             .key
             .as_ref()
             .ok_or_else(|| ShareError::Vault("vault is locked".into()))?;
-        let key: [u8; 32] = **k;
+        let key = k.clone();
         let raw = guard
             .db
             .list_items()
@@ -1025,7 +1027,7 @@ pub async fn import_package(
     link: Option<(i64, i64)>,
 ) -> Result<ImportOutcome, ShareError> {
     let path_clone = path.to_path_buf();
-    let pass_clone = passphrase.to_string();
+    let pass_clone = zeroize::Zeroizing::new(passphrase.to_string());
 
     // Decrypt package on a blocking thread
     let plain_items = tokio::task::spawn_blocking(move || {
@@ -1035,13 +1037,13 @@ pub async fn import_package(
     .map_err(|e| ShareError::Io(e.to_string()))??;
 
     // Import into vault
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = vault_state.lock().await;
-        let k = guard
+        guard
             .key
             .as_ref()
-            .ok_or_else(|| ShareError::Vault("vault is locked".into()))?;
-        **k
+            .ok_or_else(|| ShareError::Vault("vault is locked".into()))?
+            .clone()
     };
 
     let guard = vault_state.lock().await;
@@ -1072,7 +1074,7 @@ mod tests {
         }
     }
 
-    async fn test_db() -> (tempfile::TempDir, VaultDb, [u8; 32]) {
+    async fn test_db() -> (tempfile::TempDir, VaultDb, VaultKey) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.db");
         let db = VaultDb::open(path.to_str().unwrap()).await.unwrap();
@@ -1182,8 +1184,8 @@ mod session_tests {
         }
     }
 
-    fn key() -> Zeroizing<[u8; 32]> {
-        Zeroizing::new([7u8; 32])
+    fn key() -> VaultKey {
+        VaultKey::from_slice(&[7u8; 32]).unwrap()
     }
 
     async fn start(state: &Arc<ShareState>) -> Result<(u64, Arc<AtomicBool>), ShareError> {
@@ -1210,7 +1212,7 @@ mod session_tests {
     async fn peer_handshake(
         addr: SocketAddr,
         code: &'static str,
-    ) -> Result<(Zeroizing<[u8; 32]>, String), ShareError> {
+    ) -> Result<(VaultKey, String), ShareError> {
         tokio::task::spawn_blocking(move || {
             let mut s = TcpStream::connect(addr).map_err(|e| ShareError::Io(e.to_string()))?;
             // Generous timeout: the listener only polls for connections every 500 ms.
@@ -1222,7 +1224,7 @@ mod session_tests {
     }
 
     type PairResult =
-        Result<Option<(std::net::TcpStream, Zeroizing<[u8; 32]>, String)>, ShareError>;
+        Result<Option<(std::net::TcpStream, VaultKey, String)>, ShareError>;
 
     fn spawn_accept(
         state: &Arc<ShareState>,

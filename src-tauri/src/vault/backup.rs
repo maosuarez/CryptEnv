@@ -9,11 +9,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::{epoch_to_iso8601, SharedState, SystemTime, UNIX_EPOCH, VaultState};
-use crate::crypto::{self, CryptoKey};
+use crate::crypto::{self, VaultKey};
 use crate::db::{
     pre_restore_path, remove_db_files, sibling_with_suffix, DbCategory, DbEnvironmentVar, VaultDb,
 };
@@ -117,12 +116,14 @@ pub(super) struct MetaItemProject {
     pub project_id: i64,
 }
 
-pub(super) fn encode_meta(key: &CryptoKey, meta: &Meta) -> Result<String, String> {
-    let json = serde_json::to_vec(meta).map_err(|e| format!("serialize backup metadata: {e}"))?;
+pub(super) fn encode_meta(key: &VaultKey, meta: &Meta) -> Result<String, String> {
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_vec(meta).map_err(|e| format!("serialize backup metadata: {e}"))?,
+    );
     crypto::encrypt(key, &json)
 }
 
-pub(super) fn decode_meta(key: &CryptoKey, hex: &str) -> Result<Meta, String> {
+pub(super) fn decode_meta(key: &VaultKey, hex: &str) -> Result<Meta, String> {
     let json = crypto::decrypt(key, hex).map_err(|_| "backup metadata is corrupt".to_string())?;
     serde_json::from_slice(&json).map_err(|_| "backup metadata is corrupt".to_string())
 }
@@ -141,7 +142,7 @@ pub(super) fn parse_backup(json: &str) -> Result<BackupFile, String> {
 
 /// The backup's metadata: decrypted for v2, rebuilt from the plaintext
 /// category list for v1 (which carried no projects).
-fn load_meta(backup: &BackupFile, key: &CryptoKey) -> Result<Meta, String> {
+fn load_meta(backup: &BackupFile, key: &VaultKey) -> Result<Meta, String> {
     match &backup.meta {
         Some(hex) => decode_meta(key, hex),
         None => Ok(Meta {
@@ -170,7 +171,7 @@ fn load_meta(backup: &BackupFile, key: &CryptoKey) -> Result<Meta, String> {
 /// Builds a v2 backup of the whole vault. Returns the file and its item count.
 pub(super) async fn build_backup(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
 ) -> Result<(BackupFile, usize), String> {
     let (salt, token) = db.get_meta().await?.ok_or("vault_meta missing")?;
 
@@ -278,7 +279,7 @@ async fn apply_backup(
     tx: &mut Transaction<'_, Sqlite>,
     backup: &BackupFile,
     meta: &Meta,
-    reencrypt: Option<(&CryptoKey, &CryptoKey)>,
+    reencrypt: Option<(&VaultKey, &VaultKey)>,
     holding_name: &str,
 ) -> Result<RestoreSummary, String> {
     let mut summary = RestoreSummary {
@@ -410,8 +411,8 @@ async fn apply_backup(
 struct Plan<'a> {
     backup: &'a BackupFile,
     meta: &'a Meta,
-    backup_key: &'a CryptoKey,
-    current_key: &'a CryptoKey,
+    backup_key: &'a VaultKey,
+    current_key: &'a VaultKey,
     merge: bool,
     holding_name: &'a str,
 }
@@ -553,16 +554,13 @@ pub(super) async fn restore_shared(
     let expected = current_key.clone();
     let backup_key = tokio::task::spawn_blocking(move || {
         if let (Some(pw), Some((salt, token))) = (current_pw, current_meta) {
-            let derived = Zeroizing::new(
-                crypto::unlock_vault_crypto(&pw, &salt, &token)
-                    .map_err(|_| "incorrect current master password".to_string())?,
-            );
-            if !bool::from(derived.as_slice().ct_eq(expected.as_slice())) {
+            let derived = crypto::unlock_vault_crypto(&pw, &salt, &token)
+                .map_err(|_| "incorrect current master password".to_string())?;
+            if !derived.ct_eq(&expected) {
                 return Err("incorrect current master password".to_string());
             }
         }
         crypto::unlock_vault_crypto(&backup_pw, &salt, &token)
-            .map(Zeroizing::new)
             .map_err(|_| "incorrect master password for this backup".to_string())
     })
     .await
@@ -601,20 +599,17 @@ pub(super) async fn restore(
             .filter(|p| !p.is_empty())
             .ok_or("the current master password is required to replace the vault")?;
         let (salt, token) = s.db.get_meta().await?.ok_or("vault_meta missing")?;
-        let derived = Zeroizing::new(
-            crypto::unlock_vault_crypto(pw.as_bytes(), &salt, &token)
-                .map_err(|_| "incorrect current master password".to_string())?,
-        );
-        if !bool::from(derived.as_slice().ct_eq(current_key.as_slice())) {
+        let derived = crypto::unlock_vault_crypto(pw.as_bytes(), &salt, &token)
+            .map_err(|_| "incorrect current master password".to_string())?;
+        if !derived.ct_eq(&current_key) {
             return Err("incorrect current master password".to_string());
         }
     }
 
     let backup = parse_backup(json)?;
-    let backup_key = Zeroizing::new(
+    let backup_key =
         crypto::unlock_vault_crypto(backup_password.as_bytes(), &backup.salt, &backup.token)
-            .map_err(|_| "incorrect master password for this backup".to_string())?,
-    );
+            .map_err(|_| "incorrect master password for this backup".to_string())?;
     restore_verified(s, &backup, backup_key, current_key, merge).await
 }
 
@@ -623,8 +618,8 @@ pub(super) async fn restore(
 async fn restore_verified(
     s: &mut VaultState,
     backup: &BackupFile,
-    backup_key: Zeroizing<[u8; 32]>,
-    current_key: Zeroizing<[u8; 32]>,
+    backup_key: VaultKey,
+    current_key: VaultKey,
     merge: bool,
 ) -> Result<RestoreSummary, String> {
     let meta = load_meta(backup, &backup_key)?;
@@ -764,7 +759,7 @@ mod tests {
 
         assert_eq!(item_names(&b).await, item_names(&a).await);
         let s = b.state.lock().await;
-        assert_eq!(s.key.as_ref().unwrap().as_slice(), a_key.as_slice());
+        assert!(s.key.as_ref().unwrap().ct_eq(&a_key));
         let projects = s.db.list_projects().await.unwrap();
         assert_eq!(projects.len(), 1);
         let envs = s.db.list_environments(projects[0].id).await.unwrap();
@@ -887,7 +882,7 @@ mod tests {
         let summary = restore_into(&b, &json, None, true).await.unwrap();
         assert_eq!(summary.items, 4);
         let s = b.state.lock().await;
-        assert_eq!(s.key.as_ref().unwrap().as_slice(), b_key.as_slice());
+        assert!(s.key.as_ref().unwrap().ct_eq(&b_key));
         let projects = s.db.list_projects().await.unwrap();
         assert_eq!(projects.len(), 1);
         let envs = s.db.list_environments(projects[0].id).await.unwrap();

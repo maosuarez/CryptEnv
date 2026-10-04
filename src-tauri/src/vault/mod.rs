@@ -4,11 +4,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
-use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
 
 use crate::biometric;
-use crate::crypto::{self, CryptoKey};
+use crate::crypto::{self, SecretString, VaultKey};
 use crate::db::{DbCategory, LinkMode, LinkOutcome, VaultDb};
 
 pub mod backup;
@@ -78,8 +76,8 @@ pub struct UnlockPayload {
 
 pub struct VaultState {
     pub db: VaultDb,
-    /// Zeroizing guarantees the 32 bytes are overwritten when set to None or dropped.
-    pub key: Option<Zeroizing<[u8; 32]>>,
+    /// `VaultKey` guarantees the 32 bytes are overwritten when set to None or dropped.
+    pub key: Option<VaultKey>,
     /// Monotonic timestamp of the last vault operation. None when the vault is locked.
     pub last_activity: Option<std::time::Instant>,
     /// Lock epoch: bumped by `set_key` whenever the key changes (unlock, lock,
@@ -113,10 +111,10 @@ impl VaultState {
     /// The only place `key` is assigned. Bumps `epoch` unless the key is
     /// unchanged (re-unlocking an already unlocked vault must not end the
     /// other terminals' sessions).
-    pub fn set_key(&mut self, key: Option<Zeroizing<[u8; 32]>>) {
+    pub fn set_key(&mut self, key: Option<VaultKey>) {
         let unchanged = match (&self.key, &key) {
             (None, None) => true,
-            (Some(a), Some(b)) => bool::from(a.as_slice().ct_eq(b.as_slice())),
+            (Some(a), Some(b)) => a.ct_eq(b),
             _ => false,
         };
         // A restore keeps the previous database until the next successful
@@ -151,7 +149,7 @@ pub type SharedState = Arc<Mutex<VaultState>>;
 /// decryption) rather than inside the ciphertext — this reassembles it onto
 /// the decrypted item.
 pub(crate) fn decrypt_item(
-    key: &CryptoKey,
+    key: &VaultKey,
     row_id: i64,
     data: &str,
     is_global: bool,
@@ -166,10 +164,12 @@ pub(crate) fn decrypt_item(
 
 /// Strips `is_global` before serializing — it's metadata, not a secret, and
 /// must never enter the ciphertext (see `decrypt_item`).
-pub(crate) fn encrypt_item(key: &CryptoKey, item: &VaultItem) -> Result<String, String> {
+pub(crate) fn encrypt_item(key: &VaultKey, item: &VaultItem) -> Result<String, String> {
     let mut for_blob = item.clone();
     for_blob.is_global = None;
-    let json = serde_json::to_vec(&for_blob).map_err(|e| format!("serialize item: {e}"))?;
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_vec(&for_blob).map_err(|e| format!("serialize item: {e}"))?,
+    );
     crypto::encrypt(key, &json)
 }
 
@@ -179,7 +179,7 @@ pub(crate) fn encrypt_item(key: &CryptoKey, item: &VaultItem) -> Result<String, 
 /// item") into real encrypted secret items, owned by their environment's
 /// project. Called from every unlock entry point (password + biometric +
 /// the HTTP/CLI/MCP unlock path in `api::handle_unlock`).
-pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &CryptoKey) -> Result<(), String> {
+pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &VaultKey) -> Result<(), String> {
     if db.get_setting("migrated_literals_v1").await?.is_some() {
         return Ok(());
     }
@@ -227,10 +227,10 @@ pub async fn vault_is_setup(state: State<'_, SharedState>) -> Result<bool, Strin
 
 #[tauri::command]
 pub async fn vault_unlock(
-    password: String,
+    password: SecretString,
     state: State<'_, SharedState>,
 ) -> Result<UnlockPayload, String> {
-    unlock_for_gui(&state, password.as_bytes()).await
+    unlock_for_gui(&state, password.expose().as_bytes()).await
 }
 
 /// GUI unlock (also first-run vault creation). The key derivation runs off
@@ -309,7 +309,7 @@ impl From<String> for UpdateItemError {
 /// value (secret fields never leave this process).
 pub async fn update_item_merged(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     id: i64,
     body: VaultItem,
 ) -> Result<VaultItem, UpdateItemError> {
@@ -371,7 +371,7 @@ pub async fn vault_save_item(
 /// default — the caller must explicitly toggle that afterwards.
 pub async fn create_project_item(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     item: &VaultItem,
     project_id: i64,
 ) -> Result<i64, String> {
@@ -404,10 +404,10 @@ pub enum UpsertOutcome {
 /// `created` on the update branch so the ciphertext and the column agree),
 /// then hand the encrypted blob to `db::create_or_link_item`'s single
 /// transaction. This is the only layer that holds the vault key on this
-/// path — `db` never sees a `CryptoKey`.
+/// path — `db` never sees a `VaultKey`.
 pub async fn create_or_update_env_item(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     item: &VaultItem,
     project_id: i64,
     environment_id: i64,
@@ -560,7 +560,7 @@ fn validate_template_input(input: &ProjectFromTemplatesInput) -> Result<(), Stri
 /// removes the items this project solely owns.
 pub async fn create_project_from_templates(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     input: ProjectFromTemplatesInput,
 ) -> Result<i64, String> {
     scaffold_project(db, key, input, None).await
@@ -570,7 +570,7 @@ pub async fn create_project_from_templates(
 /// items, to exercise the rollback path.
 async fn scaffold_project(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     input: ProjectFromTemplatesInput,
     fail_after: Option<usize>,
 ) -> Result<i64, String> {
@@ -591,7 +591,7 @@ async fn scaffold_project(
 
 async fn populate_default_environment(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     project_id: i64,
     vars: Vec<TemplateVarInput>,
     fail_after: Option<usize>,
@@ -684,7 +684,7 @@ pub struct GlobalToggleResult {
 /// identical behaviour.
 pub async fn set_item_global(
     db: &VaultDb,
-    key: &CryptoKey,
+    key: &VaultKey,
     id: i64,
     global: bool,
 ) -> Result<GlobalToggleResult, String> {
@@ -771,7 +771,7 @@ pub async fn vault_get_item_owners(
 /// Decrypts only the ids `db::list_orphan_item_ids` returns and redacts them,
 /// so the caller can judge what it is about to delete without any secret
 /// value leaving this process.
-pub async fn list_orphan_items(db: &VaultDb, key: &CryptoKey) -> Result<Vec<VaultItem>, String> {
+pub async fn list_orphan_items(db: &VaultDb, key: &VaultKey) -> Result<Vec<VaultItem>, String> {
     let ids = db.list_orphan_item_ids().await?;
     if ids.is_empty() {
         return Ok(vec![]);
@@ -938,11 +938,11 @@ pub fn app_get_system_info(app: tauri::AppHandle) -> Result<AppSystemInfo, Strin
 
 #[tauri::command]
 pub async fn vault_change_password(
-    current_password: String,
-    new_password: String,
+    current_password: SecretString,
+    new_password: SecretString,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    unlock::change_password(&state, &current_password, &new_password).await
+    unlock::change_password(&state, current_password.expose(), new_password.expose()).await
 }
 
 #[tauri::command]
@@ -1078,14 +1078,21 @@ pub async fn vault_export_backup(
 #[tauri::command]
 pub async fn vault_import_backup(
     path: String,
-    master_password: String,
+    master_password: SecretString,
     merge: bool,
-    current_password: Option<String>,
+    current_password: Option<SecretString>,
     state: State<'_, SharedState>,
 ) -> Result<backup::RestoreSummary, String> {
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("read backup: {e}"))?;
-    backup::restore_shared(&state, &json, &master_password, current_password.as_deref(), merge).await
+    backup::restore_shared(
+        &state,
+        &json,
+        master_password.expose(),
+        current_password.as_ref().map(|p| p.expose()),
+        merge,
+    )
+    .await
 }
 
 /// Restore a `.cenvbak` by passing its JSON content directly.
@@ -1093,12 +1100,19 @@ pub async fn vault_import_backup(
 #[tauri::command]
 pub async fn vault_import_backup_data(
     data: String,
-    master_password: String,
+    master_password: SecretString,
     merge: bool,
-    current_password: Option<String>,
+    current_password: Option<SecretString>,
     state: State<'_, SharedState>,
 ) -> Result<backup::RestoreSummary, String> {
-    backup::restore_shared(&state, &data, &master_password, current_password.as_deref(), merge).await
+    backup::restore_shared(
+        &state,
+        &data,
+        master_password.expose(),
+        current_password.as_ref().map(|p| p.expose()),
+        merge,
+    )
+    .await
 }
 
 // ─── Import from password managers ───────────────────────────────────────────
@@ -1328,11 +1342,15 @@ pub async fn biometric_is_enrolled(state: State<'_, SharedState>) -> Result<bool
 
 #[tauri::command]
 pub async fn biometric_enroll(
-    password: String,
+    password: SecretString,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    let password = Zeroizing::new(password.into_bytes());
-    biometric_enrollment::enroll(&state, crate::biometric::platform_signer(), &password).await
+    biometric_enrollment::enroll(
+        &state,
+        crate::biometric::platform_signer(),
+        password.expose().as_bytes(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1363,7 +1381,7 @@ mod tests {
     use super::*;
     use crate::db::DbEnvironmentVar;
 
-    async fn test_db() -> (tempfile::TempDir, VaultDb, [u8; 32]) {
+    async fn test_db() -> (tempfile::TempDir, VaultDb, VaultKey) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.db");
         let db = VaultDb::open(path.to_str().unwrap()).await.unwrap();

@@ -631,7 +631,7 @@ fn validate_update(body: &VaultItem) -> Result<(), axum::response::Response> {
 
 #[derive(Deserialize)]
 struct UnlockBody {
-    master_password: String,
+    master_password: crate::crypto::SecretString,
 }
 
 async fn handle_unlock(
@@ -642,7 +642,7 @@ async fn handle_unlock(
     // with the GUI unlock); the key derivation runs off the vault lock.
     let outcome = match unlock::unlock_with_password(
         &state.vault,
-        body.master_password.as_bytes(),
+        body.master_password.expose().as_bytes(),
         false,
         false,
     )
@@ -1813,7 +1813,7 @@ async fn handle_share_listen(
     let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => zeroize::Zeroizing::new(**k),
+            Some(k) => k.clone(),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
@@ -1890,7 +1890,7 @@ async fn handle_share_connect(
     let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => zeroize::Zeroizing::new(**k),
+            Some(k) => k.clone(),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
@@ -2030,7 +2030,7 @@ struct ShareExportBody {
 
 #[derive(Serialize)]
 struct ShareExportResponse {
-    passphrase: String,
+    passphrase: zeroize::Zeroizing<String>,
     path: String,
 }
 
@@ -2077,7 +2077,7 @@ async fn handle_share_export(
 #[derive(Deserialize)]
 struct ShareImportBody {
     path: String,
-    passphrase: String,
+    passphrase: crate::crypto::SecretString,
 }
 
 #[derive(Serialize)]
@@ -2113,7 +2113,7 @@ async fn handle_share_import(
     };
 
     let path = std::path::PathBuf::from(&body.path);
-    match crate::share::import_package(&path, &body.passphrase, &state.vault, Some((env.project_id, env.id))).await {
+    match crate::share::import_package(&path, body.passphrase.expose(), &state.vault, Some((env.project_id, env.id))).await {
         Ok(outcome) => {
             let count = outcome.names.len();
             (
@@ -2360,8 +2360,8 @@ async fn handle_inject_environment(
 
     let vault = state.vault.lock().await;
 
-    let vault_key: [u8; 32] = match vault.key.as_ref() {
-        Some(k) => **k,
+    let vault_key = match vault.key.as_ref() {
+        Some(k) => k.clone(),
         None => {
             return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response()
         }
@@ -2545,7 +2545,7 @@ struct RelaySendBody {
 #[derive(serde::Serialize)]
 struct RelaySendResponse {
     code: String,
-    passphrase: String,
+    passphrase: zeroize::Zeroizing<String>,
 }
 
 /// A failure from an operation shared by the direct (session) route and the
@@ -2603,7 +2603,7 @@ async fn item_names(state: &ApiState, ids: &[i64]) -> Vec<String> {
 impl ApiState {
     /// Uploads the items to the internet relay and returns `(code, passphrase)`.
     /// The pair is secret: callers hand it to the user, never to an MCP caller.
-    pub(crate) async fn relay_send_core(&self, item_ids: &[i64]) -> Result<(String, String), CoreError> {
+    pub(crate) async fn relay_send_core(&self, item_ids: &[i64]) -> Result<(String, zeroize::Zeroizing<String>), CoreError> {
         if item_ids.is_empty() {
             return Err(CoreError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2617,7 +2617,7 @@ impl ApiState {
         let (supabase_url, anon_key, plain_items) = {
             let vault = self.vault.lock().await;
             let k = match vault.key.as_ref() {
-                Some(k) => **k,
+                Some(k) => k.clone(),
                 None => return Err(CoreError::new(StatusCode::FORBIDDEN, "VAULT_LOCKED", "vault locked".to_string())),
             };
 
@@ -2703,7 +2703,7 @@ impl ApiState {
 
     /// Writes the encrypted share package and returns its passphrase (secret:
     /// for the user only).
-    pub(crate) async fn share_export_core(&self, items: &[i64], output_path: &str) -> Result<String, CoreError> {
+    pub(crate) async fn share_export_core(&self, items: &[i64], output_path: &str) -> Result<zeroize::Zeroizing<String>, CoreError> {
         if items.is_empty() {
             return Err(CoreError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2766,7 +2766,7 @@ async fn handle_relay_send(
 #[derive(serde::Deserialize)]
 struct RelayReceiveBody {
     code: String,
-    passphrase: String,
+    passphrase: crate::crypto::SecretString,
 }
 
 #[derive(serde::Serialize)]
@@ -2784,7 +2784,7 @@ async fn handle_relay_receive(
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<RelayReceiveBody>,
 ) -> impl IntoResponse {
-    if body.code.is_empty() || body.passphrase.is_empty() {
+    if body.code.is_empty() || body.passphrase.expose().is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
             "code and passphrase are required",
@@ -2810,7 +2810,7 @@ async fn handle_relay_receive(
     };
 
     // Derive relay key before spawning blocking tasks (no I/O needed)
-    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
+    let relay_key = match relay::derive_relay_key_async(&body.code, body.passphrase.expose()).await {
         Ok(k) => k,
         Err(e) => {
             return internal_error(&e)
@@ -2822,7 +2822,7 @@ async fn handle_relay_receive(
     let (vault_key, supabase_url, anon_key) = {
         let vault = state.vault.lock().await;
         let k = match vault.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => k.clone(),
             None => {
                 return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED")
                     .into_response()
@@ -2943,7 +2943,7 @@ struct ProjectRelaySendBody {
 #[derive(serde::Serialize)]
 struct ProjectRelaySendResponse {
     code: String,
-    passphrase: String,
+    passphrase: zeroize::Zeroizing<String>,
     project: String,
     environment_count: usize,
     item_count: usize,
@@ -2972,7 +2972,7 @@ async fn handle_project_relay_send(
     let (supabase_url, anon_key, bundle) = {
         let vault = state.vault.lock().await;
         let k = match vault.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => k.clone(),
             None => {
                 return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED")
                     .into_response()
@@ -3086,7 +3086,7 @@ async fn handle_project_relay_send(
 #[derive(serde::Deserialize)]
 struct ProjectRelayReceiveBody {
     code: String,
-    passphrase: String,
+    passphrase: crate::crypto::SecretString,
     #[serde(default)]
     project_name_override: Option<String>,
 }
@@ -3107,7 +3107,7 @@ async fn handle_project_relay_receive(
     AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<ProjectRelayReceiveBody>,
 ) -> impl IntoResponse {
-    if body.code.is_empty() || body.passphrase.is_empty() {
+    if body.code.is_empty() || body.passphrase.expose().is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
             "code and passphrase are required",
@@ -3116,7 +3116,7 @@ async fn handle_project_relay_receive(
         .into_response();
     }
 
-    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
+    let relay_key = match relay::derive_relay_key_async(&body.code, body.passphrase.expose()).await {
         Ok(k) => k,
         Err(e) => {
             return internal_error(&e)
@@ -3127,7 +3127,7 @@ async fn handle_project_relay_receive(
     let (vault_key, supabase_url, anon_key) = {
         let vault = state.vault.lock().await;
         let k = match vault.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => k.clone(),
             None => {
                 return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED")
                     .into_response()

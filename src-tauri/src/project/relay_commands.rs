@@ -9,8 +9,10 @@
 
 use tauri::State;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::project::relay::{build_project_bundle, receive_project_bundle};
+use crate::crypto::SecretString;
 use crate::share::relay;
 use crate::vault::SharedState;
 
@@ -26,7 +28,7 @@ const DEFAULT_RELAY_ANON_KEY: &str = match option_env!("CRYPTENV_RELAY_ANON_KEY"
 #[derive(Serialize)]
 pub struct RelayShareResult {
     pub code: String,
-    pub passphrase: String,
+    pub passphrase: Zeroizing<String>,
     pub project: String,
     #[serde(rename = "environmentCount")]
     pub environment_count: usize,
@@ -43,7 +45,7 @@ pub async fn project_relay_send(
     let (supabase_url, anon_key, bundle) = {
         let mut guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        let vault_key: [u8; 32] = **k;
+        let vault_key = k.clone();
         guard.touch();
 
         let supabase_url = guard
@@ -99,14 +101,14 @@ pub struct ProjectReceiveResult {
 #[tauri::command]
 pub async fn project_relay_receive(
     code: String,
-    passphrase: String,
+    passphrase: SecretString,
     project_name_override: Option<String>,
     vault_state: State<'_, SharedState>,
 ) -> Result<ProjectReceiveResult, String> {
     let (vault_key, supabase_url, anon_key) = {
         let mut guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        let vault_key: [u8; 32] = **k;
+        let vault_key = k.clone();
         guard.touch();
 
         let supabase_url = guard
@@ -127,7 +129,7 @@ pub async fn project_relay_receive(
         (vault_key, supabase_url, anon_key)
     };
 
-    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, passphrase.expose()).await.map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
     let url_clone = supabase_url.clone();

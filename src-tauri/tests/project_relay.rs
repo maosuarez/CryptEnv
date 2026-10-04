@@ -11,6 +11,7 @@
 // built and handed directly to the receive-side function, per the plan's
 // "transport stubbed" instruction for this test file.
 
+use crypt_env_lib::crypto::VaultKey;
 use crypt_env_lib::db::VaultDb;
 use crypt_env_lib::project::relay as project_relay;
 use crypt_env_lib::share::package::PlainItem;
@@ -18,8 +19,12 @@ use crypt_env_lib::share::relay::{EnvironmentBundle, ProjectBundle, ProjectBundl
 use crypt_env_lib::vault::VaultItem;
 use tempfile::tempdir;
 
-const SENDER_KEY: [u8; 32] = [7u8; 32];
-const RECEIVER_KEY: [u8; 32] = [9u8; 32];
+fn sender_key() -> VaultKey {
+    VaultKey::from_slice(&[7u8; 32]).unwrap()
+}
+fn receiver_key() -> VaultKey {
+    VaultKey::from_slice(&[9u8; 32]).unwrap()
+}
 
 async fn open_db(dir: &tempfile::TempDir) -> VaultDb {
     let path = dir.path().join("vault.db").to_str().unwrap().to_string();
@@ -27,7 +32,7 @@ async fn open_db(dir: &tempfile::TempDir) -> VaultDb {
 }
 
 /// Encrypts and inserts a "secret" item with `name`/`value`, returning its id.
-async fn seed_item(db: &VaultDb, key: &[u8; 32], name: &str, value: &str) -> i64 {
+async fn seed_item(db: &VaultDb, key: &VaultKey, name: &str, value: &str) -> i64 {
     let item = VaultItem {
         id: 0,
         item_type: "secret".to_string(),
@@ -60,7 +65,7 @@ async fn link_var(db: &VaultDb, environment_id: i64, project_id: i64, item_id: i
 }
 
 /// Decrypts every item in `db` and returns (item_id, name, is_global).
-async fn decrypt_all(db: &VaultDb, key: &[u8; 32]) -> Vec<(i64, String, bool)> {
+async fn decrypt_all(db: &VaultDb, key: &VaultKey) -> Vec<(i64, String, bool)> {
     let raw = db.list_items().await.unwrap();
     raw.into_iter()
         .map(|(id, _item_type, data, _created, is_global)| {
@@ -82,11 +87,11 @@ async fn seed_three_env_project(dir: &tempfile::TempDir) -> (VaultDb, i64, [i64;
     let staging = db.upsert_environment(0, project_id, "staging", false).await.unwrap();
     let production = db.upsert_environment(0, project_id, "production", false).await.unwrap();
 
-    let s1 = seed_item(&db, &SENDER_KEY, "S1", "shared-1").await;
-    let s2 = seed_item(&db, &SENDER_KEY, "S2", "shared-2").await;
-    let it3 = seed_item(&db, &SENDER_KEY, "IT3", "v3").await;
-    let it4 = seed_item(&db, &SENDER_KEY, "IT4", "v4").await;
-    let it5 = seed_item(&db, &SENDER_KEY, "IT5", "v5").await;
+    let s1 = seed_item(&db, &sender_key(), "S1", "shared-1").await;
+    let s2 = seed_item(&db, &sender_key(), "S2", "shared-2").await;
+    let it3 = seed_item(&db, &sender_key(), "IT3", "v3").await;
+    let it4 = seed_item(&db, &sender_key(), "IT4", "v4").await;
+    let it5 = seed_item(&db, &sender_key(), "IT5", "v5").await;
 
     // local: S1, S2, IT3, IT4  (4)
     link_var(&db, local, project_id, s1, "S1").await;
@@ -114,7 +119,7 @@ async fn share_three_env_project_dedups_reused_items() {
     let sender_dir = tempdir().unwrap();
     let (db, project_id, envs) = seed_three_env_project(&sender_dir).await;
 
-    let bundle = project_relay::build_project_bundle(&db, &SENDER_KEY, project_id, &envs)
+    let bundle = project_relay::build_project_bundle(&db, &sender_key(), project_id, &envs)
         .await
         .expect("build_project_bundle should succeed");
 
@@ -124,7 +129,7 @@ async fn share_three_env_project_dedups_reused_items() {
 
     let receiver_dir = tempdir().unwrap();
     let receiver_db = open_db(&receiver_dir).await;
-    let result = project_relay::receive_project_bundle(&receiver_db, &RECEIVER_KEY, bundle, None)
+    let result = project_relay::receive_project_bundle(&receiver_db, &receiver_key(), bundle, None)
         .await
         .expect("receive_project_bundle should succeed into a fresh vault");
 
@@ -151,7 +156,7 @@ async fn share_three_env_project_dedups_reused_items() {
     assert_eq!(owned.len(), 5, "5 item_projects rows, all pointing at the new project");
 
     // The two shared items appear as one row each -- 0 duplicated ciphertext rows.
-    let decrypted = decrypt_all(&receiver_db, &RECEIVER_KEY).await;
+    let decrypted = decrypt_all(&receiver_db, &receiver_key()).await;
     let count_named = |n: &str| decrypted.iter().filter(|(_, name, _)| name == n).count();
     assert_eq!(count_named("S1"), 1);
     assert_eq!(count_named("S2"), 1);
@@ -199,7 +204,7 @@ async fn receive_refuses_case_insensitive_project_name_collision() {
 
     // Incoming bundle uses "MyApp" -- different case, same name.
     let bundle = minimal_bundle("MyApp");
-    let err = project_relay::receive_project_bundle(&db, &RECEIVER_KEY, bundle, None)
+    let err = project_relay::receive_project_bundle(&db, &receiver_key(), bundle, None)
         .await
         .expect_err("case-insensitive name collision must be a hard error");
 
@@ -216,7 +221,7 @@ async fn receive_refuses_case_insensitive_project_name_collision() {
 async fn receive_with_name_override_succeeds_after_collision() {
     let sender_dir = tempdir().unwrap();
     let (sender_db, project_id, envs) = seed_three_env_project(&sender_dir).await;
-    let bundle = project_relay::build_project_bundle(&sender_db, &SENDER_KEY, project_id, &envs)
+    let bundle = project_relay::build_project_bundle(&sender_db, &sender_key(), project_id, &envs)
         .await
         .unwrap();
     assert_eq!(bundle.name, "MyApp");
@@ -228,7 +233,7 @@ async fn receive_with_name_override_succeeds_after_collision() {
 
     let result = project_relay::receive_project_bundle(
         &db,
-        &RECEIVER_KEY,
+        &receiver_key(),
         bundle,
         Some("MyApp-received".to_string()),
     )
@@ -252,15 +257,15 @@ async fn send_excludes_unselected_environments() {
     let local = db.upsert_environment(0, project_id, "local", true).await.unwrap();
     let production = db.upsert_environment(0, project_id, "production", false).await.unwrap();
 
-    let shared = seed_item(&db, &SENDER_KEY, "SHARED", "shared-value").await;
-    let prod_only = seed_item(&db, &SENDER_KEY, "PRODONLY", "prod-value").await;
+    let shared = seed_item(&db, &sender_key(), "SHARED", "shared-value").await;
+    let prod_only = seed_item(&db, &sender_key(), "PRODONLY", "prod-value").await;
 
     link_var(&db, local, project_id, shared, "SHARED").await;
     link_var(&db, production, project_id, shared, "SHARED").await;
     link_var(&db, production, project_id, prod_only, "PRODONLY").await;
 
     // Select only the default (local) environment.
-    let bundle = project_relay::build_project_bundle(&db, &SENDER_KEY, project_id, &[local])
+    let bundle = project_relay::build_project_bundle(&db, &sender_key(), project_id, &[local])
         .await
         .unwrap();
 
@@ -280,7 +285,7 @@ async fn send_skips_dangling_item_reference() {
     let project_id = db.upsert_project(0, "MyApp", None, "generic").await.unwrap();
     let local = db.upsert_environment(0, project_id, "local", true).await.unwrap();
 
-    let real_item = seed_item(&db, &SENDER_KEY, "REAL", "value").await;
+    let real_item = seed_item(&db, &sender_key(), "REAL", "value").await;
     link_var(&db, local, project_id, real_item, "REAL").await;
 
     // Link a var whose item_id does not (and never will) resolve to a real
@@ -288,7 +293,7 @@ async fn send_skips_dangling_item_reference() {
     let dangling_item_id = 999_999;
     db.upsert_environment_var(local, "GHOST", dangling_item_id).await.unwrap();
 
-    let bundle = project_relay::build_project_bundle(&db, &SENDER_KEY, project_id, &[local])
+    let bundle = project_relay::build_project_bundle(&db, &sender_key(), project_id, &[local])
         .await
         .expect("a dangling item_id must not fail the whole send");
 
@@ -302,13 +307,13 @@ async fn send_skips_dangling_item_reference() {
 async fn received_items_are_project_owned_not_global() {
     let sender_dir = tempdir().unwrap();
     let (sender_db, project_id, envs) = seed_three_env_project(&sender_dir).await;
-    let bundle = project_relay::build_project_bundle(&sender_db, &SENDER_KEY, project_id, &envs)
+    let bundle = project_relay::build_project_bundle(&sender_db, &sender_key(), project_id, &envs)
         .await
         .unwrap();
 
     let dir = tempdir().unwrap();
     let db = open_db(&dir).await;
-    let result = project_relay::receive_project_bundle(&db, &RECEIVER_KEY, bundle, None)
+    let result = project_relay::receive_project_bundle(&db, &receiver_key(), bundle, None)
         .await
         .unwrap();
 
@@ -330,10 +335,10 @@ async fn bundle_never_contains_paths() {
     let leaky_path = "C:\\Users\\maosuarez\\dev\\myapp\\.env.production";
     db.set_environment_paths(local, &[leaky_path.to_string()]).await.unwrap();
 
-    let item = seed_item(&db, &SENDER_KEY, "SECRET", "value").await;
+    let item = seed_item(&db, &sender_key(), "SECRET", "value").await;
     link_var(&db, local, project_id, item, "SECRET").await;
 
-    let bundle = project_relay::build_project_bundle(&db, &SENDER_KEY, project_id, &[local])
+    let bundle = project_relay::build_project_bundle(&db, &sender_key(), project_id, &[local])
         .await
         .unwrap();
 

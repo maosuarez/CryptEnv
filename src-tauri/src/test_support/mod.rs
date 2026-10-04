@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
+use crate::crypto::VaultKey;
 
 use crate::db::VaultDb;
 use crate::vault::{SharedState, VaultItem, VaultState};
@@ -76,7 +76,7 @@ async fn open_db() -> (tempfile::TempDir, VaultDb) {
 /// Initialises vault crypto (salt + verify token + key), persists them, and
 /// seeds `settings['mcp_token']` so `token` authenticates immediately.
 /// Returns the raw 32-byte key.
-async fn init_crypto(db: &VaultDb) -> [u8; 32] {
+async fn init_crypto(db: &VaultDb) -> VaultKey {
     let (salt, verify_token, key) =
         crate::crypto::init_vault_crypto(MASTER_PASSWORD.as_bytes()).expect("init vault crypto");
     db.init_vault(&salt, &verify_token)
@@ -167,7 +167,7 @@ async fn build(seed_data: bool) -> TestVault {
     let state: SharedState = Arc::new(Mutex::new(VaultState::new(db)));
     {
         let mut s = state.lock().await;
-        s.set_key(Some(Zeroizing::new(key)));
+        s.set_key(Some(key.clone()));
         s.touch();
     }
 
