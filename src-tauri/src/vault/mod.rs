@@ -1293,37 +1293,18 @@ pub async fn app_generate_mcp_config(
         std::path::PathBuf::from(&target_path)
     };
 
-    let mut root: serde_json::Value = if resolved.exists() {
-        let content = std::fs::read_to_string(&resolved)
-            .map_err(|e| format!("read {}: {e}", resolved.display()))?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    {
-        let obj = root.as_object_mut().ok_or("existing .mcp.json is not a JSON object")?;
-        let mcp_servers = obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
-        if let Some(servers) = mcp_servers.as_object_mut() {
-            servers.insert(
-                "cryptenv".to_string(),
-                serde_json::json!({
-                    "command": "crypt-env-mcp",
-                    "env": { "CRYPTENV_TOKEN": token }
-                }),
-            );
-        }
-    }
-
-    if let Some(parent) = resolved.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create dirs {}: {e}", parent.display()))?;
-    }
-
-    let json_str = serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("serialize mcp config: {e}"))?;
-    std::fs::write(&resolved, &json_str)
-        .map_err(|e| format!("write {}: {e}", resolved.display()))?;
+    // Never rewrite a file we cannot parse strictly (it may hold other MCP
+    // servers); `hostcfg` refuses with a token-free snippet instead.
+    let entry = serde_json::json!({
+        "command": "crypt-env-mcp",
+        "env": { "CRYPTENV_TOKEN": token }
+    });
+    let placeholder = serde_json::json!({
+        "command": "crypt-env-mcp",
+        "env": { "CRYPTENV_TOKEN": "<your MCP token — shown in Settings>" }
+    });
+    crate::hostcfg::merge_json_entry(&resolved, &["mcpServers", "cryptenv"], &entry, &placeholder)
+        .map_err(|e| e.to_string())?;
 
     Ok(resolved.to_string_lossy().into_owned())
 }

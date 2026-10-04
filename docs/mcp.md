@@ -40,6 +40,7 @@ src-tauri\target\release\crypt-env-mcp.exe
 ### Prerequisites
 1. **Generate Token**: Open CryptEnv → **Settings** → **Integrations** → **Generate MCP Token**.
 2. **Unlock Vault**: Launch CryptEnv and unlock your vault. `crypt-env-mcp` communicates with the local REST API at `127.0.0.1:47821`.
+   The setup wizard can also write the `cryptenv` entry into `~/.mcp.json` for you. Only that entry changes (other servers are kept), the write is atomic with a one-time `.bak`, and a new file is `0600` on Unix. A file that is not strict JSON (comments, trailing commas) is left untouched and the wizard shows the entry to add by hand, with a token placeholder.
 3. **Restart Client**: Restart Claude Desktop or your MCP client after updating the configuration.
 
 ---

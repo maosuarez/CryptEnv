@@ -103,7 +103,13 @@ fn run_wsl(args: WslArgs) -> Result<(), CliError> {
 fn run_wsl_from_windows(args: WslArgs) -> Result<(), CliError> {
     use crypt_env_lib::wsl::client_setup as cs;
     let runner = WslExe;
-    let distros = match cs::list_distros(&runner) {
+    // The shared WSL core is async (bounded, reaped `wsl.exe` children); the CLI
+    // is synchronous, so drive it on a throwaway current-thread runtime.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::Config(format!("cannot start async runtime: {e}")))?;
+    let distros = match rt.block_on(cs::list_distros(&runner)) {
         Ok(d) => d,
         Err(cs::WslError::NotAvailable) => Vec::new(),
         Err(e) => return Err(CliError::Config(e.to_string())),
@@ -137,11 +143,11 @@ fn run_wsl_from_windows(args: WslArgs) -> Result<(), CliError> {
             }
             let helper = helper.to_string_lossy().into_owned();
             let report = if args.remove {
-                cs::remove_client(&runner, &distro, &helper)
+                rt.block_on(cs::remove_client(&runner, &distro, &helper))
             } else {
                 let appdata = std::env::var("APPDATA")
                     .map_err(|_| CliError::Config("APPDATA is not set".to_string()))?;
-                cs::configure_client(&runner, &distro, &helper, &appdata, exe.to_str())
+                rt.block_on(cs::configure_client(&runner, &distro, &helper, &appdata, exe.to_str()))
             }
             .map_err(|e| CliError::Config(e.to_string()))?;
             println!("crypt-env: configured distribution '{distro}'");
@@ -159,13 +165,14 @@ fn run_wsl_from_windows(args: WslArgs) -> Result<(), CliError> {
 struct WslExe;
 
 impl crypt_env_lib::wsl::client_setup::WslRunner for WslExe {
-    fn wsl(&self, args: &[String]) -> std::io::Result<crypt_env_lib::wsl::client_setup::RunOutput> {
-        let out = std::process::Command::new("wsl.exe").args(args).env("WSL_UTF8", "1").output()?;
-        Ok(crypt_env_lib::wsl::client_setup::RunOutput {
-            success: out.status.success(),
-            stdout: out.stdout,
-            stderr: out.stderr,
-        })
+    async fn run(
+        &self,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> std::io::Result<crypt_env_lib::wsl::client_setup::RunOutput> {
+        let mut cmd = tokio::process::Command::new("wsl.exe");
+        cmd.args(args).env("WSL_UTF8", "1");
+        crypt_env_lib::wsl::client_setup::run_process(cmd, timeout).await
     }
 }
 

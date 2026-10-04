@@ -10,7 +10,7 @@
 
 pub mod client_setup;
 
-pub use client_setup::{wsl_configure_client, wsl_detect, wsl_remove_client};
+pub use client_setup::{wsl_configure_client, wsl_detect, wsl_detect_distro, wsl_remove_client};
 
 // ─── Pure parsing (no I/O) ─────────────────────────────────────────────────
 

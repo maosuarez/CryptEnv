@@ -164,6 +164,8 @@ export type IconName =
 
 export interface WslDistro {
   name:        string;
+  /** `stopped` distros are never started by detection; the user opts in per distro. */
+  state:       'running' | 'stopped';
   defaultUser: string | null;
   configured:  boolean;
   /** The managed `crypt-env` launcher (delegating to the Windows CLI) is installed. */
@@ -192,7 +194,7 @@ export interface WslActionReport {
 export type WslLauncherStatus = 'absent' | 'written' | 'unchanged' | 'deleted' | 'skipped';
 
 export interface WslError {
-  kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling';
+  kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling' | 'timeout' | 'busy';
   message?: string;
 }
 

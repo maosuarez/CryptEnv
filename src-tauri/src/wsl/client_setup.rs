@@ -15,6 +15,24 @@
 
 use cryptenv_setup::ActionReport;
 use serde::Serialize;
+use std::time::Duration;
+
+/// Budget for each probe / listing `wsl.exe` call.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for the configure / remove helper run.
+pub const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Only one WSL operation runs at a time; a second is rejected, not queued.
+static WSL_OP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Claims the WSL operation slot, or fails with [`WslError::Busy`].
+pub fn begin_operation() -> Result<tokio::sync::MutexGuard<'static, ()>, WslError> {
+    claim(&WSL_OP)
+}
+
+fn claim(slot: &'static tokio::sync::Mutex<()>) -> Result<tokio::sync::MutexGuard<'static, ()>, WslError> {
+    slot.try_lock().map_err(|_| WslError::Busy)
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -30,6 +48,10 @@ pub enum WslError {
     UnknownDistro(String),
     /// `wsl.exe` or the helper failed or produced unexpected output.
     Tooling(String),
+    /// A `wsl.exe` call exceeded its budget; it was killed and reaped.
+    Timeout(String),
+    /// Another WSL operation is already running.
+    Busy,
 }
 
 impl std::fmt::Display for WslError {
@@ -39,14 +61,26 @@ impl std::fmt::Display for WslError {
             WslError::NotAvailable => write!(f, "WSL is not installed"),
             WslError::UnknownDistro(d) => write!(f, "unknown WSL distribution: {d}"),
             WslError::Tooling(m) => write!(f, "WSL tooling error: {m}"),
+            WslError::Timeout(m) => write!(f, "WSL timed out: {m}"),
+            WslError::Busy => write!(f, "operation in progress"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistroState {
+    Running,
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WslDistro {
     pub name: String,
+    /// `running` distros are probed; `stopped` ones are never started by
+    /// detection (the user opts in per distro).
+    pub state: DistroState,
     /// Default Linux user (`whoami`), `None` when the probe failed.
     pub default_user: Option<String>,
     /// The cryptenv `env.sh` + rc marker block are present.
@@ -73,9 +107,48 @@ pub struct RunOutput {
     pub stderr: Vec<u8>,
 }
 
-/// Runs `wsl.exe` with the given argument vector.
+/// Runs `wsl.exe` with the given argument vector. An implementation MUST kill
+/// and reap the process when `timeout` elapses and return
+/// [`std::io::ErrorKind::TimedOut`].
+#[allow(async_fn_in_trait)]
 pub trait WslRunner {
-    fn wsl(&self, args: &[String]) -> std::io::Result<RunOutput>;
+    async fn run(&self, args: &[String], timeout: Duration) -> std::io::Result<RunOutput>;
+}
+
+/// Spawns `cmd` with captured output under `timeout`. The child is killed on
+/// drop; on timeout it is killed and awaited before returning `TimedOut`, so no
+/// orphan survives an abandoned operation.
+pub async fn run_process(mut cmd: tokio::process::Command, timeout: Duration) -> std::io::Result<RunOutput> {
+    use tokio::io::AsyncReadExt as _;
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    async fn drain(pipe: &mut Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(p) = pipe {
+            p.read_to_end(&mut buf).await?;
+        }
+        Ok(buf)
+    }
+
+    let work = async {
+        let (status, out, err) = tokio::join!(child.wait(), drain(&mut stdout), drain(&mut stderr));
+        Ok::<_, std::io::Error>(RunOutput { success: status?.success(), stdout: out?, stderr: err? })
+    };
+    match tokio::time::timeout(timeout, work).await {
+        Ok(result) => result,
+        Err(_) => {
+            // `kill` sends the signal and waits, reaping the child.
+            let _ = child.kill().await;
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
 }
 
 /// Fixed probe script — takes no interpolated input.
@@ -175,13 +248,22 @@ pub fn parse_mirrored(content: &str) -> bool {
 // ─── Core operations (platform-neutral) ─────────────────────────────────────
 
 fn tooling_from_io(e: std::io::Error) -> WslError {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        return WslError::Timeout("WSL did not respond in time".to_string());
+    }
     WslError::Tooling(e.to_string())
 }
 
-/// Lists distros. `wsl.exe` missing → [`WslError::NotAvailable`]; a failing
-/// `--list` (WSL present, zero distros) → empty list.
-pub fn list_distros(r: &dyn WslRunner) -> Result<Vec<String>, WslError> {
-    let out = match r.wsl(&["--list".into(), "--quiet".into()]) {
+/// Docker Desktop's internal distributions are never listed or probed.
+fn is_internal(name: &str) -> bool {
+    name.starts_with("docker-desktop")
+}
+
+/// Lists distros without touching their state. `wsl.exe` missing →
+/// [`WslError::NotAvailable`]; a failing `--list` (WSL present, zero distros)
+/// → empty list.
+pub async fn list_distros<R: WslRunner>(r: &R) -> Result<Vec<String>, WslError> {
+    let out = match r.run(&["--list".into(), "--quiet".into()], PROBE_TIMEOUT).await {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(WslError::NotAvailable),
         Err(e) => return Err(tooling_from_io(e)),
@@ -189,77 +271,148 @@ pub fn list_distros(r: &dyn WslRunner) -> Result<Vec<String>, WslError> {
     if !out.success {
         return Ok(Vec::new());
     }
-    Ok(lines(&decode_wsl_output(&out.stdout)?))
+    Ok(lines(&decode_wsl_output(&out.stdout)?)
+        .into_iter()
+        .filter(|n| !is_internal(n))
+        .collect())
 }
 
-/// Read-only detection. Runs `whoami` and a fixed `test`/`grep` probe per
-/// distro; writes nothing anywhere.
-pub fn detect(r: &dyn WslRunner, wslconfig: Option<&str>) -> Result<WslStatus, WslError> {
+/// Words `wsl -l -v` prints for a running distro, lowercase, per locale.
+/// Anything else is treated as stopped (safe: the user can still click Detect).
+const RUNNING_WORDS: &[&str] = &[
+    "running",
+    "en ejecución",
+    "em execução",
+    "wird ausgeführt",
+    "en cours d'exécution",
+    "in esecuzione",
+];
+
+/// Parses `wsl -l -v` output by the column offsets of its header row, so
+/// localized, multi-word state names ("En ejecución") stay intact.
+pub fn parse_distro_states(text: &str) -> Result<Vec<(String, DistroState)>, WslError> {
+    let garbled = || WslError::Tooling("unrecognised output from wsl.exe".to_string());
+    let mut rows = text.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<char> = rows.next().ok_or_else(garbled)?.chars().collect();
+
+    // Start offset of each whitespace-separated header word.
+    let mut starts = Vec::new();
+    for (i, c) in header.iter().enumerate() {
+        if !c.is_whitespace() && (i == 0 || header[i - 1].is_whitespace()) {
+            starts.push(i);
+        }
+    }
+    let [name_at, state_at, version_at, ..] = starts[..] else {
+        return Err(garbled());
+    };
+
+    let mut out = Vec::new();
+    for row in rows {
+        let row: Vec<char> = row.trim_end().chars().collect();
+        if row.len() <= state_at {
+            continue;
+        }
+        let cell = |from: usize, to: usize| -> String {
+            row[from.min(row.len())..to.min(row.len())].iter().collect::<String>().trim().to_string()
+        };
+        let name = cell(name_at, state_at);
+        if name.is_empty() {
+            continue;
+        }
+        let state = cell(state_at, version_at).to_lowercase();
+        let state = if RUNNING_WORDS.contains(&state.as_str()) {
+            DistroState::Running
+        } else {
+            DistroState::Stopped
+        };
+        out.push((name, state));
+    }
+    Ok(out)
+}
+
+/// Distribution states from `wsl -l -v`. Does not start anything.
+async fn list_states<R: WslRunner>(r: &R) -> Result<Vec<(String, DistroState)>, WslError> {
+    let out = match r.run(&["-l".into(), "-v".into()], PROBE_TIMEOUT).await {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(WslError::NotAvailable),
+        Err(e) => return Err(tooling_from_io(e)),
+    };
+    if !out.success {
+        return Ok(Vec::new());
+    }
+    Ok(parse_distro_states(&decode_wsl_output(&out.stdout)?)?
+        .into_iter()
+        .filter(|(n, _)| !is_internal(n))
+        .collect())
+}
+
+/// Runs `whoami` and the fixed `test`/`grep` probes inside `name`. This
+/// starts the distro if it is stopped, so callers gate it.
+async fn probe_distro<R: WslRunner>(r: &R, name: String) -> WslDistro {
+    let sh_probe = |script: &'static str| {
+        vec!["-d".to_string(), name.clone(), "-e".into(), "sh".into(), "-c".into(), script.into()]
+    };
+    let default_user = r
+        .run(&["-d".into(), name.clone(), "-e".into(), "whoami".into()], PROBE_TIMEOUT)
+        .await
+        .ok()
+        .filter(|o| o.success)
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let configured = r
+        .run(&sh_probe(CONFIGURED_PROBE), PROBE_TIMEOUT)
+        .await
+        .map(|o| o.success)
+        .unwrap_or(false);
+    let launcher = r
+        .run(&sh_probe(LAUNCHER_PROBE), PROBE_TIMEOUT)
+        .await
+        .map(|o| o.success)
+        .unwrap_or(false);
+    WslDistro { name, state: DistroState::Running, default_user, configured, launcher }
+}
+
+/// Read-only detection. Only *running* distros are probed; stopped ones are
+/// reported as such without being started. Writes nothing anywhere.
+pub async fn detect<R: WslRunner>(r: &R, wslconfig: Option<&str>) -> Result<WslStatus, WslError> {
     let mirrored = wslconfig.map(parse_mirrored).unwrap_or(false);
-    let names = match list_distros(r) {
+    let states = match list_states(r).await {
         Ok(n) => n,
         Err(WslError::NotAvailable) => {
-            return Ok(WslStatus {
-                available: false,
-                distros: Vec::new(),
-                mirrored,
-            })
+            return Ok(WslStatus { available: false, distros: Vec::new(), mirrored })
         }
         Err(e) => return Err(e),
     };
 
-    let distros = names
-        .into_iter()
-        .map(|name| {
-            let default_user = r
-                .wsl(&["-d".into(), name.clone(), "-e".into(), "whoami".into()])
-                .ok()
-                .filter(|o| o.success)
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let configured = r
-                .wsl(&[
-                    "-d".into(),
-                    name.clone(),
-                    "-e".into(),
-                    "sh".into(),
-                    "-c".into(),
-                    CONFIGURED_PROBE.into(),
-                ])
-                .map(|o| o.success)
-                .unwrap_or(false);
-            let launcher = r
-                .wsl(&[
-                    "-d".into(),
-                    name.clone(),
-                    "-e".into(),
-                    "sh".into(),
-                    "-c".into(),
-                    LAUNCHER_PROBE.into(),
-                ])
-                .map(|o| o.success)
-                .unwrap_or(false);
-            WslDistro {
+    let mut distros = Vec::with_capacity(states.len());
+    for (name, state) in states {
+        distros.push(match state {
+            DistroState::Running => probe_distro(r, name).await,
+            DistroState::Stopped => WslDistro {
                 name,
-                default_user,
-                configured,
-                launcher,
-            }
-        })
-        .collect::<Vec<_>>();
+                state,
+                default_user: None,
+                configured: false,
+                launcher: false,
+            },
+        });
+    }
 
-    Ok(WslStatus {
-        available: !distros.is_empty(),
-        distros,
-        mirrored,
-    })
+    Ok(WslStatus { available: !distros.is_empty(), distros, mirrored })
+}
+
+/// Explicit, user-requested detection of one distro. Unlike [`detect`] this
+/// starts the distro if it is stopped.
+pub async fn detect_distro<R: WslRunner>(r: &R, distro: &str) -> Result<WslDistro, WslError> {
+    ensure_known(r, distro).await?;
+    Ok(probe_distro(r, distro.to_string()).await)
 }
 
 /// Rejects any distro not in a *fresh* `wsl --list` (D5: closes the window
 /// between UI render and action).
-fn ensure_known(r: &dyn WslRunner, distro: &str) -> Result<(), WslError> {
-    if list_distros(r)?.iter().any(|d| d == distro) {
+async fn ensure_known<R: WslRunner>(r: &R, distro: &str) -> Result<(), WslError> {
+    if list_distros(r).await?.iter().any(|d| d == distro) {
         Ok(())
     } else {
         Err(WslError::UnknownDistro(distro.to_string()))
@@ -267,16 +420,20 @@ fn ensure_known(r: &dyn WslRunner, distro: &str) -> Result<(), WslError> {
 }
 
 /// Where the helper lives when viewed from inside `distro`.
-fn helper_linux_path(r: &dyn WslRunner, distro: &str, helper_win: &str) -> Result<String, WslError> {
+async fn helper_linux_path<R: WslRunner>(r: &R, distro: &str, helper_win: &str) -> Result<String, WslError> {
     let via_wslpath = r
-        .wsl(&[
-            "-d".into(),
-            distro.into(),
-            "-e".into(),
-            "wslpath".into(),
-            "-u".into(),
-            helper_win.into(),
-        ])
+        .run(
+            &[
+                "-d".into(),
+                distro.into(),
+                "-e".into(),
+                "wslpath".into(),
+                "-u".into(),
+                helper_win.into(),
+            ],
+            PROBE_TIMEOUT,
+        )
+        .await
         .ok()
         .filter(|o| o.success)
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -292,14 +449,14 @@ fn helper_linux_path(r: &dyn WslRunner, distro: &str, helper_win: &str) -> Resul
         })
 }
 
-fn run_helper(
-    r: &dyn WslRunner,
+async fn run_helper<R: WslRunner>(
+    r: &R,
     distro: &str,
     helper_win: &str,
     helper_args: &[String],
 ) -> Result<ActionReport, WslError> {
-    ensure_known(r, distro)?;
-    let helper = helper_linux_path(r, distro, helper_win)?;
+    ensure_known(r, distro).await?;
+    let helper = helper_linux_path(r, distro, helper_win).await?;
 
     let mut args: Vec<String> = vec![
         "-d".into(),
@@ -313,7 +470,15 @@ fn run_helper(
     ];
     args.extend_from_slice(helper_args);
 
-    let out = r.wsl(&args).map_err(tooling_from_io)?;
+    let out = r.run(&args, ACTION_TIMEOUT).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            WslError::Timeout(
+                "the operation timed out and was stopped; its result is unknown - refresh to check".to_string(),
+            )
+        } else {
+            tooling_from_io(e)
+        }
+    })?;
     if !out.success {
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(WslError::Tooling(if msg.is_empty() {
@@ -333,8 +498,8 @@ fn run_helper(
 /// `/mnt/c/.../tls/cert.pem` path from it (the cert is referenced, never copied).
 /// `cli_win` is this installation's `crypt-env.exe`, the target of the managed
 /// `crypt-env` launcher; `None` makes the helper report the launcher skipped.
-pub fn configure_client(
-    r: &dyn WslRunner,
+pub async fn configure_client<R: WslRunner>(
+    r: &R,
     distro: &str,
     helper_win: &str,
     appdata_win: &str,
@@ -345,12 +510,16 @@ pub fn configure_client(
         args.push("--windows-cli".into());
         args.push(cli.into());
     }
-    run_helper(r, distro, helper_win, &args)
+    run_helper(r, distro, helper_win, &args).await
 }
 
 /// Reverses [`configure_client`] inside `distro`.
-pub fn remove_client(r: &dyn WslRunner, distro: &str, helper_win: &str) -> Result<ActionReport, WslError> {
-    run_helper(r, distro, helper_win, &["--remove".into()])
+pub async fn remove_client<R: WslRunner>(
+    r: &R,
+    distro: &str,
+    helper_win: &str,
+) -> Result<ActionReport, WslError> {
+    run_helper(r, distro, helper_win, &["--remove".into()]).await
 }
 
 // ─── Host dispatch (Windows vs. everything else) ────────────────────────────
@@ -366,37 +535,17 @@ const CLI_EXE: &str = "crypt-env.exe";
 #[cfg(target_os = "windows")]
 mod host {
     use super::*;
-    use std::os::windows::process::CommandExt as _;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const BUDGET: Duration = Duration::from_secs(120);
 
     pub struct SystemRunner;
 
     impl WslRunner for SystemRunner {
-        fn wsl(&self, args: &[String]) -> std::io::Result<RunOutput> {
-            let out = std::process::Command::new("wsl.exe")
-                .args(args)
-                .env("WSL_UTF8", "1")
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()?;
-            Ok(RunOutput {
-                success: out.status.success(),
-                stdout: out.stdout,
-                stderr: out.stderr,
-            })
-        }
-    }
-
-    async fn blocking<T: Send + 'static>(
-        f: impl FnOnce() -> Result<T, WslError> + Send + 'static,
-    ) -> Result<T, WslError> {
-        match tokio::time::timeout(BUDGET, tokio::task::spawn_blocking(f)).await {
-            Err(_) => Err(WslError::Tooling("WSL did not respond in time".to_string())),
-            Ok(Err(e)) => Err(WslError::Tooling(e.to_string())),
-            Ok(Ok(r)) => r,
+        async fn run(&self, args: &[String], timeout: Duration) -> std::io::Result<RunOutput> {
+            let mut cmd = tokio::process::Command::new("wsl.exe");
+            cmd.args(args).env("WSL_UTF8", "1").creation_flags(CREATE_NO_WINDOW);
+            run_process(cmd, timeout).await
         }
     }
 
@@ -418,7 +567,11 @@ mod host {
     }
 
     pub async fn detect() -> Result<WslStatus, WslError> {
-        blocking(|| super::detect(&SystemRunner, read_wslconfig().as_deref())).await
+        super::detect(&SystemRunner, read_wslconfig().as_deref()).await
+    }
+
+    pub async fn detect_distro(distro: String) -> Result<WslDistro, WslError> {
+        super::detect_distro(&SystemRunner, &distro).await
     }
 
     /// This installation's `crypt-env.exe` — the NSIS installer places it next
@@ -442,15 +595,12 @@ mod host {
             .map(|p| p.to_string_lossy().into_owned())
             .ok_or_else(|| WslError::Tooling("cannot resolve %APPDATA%".to_string()))?;
         let cli = cli_path();
-        blocking(move || {
-            super::configure_client(&SystemRunner, &distro, &helper, &appdata, cli.as_deref())
-        })
-        .await
+        super::configure_client(&SystemRunner, &distro, &helper, &appdata, cli.as_deref()).await
     }
 
     pub async fn remove(resource_dir: Option<PathBuf>, distro: String) -> Result<ActionReport, WslError> {
         let helper = helper_path(resource_dir)?;
-        blocking(move || super::remove_client(&SystemRunner, &distro, &helper)).await
+        super::remove_client(&SystemRunner, &distro, &helper).await
     }
 }
 
@@ -462,6 +612,10 @@ mod host {
     use std::path::PathBuf;
 
     pub async fn detect() -> Result<WslStatus, WslError> {
+        Err(WslError::Unsupported)
+    }
+
+    pub async fn detect_distro(_distro: String) -> Result<WslDistro, WslError> {
         Err(WslError::Unsupported)
     }
 
@@ -484,7 +638,16 @@ mod host {
 /// whether mirrored networking is set. Read-only.
 #[tauri::command]
 pub async fn wsl_detect() -> Result<WslStatus, WslError> {
+    let _op = begin_operation()?;
     host::detect().await
+}
+
+/// Probes one distro on explicit user request. **Starts the distro if it is
+/// stopped** — the GUI labels the action accordingly.
+#[tauri::command]
+pub async fn wsl_detect_distro(distro: String) -> Result<WslDistro, WslError> {
+    let _op = begin_operation()?;
+    host::detect_distro(distro).await
 }
 
 /// Configures the `crypt-env` client inside `distro` (non-destructive; see the
@@ -495,6 +658,7 @@ pub async fn wsl_configure_client(
     distro: String,
 ) -> Result<ActionReport, WslError> {
     use tauri::Manager as _;
+    let _op = begin_operation()?;
     let resource_dir = app.path().resource_dir().ok();
     // `%APPDATA%` is the parent of `app_data_dir` (`%APPDATA%\<identifier>`).
     let appdata = app
@@ -513,6 +677,7 @@ pub async fn wsl_remove_client(
     distro: String,
 ) -> Result<ActionReport, WslError> {
     use tauri::Manager as _;
+    let _op = begin_operation()?;
     let resource_dir = app.path().resource_dir().ok();
     host::remove(resource_dir, distro).await
 }
@@ -522,8 +687,8 @@ pub async fn wsl_remove_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     fn utf16le(s: &str, bom: bool) -> Vec<u8> {
         let mut out = Vec::new();
@@ -536,27 +701,27 @@ mod tests {
         out
     }
 
-    type Responder = Box<dyn Fn(&[String]) -> std::io::Result<RunOutput>>;
+    type Responder = Box<dyn Fn(&[String]) -> std::io::Result<RunOutput> + Send + Sync>;
 
     /// Records every argument vector and answers from a scripted queue, or
     /// from a matcher closure.
     struct MockRunner {
-        calls: RefCell<Vec<Vec<String>>>,
+        calls: Mutex<Vec<Vec<String>>>,
         respond: Responder,
     }
 
     impl MockRunner {
-        fn new(respond: impl Fn(&[String]) -> std::io::Result<RunOutput> + 'static) -> Self {
+        fn new(respond: impl Fn(&[String]) -> std::io::Result<RunOutput> + Send + Sync + 'static) -> Self {
             Self {
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
                 respond: Box::new(respond),
             }
         }
     }
 
     impl WslRunner for MockRunner {
-        fn wsl(&self, args: &[String]) -> std::io::Result<RunOutput> {
-            self.calls.borrow_mut().push(args.to_vec());
+        async fn run(&self, args: &[String], _timeout: Duration) -> std::io::Result<RunOutput> {
+            self.calls.lock().unwrap().push(args.to_vec());
             (self.respond)(args)
         }
     }
@@ -575,11 +740,15 @@ mod tests {
 
     const REPORT: &str = r#"{"env_file":"/home/me/.config/cryptenv/env.sh","env_file_changed":true,"rc_files":["/home/me/.bashrc"],"backups":["/home/me/.bashrc.cryptenv.bak"],"marker_added":true,"marker_removed":false,"launcher":"/home/me/.local/share/cryptenv/bin/crypt-env","launcher_status":"written","launcher_note":null}"#;
 
+    const EN_LIST_V: &str = "  NAME              STATE           VERSION\r\n* Ubuntu            Running         2\r\n  Debian            Stopped         2\r\n  docker-desktop    Running         2\r\n";
+    const ES_LIST_V: &str = "  NOMBRE            ESTADO          VERSIÓN\r\n* Ubuntu            En ejecución    2\r\n  Debian            Detenido        2\r\n  docker-desktop    En ejecución    2\r\n";
+
     /// A two-distro WSL where `Ubuntu` is configured and `Debian` is not;
     /// only `Ubuntu` has the launcher.
     fn two_distros() -> MockRunner {
         MockRunner::new(|a| match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-            ["--list", "--quiet"] => ok(utf16le("Ubuntu\r\nDebian\r\n", false)),
+            ["--list", "--quiet"] => ok(utf16le("Ubuntu\r\nDebian\r\ndocker-desktop\r\n", false)),
+            ["-l", "-v"] => ok(utf16le(EN_LIST_V, false)),
             ["-d", d, "-e", "whoami"] => ok(format!("{}user\n", d.to_lowercase())),
             ["-d", "Ubuntu", "-e", "sh", "-c", _] => ok(""),
             ["-d", _, "-e", "sh", "-c", _] => fail(),
@@ -614,10 +783,10 @@ mod tests {
         assert!(matches!(decode_wsl_output(&[0x07, 0x1B, 0x02]), Err(WslError::Tooling(_))));
     }
 
-    #[test]
-    fn detect_surfaces_garbled_list_as_tooling() {
+    #[tokio::test]
+    async fn detect_surfaces_garbled_list_as_tooling() {
         let r = MockRunner::new(|_| ok(vec![0xC3, 0x28]));
-        assert!(matches!(detect(&r, None), Err(WslError::Tooling(_))));
+        assert!(matches!(detect(&r, None).await, Err(WslError::Tooling(_))));
     }
 
     // ─── .wslconfig ─────────────────────────────────────────────────────────
@@ -635,45 +804,142 @@ mod tests {
     // ─── detect ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn detect_enumerates_distros_with_user_and_configured_flag() {
+    fn parses_english_and_spanish_state_listings() {
+        for text in [EN_LIST_V, ES_LIST_V] {
+            assert_eq!(
+                parse_distro_states(text).unwrap(),
+                vec![
+                    ("Ubuntu".to_string(), DistroState::Running),
+                    ("Debian".to_string(), DistroState::Stopped),
+                    ("docker-desktop".to_string(), DistroState::Running),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn utf16le_listing_with_bom_decodes_then_parses() {
+        let bytes = utf16le(ES_LIST_V, true);
+        let parsed = parse_distro_states(&decode_wsl_output(&bytes).unwrap()).unwrap();
+        assert_eq!(parsed[0], ("Ubuntu".to_string(), DistroState::Running));
+    }
+
+    #[test]
+    fn unknown_state_word_is_stopped_and_bad_header_is_an_error() {
+        let text = "  NAME  STATE  VERSION\n  Foo   Zzz    2\n";
+        assert_eq!(parse_distro_states(text).unwrap(), vec![("Foo".to_string(), DistroState::Stopped)]);
+        assert!(matches!(parse_distro_states("garbage\n"), Err(WslError::Tooling(_))));
+        assert!(matches!(parse_distro_states(""), Err(WslError::Tooling(_))));
+    }
+
+    #[tokio::test]
+    async fn detect_probes_only_running_distros_and_skips_docker() {
         let r = two_distros();
-        let s = detect(&r, Some("[wsl2]\nnetworkingMode=mirrored\n")).unwrap();
+        let s = detect(&r, Some("[wsl2]\nnetworkingMode=mirrored\n")).await.unwrap();
         assert!(s.available);
         assert!(s.mirrored);
         assert_eq!(
             s.distros,
             vec![
-                WslDistro { name: "Ubuntu".into(), default_user: Some("ubuntuuser".into()), configured: true, launcher: true },
-                WslDistro { name: "Debian".into(), default_user: Some("debianuser".into()), configured: false, launcher: false },
+                WslDistro { name: "Ubuntu".into(), state: DistroState::Running, default_user: Some("ubuntuuser".into()), configured: true, launcher: true },
+                WslDistro { name: "Debian".into(), state: DistroState::Stopped, default_user: None, configured: false, launcher: false },
             ]
         );
-        // Read-only: no helper run, no wslpath, only list / whoami / probe.
-        for call in r.calls.borrow().iter() {
+        // Read-only, and the stopped distro is never addressed.
+        for call in r.calls.lock().unwrap().iter() {
             assert!(!call.iter().any(|a| a == "wslpath" || a == RUN_HELPER));
             assert!(!call.iter().any(|a| a == "--windows-cli" || a == "--remove"));
+            assert!(!call.iter().any(|a| a == "Debian" || a.starts_with("docker-desktop")), "{call:?}");
         }
     }
 
-    #[test]
-    fn detect_reports_unavailable_when_wsl_missing() {
+    #[tokio::test]
+    async fn detect_distro_starts_only_the_requested_distro() {
+        let r = two_distros();
+        let d = detect_distro(&r, "Debian").await.unwrap();
+        assert_eq!(d.name, "Debian");
+        assert_eq!(d.state, DistroState::Running);
+        assert_eq!(d.default_user.as_deref(), Some("debianuser"));
+        assert_eq!(
+            detect_distro(&r, "docker-desktop").await.unwrap_err(),
+            WslError::UnknownDistro("docker-desktop".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_reports_unavailable_when_wsl_missing() {
         let r = MockRunner::new(|_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
-        let s = detect(&r, None).unwrap();
+        let s = detect(&r, None).await.unwrap();
         assert!(!s.available);
         assert!(s.distros.is_empty());
         assert!(!s.mirrored);
     }
 
-    #[test]
-    fn detect_with_zero_distros_is_unavailable() {
+    #[tokio::test]
+    async fn detect_with_zero_distros_is_unavailable() {
         let r = MockRunner::new(|_| fail());
-        let s = detect(&r, None).unwrap();
+        let s = detect(&r, None).await.unwrap();
         assert!(!s.available);
+    }
+
+    #[tokio::test]
+    async fn timed_out_listing_is_a_timeout_error() {
+        let r = MockRunner::new(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        assert!(matches!(detect(&r, None).await, Err(WslError::Timeout(_))));
+    }
+
+    // ─── process reaping / serialization ────────────────────────────────────
+
+    #[test]
+    fn detect_future_is_send() {
+        // The Tauri commands need Send futures; this fails to compile otherwise.
+        fn assert_send<T: Send>(_: T) {}
+        let r = MockRunner::new(|_| fail());
+        assert_send(detect(&r, None));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_process_kills_and_reaps_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(format!("echo $$ > '{}'; exec sleep 30", pidfile.display()));
+
+        let started = std::time::Instant::now();
+        let err = run_process(cmd, Duration::from_millis(500)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // The child was killed and awaited: signalling it now finds no process.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child {pid} still alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_process_captures_output() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("printf hi; printf err >&2; exit 3");
+        let out = run_process(cmd, Duration::from_secs(5)).await.unwrap();
+        assert!(!out.success);
+        assert_eq!(out.stdout, b"hi");
+        assert_eq!(out.stderr, b"err");
+    }
+
+    #[tokio::test]
+    async fn second_claim_is_rejected_while_one_is_held() {
+        static SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let first = claim(&SLOT).unwrap();
+        assert_eq!(claim(&SLOT).unwrap_err(), WslError::Busy);
+        drop(first);
+        assert!(claim(&SLOT).is_ok());
     }
 
     // ─── configure / remove ─────────────────────────────────────────────────
 
-    #[test]
-    fn configure_rejects_unknown_distro_without_running_anything_else() {
+    #[tokio::test]
+    async fn configure_rejects_unknown_distro_without_running_anything_else() {
         let r = two_distros();
         let err = configure_client(
             &r,
@@ -682,15 +948,16 @@ mod tests {
             r"C:\Users\me\AppData\Roaming",
             Some(r"C:\App\crypt-env.exe"),
         )
+        .await
         .unwrap_err();
         assert_eq!(err, WslError::UnknownDistro("Arch".into()));
-        let calls = r.calls.borrow();
+        let calls = r.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], vec!["--list", "--quiet"]);
     }
 
-    #[test]
-    fn configure_passes_distro_and_values_as_discrete_args() {
+    #[tokio::test]
+    async fn configure_passes_distro_and_values_as_discrete_args() {
         let r = two_distros();
         let report = configure_client(
             &r,
@@ -699,12 +966,13 @@ mod tests {
             r"C:\Users\me\AppData\Roaming",
             Some(r"D:\My Apps\Crypt'Env\crypt-env.exe"),
         )
+        .await
         .unwrap();
         assert_eq!(report.launcher_status, cryptenv_setup::LauncherStatus::Written);
         assert_eq!(report.backups, vec!["/home/me/.bashrc.cryptenv.bak"]);
         assert!(report.marker_added);
 
-        let calls = r.calls.borrow();
+        let calls = r.calls.lock().unwrap();
         let run = calls.last().unwrap();
         assert_eq!(
             run,
@@ -729,56 +997,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configure_without_cli_omits_windows_cli_arg() {
+    #[tokio::test]
+    async fn configure_without_cli_omits_windows_cli_arg() {
         let r = two_distros();
-        configure_client(&r, "Ubuntu", r"C:\h", r"C:\Users\me\AppData\Roaming", None).unwrap();
-        let calls = r.calls.borrow();
+        configure_client(&r, "Ubuntu", r"C:\h", r"C:\Users\me\AppData\Roaming", None).await.unwrap();
+        let calls = r.calls.lock().unwrap();
         assert!(!calls.last().unwrap().iter().any(|a| a == "--windows-cli"));
     }
 
-    #[test]
-    fn remove_runs_helper_with_remove_flag() {
+    #[tokio::test]
+    async fn remove_runs_helper_with_remove_flag() {
         let r = two_distros();
-        remove_client(&r, "Debian", r"C:\App\wsl\crypt-env-setup").unwrap();
-        let calls = r.calls.borrow();
+        remove_client(&r, "Debian", r"C:\App\wsl\crypt-env-setup").await.unwrap();
+        let calls = r.calls.lock().unwrap();
         let run = calls.last().unwrap();
         assert_eq!(run[1], "Debian");
         assert_eq!(run.last().map(String::as_str), Some("--remove"));
     }
 
-    #[test]
-    fn helper_failure_and_bad_report_are_tooling_errors() {
-        let queue = RefCell::new(VecDeque::from([
+    #[tokio::test]
+    async fn helper_failure_and_bad_report_are_tooling_errors() {
+        let queue = Mutex::new(VecDeque::from([
             ok(utf16le("Ubuntu\r\n", false)),
             ok("/mnt/c/h\n"),
             Ok(RunOutput { success: false, stdout: Vec::new(), stderr: b"boom".to_vec() }),
         ]));
-        let r = MockRunner::new(move |_| queue.borrow_mut().pop_front().unwrap_or_else(fail));
+        let r = MockRunner::new(move |_| queue.lock().unwrap().pop_front().unwrap_or_else(fail));
         assert_eq!(
-            remove_client(&r, "Ubuntu", r"C:\h").unwrap_err(),
+            remove_client(&r, "Ubuntu", r"C:\h").await.unwrap_err(),
             WslError::Tooling("boom".into())
         );
 
-        let queue = RefCell::new(VecDeque::from([
+        let queue = Mutex::new(VecDeque::from([
             ok(utf16le("Ubuntu\r\n", false)),
             ok("/mnt/c/h\n"),
             ok("not json"),
         ]));
-        let r = MockRunner::new(move |_| queue.borrow_mut().pop_front().unwrap_or_else(fail));
-        assert!(matches!(remove_client(&r, "Ubuntu", r"C:\h"), Err(WslError::Tooling(_))));
+        let r = MockRunner::new(move |_| queue.lock().unwrap().pop_front().unwrap_or_else(fail));
+        assert!(matches!(remove_client(&r, "Ubuntu", r"C:\h").await, Err(WslError::Tooling(_))));
     }
 
-    #[test]
-    fn helper_path_falls_back_to_drvfs_mapping() {
-        let queue = RefCell::new(VecDeque::from([
+    #[tokio::test]
+    async fn helper_path_falls_back_to_drvfs_mapping() {
+        let queue = Mutex::new(VecDeque::from([
             ok(utf16le("Ubuntu\r\n", false)),
             fail(), // wslpath unavailable
             ok(REPORT),
         ]));
-        let r = MockRunner::new(move |_| queue.borrow_mut().pop_front().unwrap_or_else(fail));
-        remove_client(&r, "Ubuntu", r"C:\App\wsl\crypt-env-setup").unwrap();
-        let calls = r.calls.borrow();
+        let r = MockRunner::new(move |_| queue.lock().unwrap().pop_front().unwrap_or_else(fail));
+        remove_client(&r, "Ubuntu", r"C:\App\wsl\crypt-env-setup").await.unwrap();
+        let calls = r.calls.lock().unwrap();
         assert_eq!(calls[2][7], "/mnt/c/App/wsl/crypt-env-setup");
     }
 

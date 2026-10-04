@@ -678,6 +678,8 @@
     }
   },
   "setup": {
+    "copySnippet": "Copy snippet",
+    "snippetCopied": "Snippet copied",
     "welcomeTitle": "Welcome to CryptEnv",
     "claudeTitle": "Claude Code Integration",
     "intro": "Your vault is ready. CryptEnv can integrate with Claude Code so Claude can securely access your secrets as environment variables — without exposing their values directly.",
@@ -798,7 +800,9 @@
     "wslNotAvailable": "WSL is not installed",
     "wslUnknownDistro": "Distribution \"{distro}\" is no longer installed — refresh and try again",
     "wslTooling": "WSL error",
-    "wslToolingDetail": "WSL error: {message}"
+    "wslToolingDetail": "WSL error: {message}",
+    "wslTimeout": "WSL did not respond in time: {message}",
+    "wslBusy": "Another WSL operation is in progress"
   },
   "ui": {
     "ok": "OK",
@@ -867,6 +871,10 @@
     "mirroredNote": "Not needed for the {cmd} command that Configure installs — it runs the Windows CLI and works with the default networking. Only a native Linux {cmd} build needs mirrored networking to reach the vault on 127.0.0.1. Applying it requires {shutdown} and changes networking for every distro, so CryptEnv never edits this file for you.",
     "unknownUser": "unknown user",
     "notConfigured": "Not configured",
+    "stopped": "Stopped",
+    "detect": "Detect (starts the distribution)",
+    "detecting": "Detecting...",
+    "detectTitle": "Starts this distribution to inspect it",
     "configured": "Configured",
     "configuredNoLauncher": "Configured · no crypt-env command — reconfigure",
     "configuring": "CONFIGURING…",
