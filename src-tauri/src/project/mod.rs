@@ -468,20 +468,27 @@ pub async fn save_environment(db: &VaultDb, input: EnvironmentInput) -> Result<i
     validate_environment_name(&input.name)?;
     ensure_no_case_collision(db, input.project_id, input.id, &input.name).await?;
 
+    // Validate before opening the transaction so rejected input never writes.
+    crate::db::validate_unique_keys(input.vars.iter().map(|v| v.key.as_str()))?;
+    crate::db::validate_unique_paths(&input.paths)?;
 
-    let env_id = db
-        .upsert_environment(input.id, input.project_id, &input.name, input.is_default)
-        .await?;
+    // Rename, paths, ownership grants and vars commit together or not at all.
+    // Dropping `tx` on an early `?` return rolls everything back.
+    let mut tx = db.begin().await?;
 
-    db.set_environment_paths(env_id, &input.paths).await?;
+    let env_id =
+        VaultDb::upsert_environment_tx(&mut tx, input.id, input.project_id, &input.name, input.is_default)
+            .await?;
+
+    VaultDb::set_environment_paths_tx(&mut tx, env_id, &input.paths).await?;
 
     for v in &input.vars {
-        let owners = db.list_owning_projects(v.item_id).await?;
+        let owners = VaultDb::list_owning_projects_tx(&mut tx, v.item_id).await?;
         if owners.contains(&input.project_id) {
             continue;
         }
-        if db.is_item_global(v.item_id).await?.unwrap_or(false) {
-            db.add_item_owner(v.item_id, input.project_id).await?;
+        if VaultDb::is_item_global_tx(&mut tx, v.item_id).await?.unwrap_or(false) {
+            VaultDb::add_item_owner_tx(&mut tx, v.item_id, input.project_id).await?;
         } else {
             return Err(format!(
                 "item {} is not global and not already owned by this project",
@@ -496,7 +503,8 @@ pub async fn save_environment(db: &VaultDb, input: EnvironmentInput) -> Result<i
         .map(|v| DbEnvironmentVar { id: 0, environment_id: env_id, key: v.key, item_id: Some(v.item_id), literal: None })
         .collect();
 
-    db.set_environment_vars(env_id, &db_vars).await?;
+    VaultDb::set_environment_vars_tx(&mut tx, env_id, &db_vars).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(env_id)
 }
 
@@ -1830,5 +1838,72 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert!(!plain.exists(), "no path is written when any target is a symlink");
+    }
+
+    // ─── vault-db-transactional-integrity ─────────────────────────────
+
+    #[tokio::test]
+    async fn save_environment_rejects_duplicate_keys_without_writing() {
+        let (_dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let item = plain_secret("A", "va");
+        let enc = crate::vault::encrypt_item(&key, &item).unwrap();
+        let item_id = db.upsert_item(0, "secret", &enc, &item.created, false).await.unwrap();
+        db.add_item_owner(item_id, project_id).await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: "production".to_string(), is_default: true,
+            paths: vec![], vars: vec![EnvironmentVar { id: 0, key: "A".to_string(), item_id }],
+        }).await.unwrap();
+
+        let err = save_environment(&db, EnvironmentInput {
+            id: env_id, project_id, name: "renamed".to_string(), is_default: true,
+            paths: vec![],
+            vars: vec![
+                EnvironmentVar { id: 0, key: "DUP".to_string(), item_id },
+                EnvironmentVar { id: 0, key: "DUP".to_string(), item_id },
+            ],
+        }).await.unwrap_err();
+        assert!(err.contains("DUP"));
+
+        let env = db.get_environment(env_id).await.unwrap().unwrap();
+        assert_eq!(env.name, "production");
+        let vars = db.get_environment_vars(env_id).await.unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "A");
+    }
+
+    #[tokio::test]
+    async fn save_environment_is_atomic_when_var_insert_fails() {
+        let (_dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let item = plain_secret("SHARED", "v");
+        let enc = crate::vault::encrypt_item(&key, &item).unwrap();
+        let global_id = db.upsert_item(0, "secret", &enc, &item.created, true).await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: "production".to_string(), is_default: true,
+            paths: vec!["/a".to_string()], vars: vec![],
+        }).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON environment_vars
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let res = save_environment(&db, EnvironmentInput {
+            id: env_id, project_id, name: "staging".to_string(), is_default: true,
+            paths: vec!["/b".to_string()],
+            vars: vec![EnvironmentVar { id: 0, key: "SHARED".to_string(), item_id: global_id }],
+        }).await;
+        assert!(res.is_err());
+
+        let env = db.get_environment(env_id).await.unwrap().unwrap();
+        assert_eq!(env.name, "production", "rename must be rolled back");
+        assert_eq!(db.get_environment_paths(env_id).await.unwrap(), vec!["/a".to_string()]);
+        assert!(db.list_owning_projects(global_id).await.unwrap().is_empty(), "ownership grant must be rolled back");
     }
 }

@@ -163,3 +163,24 @@ async fn reveal_item_nonexistent_returns_404() {
     .await;
     assert_eq!(status.as_u16(), 404);
 }
+
+#[tokio::test]
+async fn concurrent_updates_to_different_fields_are_both_kept() {
+    let v = unlocked_vault().await;
+    let app = router(&v);
+    let id = v.item_ids[0];
+    let uri = format!("/items/{id}");
+
+    let value_body = serde_json::json!({ "type": "secret", "value": "new-value" });
+    let desc_body = serde_json::json!({ "type": "secret", "description": "new-description" });
+    let (a, b) = tokio::join!(
+        req(&app, "PUT", &uri, Some(&v.token), Some(value_body)),
+        req(&app, "PUT", &uri, Some(&v.token), Some(desc_body)),
+    );
+    assert_eq!(a.0.as_u16(), 200);
+    assert_eq!(b.0.as_u16(), 200);
+
+    let stored = read_item(&v, id).await;
+    assert_eq!(stored.value.as_deref(), Some("new-value"));
+    assert_eq!(stored.description.as_deref(), Some("new-description"));
+}

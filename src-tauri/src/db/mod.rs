@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::time::Duration;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -181,7 +182,7 @@ pub struct InsertedProject {
 }
 
 pub struct VaultDb {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     path: String,
 }
 
@@ -225,11 +226,36 @@ fn map_conflict(e: sqlx::Error, sentinel: &str) -> String {
     e.to_string()
 }
 
+/// Connection options applied to EVERY pooled connection (including ones
+/// opened after the pool recycles idle connections). `foreign_keys` and
+/// `secure_delete` are per-connection pragmas: running them once as a query
+/// only configures whichever connection happened to execute it.
+///
+/// `secure_delete`: SQLite zeroes freed page content on every
+/// DELETE/UPDATE-that-frees instead of merely unlinking it. Covers
+/// `delete_item`, `delete_project`'s cascades, the `Replace` conflict branch,
+/// and the orphan prune path uniformly (see `wipe_and_reset` for the
+/// file-level version of the same idea). No on-disk format impact.
+pub(crate) fn connect_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .pragma("secure_delete", "ON")
+        .busy_timeout(Duration::from_secs(5))
+}
+
 impl VaultDb {
+    /// Starts a transaction on the pool. Callers that need several writes to
+    /// succeed or fail together (e.g. `project::save_environment`) use this
+    /// together with the `*_tx` helpers.
+    pub async fn begin(&self) -> Result<Transaction<'static, Sqlite>, String> {
+        self.pool.begin().await.map_err(|e| e.to_string())
+    }
+
     pub async fn open(path: &str) -> Result<Self, String> {
-        let opts = SqliteConnectOptions::new()
-            .filename(Path::new(path))
-            .create_if_missing(true);
+        let opts = connect_options(Path::new(path));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -244,16 +270,8 @@ impl VaultDb {
 
     async fn init_schema(&self) -> Result<(), String> {
         let stmts = [
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA foreign_keys=ON",
-            // SQLite zeroes freed page content on every DELETE/UPDATE-that-frees
-            // when this is on, instead of merely unlinking it. Covers `delete_item`,
-            // `delete_project`'s cascades, the `Replace` conflict branch (§3.2), and
-            // the orphan prune path uniformly, rather than relying on call sites
-            // remembering to zero-then-delete (see `wipe_and_reset`'s file-level
-            // version of the same idea). Connection-level setting, no on-disk
-            // format impact — safe to remove at any time.
-            "PRAGMA secure_delete=ON",
+            // Pragmas (WAL, foreign_keys, secure_delete) live in `connect_options`
+            // so they apply to every pooled connection, not just this one.
             "CREATE TABLE IF NOT EXISTS vault_meta (
                 id            INTEGER PRIMARY KEY CHECK(id = 1),
                 kdf_salt      TEXT NOT NULL,
@@ -824,6 +842,131 @@ impl VaultDb {
         Ok(())
     }
 
+    /// Reads one item's (data, is_global) inside an open transaction, so a
+    /// read-merge-write sequence sees and writes a consistent state.
+    pub async fn get_item_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: i64,
+    ) -> Result<Option<(String, bool)>, String> {
+        let row = sqlx::query("SELECT data, is_global FROM items WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1) != 0)))
+    }
+
+    /// In-transaction counterpart of `upsert_item` for an existing row.
+    pub async fn update_item_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: i64,
+        data: &str,
+        is_global: bool,
+    ) -> Result<(), String> {
+        sqlx::query("UPDATE items SET data = ?1, updated = ?2, is_global = ?3 WHERE id = ?4")
+            .bind(data)
+            .bind(now_ts())
+            .bind(if is_global { 1_i64 } else { 0_i64 })
+            .bind(id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Forks a multi-owner item into one independent copy per owning project
+    /// and removes the original, all in one transaction. `copies` holds
+    /// `(project_id, encrypted_data)`; returns the new item ids in order. A
+    /// failure at any step leaves the original item and its links untouched.
+    pub async fn fork_item_per_owner(
+        &self,
+        original_id: i64,
+        item_type: &str,
+        created: &str,
+        copies: &[(i64, String)],
+    ) -> Result<Vec<i64>, String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let now = now_ts();
+        let mut new_ids = Vec::with_capacity(copies.len());
+        for (project_id, data) in copies {
+            let res = sqlx::query(
+                "INSERT INTO items (item_type, data, created, updated, is_global) VALUES (?1, ?2, ?3, ?4, 0)",
+            )
+            .bind(item_type)
+            .bind(data)
+            .bind(created)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            let new_id = res.last_insert_rowid();
+            Self::add_item_owner_tx(&mut tx, new_id, *project_id).await?;
+            sqlx::query(
+                "UPDATE environment_vars SET item_id = ?1
+                 WHERE item_id = ?2 AND environment_id IN
+                     (SELECT id FROM environments WHERE project_id = ?3)",
+            )
+            .bind(new_id)
+            .bind(original_id)
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            new_ids.push(new_id);
+        }
+        sqlx::query("DELETE FROM environment_vars WHERE item_id = ?1")
+            .bind(original_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM items WHERE id = ?1")
+            .bind(original_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(new_ids)
+    }
+
+    /// Applies the legacy literal-var migration atomically: each tuple is
+    /// `(environment_var_id, project_id, encrypted_item_data, created)`. Creates
+    /// the item, grants ownership, repoints the var, and finally records the
+    /// `migrated_literals_v1` flag. Either everything lands or nothing does.
+    pub async fn apply_literal_migration(
+        &self,
+        entries: &[(i64, i64, String, String)],
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let now = now_ts();
+        for (env_var_id, project_id, data, created) in entries {
+            let res = sqlx::query(
+                "INSERT INTO items (item_type, data, created, updated, is_global) VALUES ('secret', ?1, ?2, ?3, 0)",
+            )
+            .bind(data)
+            .bind(created)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            let new_id = res.last_insert_rowid();
+            Self::add_item_owner_tx(&mut tx, new_id, *project_id).await?;
+            sqlx::query("UPDATE environment_vars SET item_id = ?1, literal = NULL WHERE id = ?2")
+                .bind(new_id)
+                .bind(env_var_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('migrated_literals_v1', 'true')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     pub async fn set_item_global(&self, id: i64, is_global: bool) -> Result<(), String> {
         let is_global_i: i64 = if is_global { 1 } else { 0 };
         sqlx::query("UPDATE items SET is_global = ?1 WHERE id = ?2")
@@ -867,6 +1010,44 @@ impl VaultDb {
             .bind(item_id)
             .bind(project_id)
             .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn list_owning_projects_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        item_id: i64,
+    ) -> Result<Vec<i64>, String> {
+        let rows = sqlx::query("SELECT project_id FROM item_projects WHERE item_id = ?1")
+            .bind(item_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    pub async fn is_item_global_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: i64,
+    ) -> Result<Option<bool>, String> {
+        let val: Option<i64> = sqlx::query_scalar("SELECT is_global FROM items WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(val.map(|v| v != 0))
+    }
+
+    pub async fn add_item_owner_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        item_id: i64,
+        project_id: i64,
+    ) -> Result<(), String> {
+        sqlx::query("INSERT OR IGNORE INTO item_projects (item_id, project_id) VALUES (?1, ?2)")
+            .bind(item_id)
+            .bind(project_id)
+            .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -957,24 +1138,44 @@ impl VaultDb {
             .collect())
     }
 
+    /// Diff + upsert in one transaction: categories absent from `cats` are
+    /// deleted (their `project_categories` links cascade, which is correct),
+    /// the rest are inserted or updated in place so links to categories that
+    /// still exist survive. Any failure rolls the whole save back.
     pub async fn save_categories(&self, cats: &[DbCategory]) -> Result<(), String> {
-        sqlx::query("DELETE FROM categories")
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+
+        let existing: Vec<String> = sqlx::query_scalar("SELECT cid FROM categories")
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
+        let keep: std::collections::HashSet<&str> = cats.iter().map(|c| c.cid.as_str()).collect();
+        for cid in existing.iter().filter(|cid| !keep.contains(cid.as_str())) {
+            sqlx::query("DELETE FROM categories WHERE cid = ?1")
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
         for cat in cats {
             sqlx::query(
-                "INSERT INTO categories (cid, name, color, description) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO categories (cid, name, color, description) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(cid) DO UPDATE SET
+                     name = excluded.name,
+                     color = excluded.color,
+                     description = excluded.description",
             )
             .bind(&cat.cid)
             .bind(&cat.name)
             .bind(&cat.color)
             .bind(&cat.description)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
         }
-        Ok(())
+
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     pub async fn insert_category(&self, cat: &DbCategory) -> Result<(), String> {
@@ -1506,9 +1707,8 @@ impl VaultDb {
         }))
     }
 
-    /// id = 0 → INSERT, returns new id. id > 0 → UPDATE, returns same id.
-    pub async fn upsert_environment(
-        &self,
+    pub async fn upsert_environment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         id: i64,
         project_id: i64,
         name: &str,
@@ -1525,7 +1725,7 @@ impl VaultDb {
             .bind(is_default_i)
             .bind(&now)
             .bind(&now)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| map_conflict(e, ENVIRONMENT_NAME_CONFLICT))?;
             Ok(res.last_insert_rowid())
@@ -1537,11 +1737,25 @@ impl VaultDb {
             .bind(is_default_i)
             .bind(&now)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| map_conflict(e, ENVIRONMENT_NAME_CONFLICT))?;
             Ok(id)
         }
+    }
+
+    /// id = 0 → INSERT, returns new id. id > 0 → UPDATE, returns same id.
+    pub async fn upsert_environment(
+        &self,
+        id: i64,
+        project_id: i64,
+        name: &str,
+        is_default: bool,
+    ) -> Result<i64, String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let env_id = Self::upsert_environment_tx(&mut tx, id, project_id, name, is_default).await?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(env_id)
     }
 
     pub async fn delete_environment(&self, id: i64) -> Result<(), String> {
@@ -1564,14 +1778,14 @@ impl VaultDb {
         Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
-    pub async fn set_environment_paths(
-        &self,
+    pub async fn set_environment_paths_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         environment_id: i64,
         paths: &[String],
     ) -> Result<(), String> {
         sqlx::query("DELETE FROM environment_paths WHERE environment_id = ?1")
             .bind(environment_id)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
         for path in paths {
@@ -1580,11 +1794,23 @@ impl VaultDb {
             )
             .bind(environment_id)
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Rejects duplicate paths before anything is written.
+    pub async fn set_environment_paths(
+        &self,
+        environment_id: i64,
+        paths: &[String],
+    ) -> Result<(), String> {
+        validate_unique_paths(paths)?;
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        Self::set_environment_paths_tx(&mut tx, environment_id, paths).await?;
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     pub async fn get_environment_vars(&self, environment_id: i64) -> Result<Vec<DbEnvironmentVar>, String> {
@@ -1607,14 +1833,14 @@ impl VaultDb {
             .collect())
     }
 
-    pub async fn set_environment_vars(
-        &self,
+    pub async fn set_environment_vars_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         environment_id: i64,
         vars: &[DbEnvironmentVar],
     ) -> Result<(), String> {
         sqlx::query("DELETE FROM environment_vars WHERE environment_id = ?1")
             .bind(environment_id)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
         for v in vars {
@@ -1625,11 +1851,24 @@ impl VaultDb {
             .bind(&v.key)
             .bind(v.item_id)
             .bind(&v.literal)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Rejects duplicate keys (case-sensitive) before anything is written.
+    /// The error names the key only, never a value.
+    pub async fn set_environment_vars(
+        &self,
+        environment_id: i64,
+        vars: &[DbEnvironmentVar],
+    ) -> Result<(), String> {
+        validate_unique_keys(vars.iter().map(|v| v.key.as_str()))?;
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        Self::set_environment_vars_tx(&mut tx, environment_id, vars).await?;
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     /// Links a single item into an environment under `key`, without touching
@@ -2099,9 +2338,7 @@ impl VaultDb {
             }
         }
         std::fs::remove_file(&self.path).map_err(|e| format!("wipe db: {e}"))?;
-        let opts = SqliteConnectOptions::new()
-            .filename(Path::new(&self.path))
-            .create_if_missing(true);
+        let opts = connect_options(Path::new(&self.path));
         self.pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -2109,6 +2346,28 @@ impl VaultDb {
             .map_err(|e| format!("db reopen: {e}"))?;
         self.init_schema().await
     }
+}
+
+/// Duplicate-key validation shared by the environment write paths. Runs
+/// before any statement so a rejected save never touches the database.
+pub(crate) fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for k in keys {
+        if !seen.insert(k) {
+            return Err(format!("duplicate variable key: {k}"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_unique_paths(paths: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for p in paths {
+        if !seen.insert(p.as_str()) {
+            return Err(format!("duplicate path: {p}"));
+        }
+    }
+    Ok(())
 }
 
 fn now_ts() -> String {
@@ -2367,5 +2626,122 @@ mod tests {
         let vars = db.get_environment_vars(env_id).await.unwrap();
         let found = vars.iter().find(|v| v.key == "DB_HOST").unwrap();
         assert_eq!(found.id, row_id);
+    }
+
+    // ─── vault-db-transactional-integrity ─────────────────────────────
+
+    async fn open_test_db() -> (tempfile::TempDir, VaultDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let db = VaultDb::open(path.to_str().unwrap()).await.unwrap();
+        (dir, db)
+    }
+
+    fn cat(cid: &str, name: &str) -> DbCategory {
+        DbCategory { cid: cid.to_string(), name: name.to_string(), color: "#fff".to_string(), description: None }
+    }
+
+    #[tokio::test]
+    async fn every_pooled_connection_has_secure_delete_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pragmas.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(connect_options(&path))
+            .await
+            .unwrap();
+
+        // Hold all three at once so the pool is forced to open distinct connections.
+        let mut c1 = pool.acquire().await.unwrap();
+        let mut c2 = pool.acquire().await.unwrap();
+        let mut c3 = pool.acquire().await.unwrap();
+        for conn in [&mut c1, &mut c2, &mut c3] {
+            let secure: i64 = sqlx::query_scalar("PRAGMA secure_delete").fetch_one(&mut **conn).await.unwrap();
+            let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&mut **conn).await.unwrap();
+            assert_eq!(secure, 1, "secure_delete must be ON on every connection");
+            assert_eq!(fk, 1, "foreign_keys must be ON on every connection");
+        }
+    }
+
+    #[tokio::test]
+    async fn save_categories_rename_preserves_project_links() {
+        let (_dir, db) = open_test_db().await;
+        db.save_categories(&[cat("a", "Backend"), cat("b", "Frontend")]).await.unwrap();
+        let p = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        db.set_project_categories(p, &["a".to_string(), "b".to_string()]).await.unwrap();
+
+        db.save_categories(&[cat("a", "API"), cat("b", "Frontend")]).await.unwrap();
+
+        let mut names = db.list_project_categories(p).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["API".to_string(), "Frontend".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn save_categories_delete_removes_only_that_categorys_links() {
+        let (_dir, db) = open_test_db().await;
+        db.save_categories(&[cat("a", "Backend"), cat("b", "Frontend")]).await.unwrap();
+        let p = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        db.set_project_categories(p, &["a".to_string(), "b".to_string()]).await.unwrap();
+
+        db.save_categories(&[cat("b", "Frontend")]).await.unwrap();
+
+        assert_eq!(db.list_project_categories(p).await.unwrap(), vec!["Frontend".to_string()]);
+        assert_eq!(db.list_categories().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_categories_failure_changes_nothing() {
+        let (_dir, db) = open_test_db().await;
+        db.save_categories(&[cat("a", "Backend"), cat("b", "Frontend")]).await.unwrap();
+        let p = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        db.set_project_categories(p, &["a".to_string(), "b".to_string()]).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON categories WHEN NEW.name = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Drops `a` (delete step) and then fails on the insert of `c`.
+        let err = db.save_categories(&[cat("b", "Frontend"), cat("c", "boom")]).await;
+        assert!(err.is_err());
+
+        let cats = db.list_categories().await.unwrap();
+        assert_eq!(cats.len(), 2, "rolled-back save must restore the deleted category");
+        let mut names = db.list_project_categories(p).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["Backend".to_string(), "Frontend".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn set_environment_vars_rejects_duplicate_keys_before_writing() {
+        let (_dir, db) = open_test_db().await;
+        let p = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let env = db.upsert_environment(0, p, "production", true).await.unwrap();
+        let var = |key: &str| DbEnvironmentVar {
+            id: 0, environment_id: env, key: key.to_string(), item_id: None, literal: Some("x".to_string()),
+        };
+        db.set_environment_vars(env, &[var("KEEP")]).await.unwrap();
+
+        let err = db.set_environment_vars(env, &[var("API_KEY"), var("API_KEY")]).await.unwrap_err();
+        assert!(err.contains("API_KEY"));
+        let vars = db.get_environment_vars(env).await.unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "KEEP");
+    }
+
+    #[tokio::test]
+    async fn set_environment_paths_rejects_duplicate_paths_before_writing() {
+        let (_dir, db) = open_test_db().await;
+        let p = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let env = db.upsert_environment(0, p, "production", true).await.unwrap();
+        db.set_environment_paths(env, &["/a".to_string()]).await.unwrap();
+
+        let err = db.set_environment_paths(env, &["/b".to_string(), "/b".to_string()]).await;
+        assert!(err.is_err());
+        assert_eq!(db.get_environment_paths(env).await.unwrap(), vec!["/a".to_string()]);
     }
 }
