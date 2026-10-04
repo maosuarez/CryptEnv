@@ -184,6 +184,8 @@
     "unlocking": "DESBLOQUEANDO…",
     "verifying": "VERIFICANDO…",
     "windowsHello": "DESBLOQUEAR CON WINDOWS HELLO",
+    "bioReenroll": "El desbloqueo biométrico se restableció. Introduce tu contraseña maestra y vuelve a activarlo.",
+    "bioReenrollDismiss": "Cerrar",
     "keyDerivation": "derivación de clave",
     "localOnly": "solo local",
     "sessionLocked": "Bóveda bloqueada — desbloquéala para continuar"
@@ -619,6 +621,7 @@
       "confirmChange": "CONFIRMAR CAMBIO"
     },
     "masterPwPlaceholder": "Contraseña maestra…",
+    "bioReenroll": "El desbloqueo biométrico se restableció. Actívalo de nuevo.",
     "pressKeys": "Presiona las teclas…",
     "minutes": "{n} min",
     "never": "Nunca",

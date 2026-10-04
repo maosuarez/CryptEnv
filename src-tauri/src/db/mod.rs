@@ -2397,6 +2397,21 @@ impl VaultDb {
         Ok(())
     }
 
+    /// Rewrites the database file and truncates the WAL, so a value that was
+    /// just overwritten or deleted does not linger in free pages or old WAL
+    /// frames.
+    pub async fn compact(&self) -> Result<(), String> {
+        sqlx::query("VACUUM")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("db vacuum: {e}"))?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("db checkpoint: {e}"))?;
+        Ok(())
+    }
+
     /// Writes a consistent copy of this database to `dest` (must not exist).
     pub async fn vacuum_into(&self, dest: &Path) -> Result<(), String> {
         let dest = dest.to_str().ok_or_else(|| "invalid database path".to_string())?;

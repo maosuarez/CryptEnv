@@ -24,7 +24,8 @@ mod test_support;
 
 use vault::{
     app_complete_setup, app_generate_mcp_config, app_get_system_info, app_is_first_run,
-    biometric_check, biometric_disable, biometric_enroll, biometric_is_enrolled, biometric_unlock,
+    biometric_check, biometric_dismiss_notice, biometric_disable, biometric_enroll,
+    biometric_is_enrolled, biometric_reenroll_notice, biometric_unlock,
     lock_vault, vault_change_password, vault_delete_item, vault_export_backup,
     vault_generate_mcp_token, vault_get_categories, vault_get_items, vault_get_mcp_token,
     vault_get_settings, vault_import_backup, vault_import_backup_data, vault_import_items,
@@ -124,6 +125,14 @@ pub fn run() {
                 }
             };
             app.manage(recovery::AppMode::Normal);
+
+            // A biometric blob from the legacy format held the DPAPI-protected
+            // master password: delete it and flag the re-enroll notice.
+            if let Err(e) =
+                tauri::async_runtime::block_on(vault::biometric_enrollment::remove_legacy_blob(&db))
+            {
+                eprintln!("could not remove legacy biometric enrollment: {e}");
+            }
 
             let saved_hotkey = tauri::async_runtime::block_on(db.get_setting("hotkey"))
                 .ok()
@@ -274,6 +283,8 @@ pub fn run() {
             biometric_enroll,
             biometric_unlock,
             biometric_disable,
+            biometric_reenroll_notice,
+            biometric_dismiss_notice,
             share_start_send,
             share_start_receive,
             share_poll_status,

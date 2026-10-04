@@ -184,6 +184,8 @@
     "unlocking": "DESBLOQUEANDO…",
     "verifying": "VERIFICANDO…",
     "windowsHello": "DESBLOQUEAR COM WINDOWS HELLO",
+    "bioReenroll": "O desbloqueio biométrico foi redefinido. Digite sua senha mestra e ative-o novamente.",
+    "bioReenrollDismiss": "Fechar",
     "keyDerivation": "derivação de chave",
     "localOnly": "somente local",
     "sessionLocked": "Cofre bloqueado — desbloqueie para continuar"
@@ -619,6 +621,7 @@
       "confirmChange": "CONFIRMAR ALTERAÇÃO"
     },
     "masterPwPlaceholder": "Senha mestra…",
+    "bioReenroll": "O desbloqueio biométrico foi redefinido. Ative-o novamente.",
     "pressKeys": "Pressione as teclas…",
     "minutes": "{n} min",
     "never": "Nunca",

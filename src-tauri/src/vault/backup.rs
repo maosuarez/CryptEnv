@@ -19,8 +19,8 @@ use crate::db::{
 };
 
 const CURRENT_VERSION: u32 = 2;
-/// Bound to the enrolled password via DPAPI; only valid for the vault it was
-/// enrolled against, and intentionally never carried across vaults.
+/// Wraps the vault key under a Windows Hello key; only valid for the vault it
+/// was enrolled against, and intentionally never carried across vaults.
 const BIOMETRIC_SETTING: &str = "biometric_blob";
 
 // ─── Format ───────────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ use crate::crypto::{self, CryptoKey};
 use crate::db::{DbCategory, LinkMode, LinkOutcome, VaultDb};
 
 pub mod backup;
+pub mod biometric_enrollment;
 pub mod import;
 pub mod share_commands;
 pub mod unlock;
@@ -1349,81 +1350,31 @@ pub async fn biometric_enroll(
     password: String,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    // 1. Verify the supplied password against the stored vault meta.
-    unlock::verify_password(&state, password.as_bytes()).await?;
-
-    // 2. Request Windows Hello consent before storing anything.
-    let verified = biometric::request_verification("Enroll CryptEnv biometric unlock").await?;
-    if !verified {
-        return Err("Windows Hello verification was not completed".to_string());
-    }
-
-    // 3. DPAPI-protect the password bytes, then hex-encode for DB storage.
-    #[cfg(target_os = "windows")]
-    {
-        let hex_blob = {
-            use zeroize::Zeroizing;
-            let pw_bytes = Zeroizing::new(password.into_bytes());
-            let blob = biometric::dpapi_protect(&pw_bytes)?;
-            crypto::hex_encode(&blob)
-        };
-
-        let s = state.lock().await;
-        s.db.set_setting("biometric_blob", &hex_blob).await?;
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (state, password);
-        Err("biometric unlock is not available on this platform".to_string())
-    }
+    let password = Zeroizing::new(password.into_bytes());
+    biometric_enrollment::enroll(&state, crate::biometric::platform_signer(), &password).await
 }
 
 #[tauri::command]
 pub async fn biometric_unlock(state: State<'_, SharedState>) -> Result<UnlockPayload, String> {
-    // 1. Retrieve the stored DPAPI blob.
-    let hex_blob = {
-        let s = state.lock().await;
-        s.db
-            .get_setting("biometric_blob")
-            .await?
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "biometric unlock is not enrolled".to_string())?
-    };
-
-    // 2. Request Windows Hello consent.
-    let verified = biometric::request_verification("Unlock CryptEnv vault").await?;
-    if !verified {
-        return Err("Windows Hello verification was not completed".to_string());
-    }
-
-    // 3. Decode + DPAPI-unprotect to recover the master password bytes.
-    #[cfg(target_os = "windows")]
-    let password_bytes = {
-        let raw = crypto::hex_decode(&hex_blob)
-            .map_err(|_| "biometric blob is corrupt".to_string())?;
-        biometric::dpapi_unprotect(&raw)?
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = hex_blob;
-        return Err("biometric unlock is not available on this platform".to_string());
-    }
-
-    // 4. Unlock using the recovered password, same path as vault_unlock.
-    #[cfg(target_os = "windows")]
-    {
-        unlock_for_gui(&state, &password_bytes).await
-    }
+    let outcome = unlock::unlock_with_biometric(&state, crate::biometric::platform_signer(), true)
+        .await
+        .map_err(|e| e.message())?;
+    outcome.payload.ok_or_else(|| "unlock payload missing".to_string())
 }
 
 #[tauri::command]
 pub async fn biometric_disable(state: State<'_, SharedState>) -> Result<(), String> {
-    let s = state.lock().await;
-    s.db.set_setting("biometric_blob", "").await?;
-    Ok(())
+    biometric_enrollment::disable(&state, crate::biometric::platform_signer()).await
+}
+
+#[tauri::command]
+pub async fn biometric_reenroll_notice(state: State<'_, SharedState>) -> Result<bool, String> {
+    biometric_enrollment::notice_pending(&state).await
+}
+
+#[tauri::command]
+pub async fn biometric_dismiss_notice(state: State<'_, SharedState>) -> Result<(), String> {
+    biometric_enrollment::dismiss_notice(&state).await
 }
 
 #[cfg(test)]
