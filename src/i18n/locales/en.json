@@ -656,7 +656,12 @@
       "copySql": "Copy SQL",
       "sqlCopied": "SQL copied",
       "required": "Both URL and Anon Key are required",
-      "saved": "Relay settings saved"
+      "saved": "Relay settings saved",
+      "checkSchema": "CHECK SCHEMA",
+      "checking": "Checking…",
+      "schemaOk": "Relay schema v2 detected",
+      "schemaOutdated": "Relay SQL v2 is not applied on your Supabase project. Run the SQL below in the Supabase SQL Editor, then try again.",
+      "migrateHint": "After applying v2 you can remove the old table: drop table relay_packages;"
     },
     "hotkey": {
       "reset": "RESET TO DEFAULT",

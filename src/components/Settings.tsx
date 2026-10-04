@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { platform } from '@tauri-apps/plugin-os';
 import { Icon } from './ui/Icon';
+import { RelaySqlBlock, isRelaySchemaOutdated } from './ui/RelaySql';
 import { ImportModal } from './ImportModal';
 import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
@@ -75,18 +76,6 @@ function PwField({
   );
 }
 
-const RELAY_SQL = `create table if not exists relay_packages (
-  id          uuid primary key default gen_random_uuid(),
-  code        text not null unique,
-  payload     text not null,
-  expires_at  timestamptz not null default (now() + interval '24 hours'),
-  retrieved   boolean not null default false
-);
-alter table relay_packages enable row level security;
-create policy "insert" on relay_packages for insert to anon with check (true);
-create policy "select" on relay_packages for select to anon using (true);
-create policy "update" on relay_packages for update to anon using (true) with check (true);`;
-
 function AppearanceSection() {
   const { t, lang, setLang } = useTranslation();
   const theme    = useThemeStore((s) => s.theme);
@@ -138,6 +127,8 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
   const [showKey,   setShowKey]   = useState(false);
   const [sqlOpen,   setSqlOpen]   = useState(false);
   const [saving,    setSaving]    = useState(false);
+  const [checking,  setChecking]  = useState(false);
+  const [schemaStatus, setSchemaStatus] = useState<'unknown' | 'ok' | 'outdated'>('unknown');
   const { t } = useTranslation();
   // Persisted values: this save must not clobber (and re-register) them.
   const savedLockTimeout = useVaultStore((s) => s.lockTimeout);
@@ -146,6 +137,25 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
   useEffect(() => {
     // Relay settings are persisted server-side; no need to load them here.
   }, []);
+
+  const handleCheckSchema = async () => {
+    setChecking(true);
+    try {
+      await invoke<number>('relay_schema_version');
+      setSchemaStatus('ok');
+    } catch (e) {
+      const msg = String(e);
+      if (isRelaySchemaOutdated(msg)) {
+        setSchemaStatus('outdated');
+        setSqlOpen(true);
+      } else {
+        setSchemaStatus('unknown');
+        showToast(msg, 'error');
+      }
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const handleSaveRelay = async () => {
     if (!url.trim() || !anonKey.trim()) { showToast(t('settings.relay.required'), 'error'); return; }
@@ -272,23 +282,27 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
             >
               {sqlOpen ? t('settings.relay.hideSql') : t('settings.relay.setupSql')}
             </button>
+            <button
+              onClick={handleCheckSchema}
+              disabled={checking}
+              className="h-8 px-4 text-[12px] font-semibold tracking-[0.06em] font-ui text-tx3 border border-bd2 rounded-[3px] hover:text-tx transition-colors bg-transparent cursor-pointer disabled:opacity-40"
+            >
+              {checking ? t('settings.relay.checking') : t('settings.relay.checkSchema')}
+            </button>
           </div>
 
+          {schemaStatus === 'ok' && (
+            <div className="text-[11px] font-mono text-accent">{t('settings.relay.schemaOk')}</div>
+          )}
+          {schemaStatus === 'outdated' && (
+            <div className="text-[11px] font-mono text-danger">{t('settings.relay.schemaOutdated')}</div>
+          )}
+
           {sqlOpen && (
-            <div className="rounded-[3px] border border-bd bg-raised overflow-hidden">
-              <div className="flex items-center justify-between px-3 py-2 border-b border-bd">
-                <span className="text-[11px] font-mono text-tx3 tracking-[0.06em]">{t('settings.relay.runInEditor')}</span>
-                <button
-                  onClick={() => navigator.clipboard.writeText(RELAY_SQL).then(() => showToast(t('settings.relay.sqlCopied')))}
-                  className="text-tx3 hover:text-accent transition-colors"
-                  title={t('settings.relay.copySql')}
-                  aria-label={t('settings.relay.copySql')}
-                >
-                  <Icon name="copy" size={12} />
-                </button>
-              </div>
-              <pre className="text-[11px] font-mono text-tx2 p-4 overflow-x-auto leading-[1.6] whitespace-pre-wrap">{RELAY_SQL}</pre>
-            </div>
+            <>
+              <RelaySqlBlock onCopied={() => showToast(t('settings.relay.sqlCopied'))} />
+              <div className="text-[11px] font-mono text-tx3">{t('settings.relay.migrateHint')}</div>
+            </>
           )}
         </div>
       )}

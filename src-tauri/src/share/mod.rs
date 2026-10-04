@@ -35,6 +35,8 @@ pub enum ShareError {
     Remote(String),
     /// Session is in an unexpected state
     InvalidState(String),
+    /// Relay backend lacks the v2 RPCs; the user must apply the relay SQL v2
+    RelaySchemaOutdated,
 }
 
 impl std::fmt::Display for ShareError {
@@ -48,6 +50,10 @@ impl std::fmt::Display for ShareError {
             ShareError::Timeout => write!(f, "operation timed out"),
             ShareError::Remote(e) => write!(f, "peer error: {e}"),
             ShareError::InvalidState(e) => write!(f, "invalid session state: {e}"),
+            ShareError::RelaySchemaOutdated => write!(
+                f,
+                "RELAY_SCHEMA_OUTDATED: apply relay SQL v2 in your Supabase SQL editor (Settings → Internet Sharing shows the SQL)"
+            ),
         }
     }
 }

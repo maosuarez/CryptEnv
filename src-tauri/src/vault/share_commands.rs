@@ -261,7 +261,7 @@ pub async fn share_relay_send(
     let code = relay::generate_share_code();
     let passphrase = crate::share::crypto::generate_passphrase();
 
-    let relay_key = relay::derive_relay_key(&code, &passphrase).map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
     let payload = relay::encrypt_items(&plain_items, &relay_key).map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
@@ -277,6 +277,37 @@ pub async fn share_relay_send(
     { vault_state.lock().await.touch(); }
 
     Ok(RelayShareResult { code, passphrase })
+}
+
+/// Probes the configured relay for the v2 schema. Returns the schema version,
+/// or an error starting with `RELAY_SCHEMA_OUTDATED` when v2 is not applied.
+#[tauri::command]
+pub async fn relay_schema_version(
+    vault_state: State<'_, SharedState>,
+) -> Result<i32, String> {
+    let (supabase_url, anon_key) = {
+        let mut guard = vault_state.lock().await;
+        guard.touch();
+        let supabase_url = guard
+            .db
+            .get_setting("relay_supabase_url")
+            .await?
+            .unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
+        let anon_key = guard
+            .db
+            .get_setting("relay_supabase_anon_key")
+            .await?
+            .unwrap_or_else(|| DEFAULT_RELAY_ANON_KEY.to_string());
+        if supabase_url.is_empty() || anon_key.is_empty() {
+            return Err("Supabase relay not configured. Go to Settings → Internet Sharing to add your Supabase URL and API key.".to_string());
+        }
+        (supabase_url, anon_key)
+    };
+
+    tokio::task::spawn_blocking(move || relay::relay_schema_version(&supabase_url, &anon_key))
+        .await
+        .map_err(|e| format!("relay schema check failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -309,13 +340,13 @@ pub async fn share_relay_receive(
         (vault_key, supabase_url, anon_key)
     };
 
-    let relay_key = relay::derive_relay_key(&code, &passphrase).map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
     let url_clone = supabase_url.clone();
     let key_clone = anon_key.clone();
     let payload = tokio::task::spawn_blocking(move || {
-        relay::relay_download(&url_clone, &key_clone, &code_clone)
+        relay::relay_claim(&url_clone, &key_clone, &code_clone)
     })
     .await
     .map_err(|e| format!("relay receive failed: {e}"))?
@@ -323,14 +354,6 @@ pub async fn share_relay_receive(
 
     let plain_items = relay::decrypt_payload(&payload, &relay_key)
         .map_err(|e| format!("relay receive failed: could not decrypt payload — {e}"))?;
-
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = code.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)
-    })
-    .await;
 
     let mut guard = vault_state.lock().await;
     guard.touch();

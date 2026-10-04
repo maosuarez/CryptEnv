@@ -11,16 +11,28 @@ use crate::share::crypto::{decrypt_message, encrypt_message};
 // ─── Relay session structs ────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct RelayInsert<'a> {
-    code: &'a str,
-    payload: &'a str,
-    expires_at: &'a str,
+struct RelayPutArgs<'a> {
+    p_code_hash: &'a str,
+    p_payload: &'a str,
 }
 
-#[derive(Deserialize)]
-struct RelayRow {
-    payload: String,
+#[derive(Serialize)]
+struct RelayClaimArgs<'a> {
+    p_code_hash: &'a str,
 }
+
+/// PostgREST error body. Only the machine code is ever read — never the
+/// message/details/hint, which could echo request data.
+#[derive(Deserialize)]
+struct PostgrestError {
+    code: Option<String>,
+}
+
+/// Process-wide limit on concurrent Argon2id relay derivations (32 MiB each).
+static RELAY_KDF: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Relay schema version this client speaks (see `relay_schema_version()` in the SQL).
+pub const RELAY_SCHEMA_VERSION: i32 = 2;
 
 // ─── Key derivation ───────────────────────────────────────────────────────────
 
@@ -36,6 +48,40 @@ pub fn derive_relay_key(code: &str, passphrase: &str) -> Result<[u8; 32], ShareE
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
         .map_err(|e| ShareError::Crypto(e.to_string()))?;
     Ok(key)
+}
+
+/// Runs `f` on a blocking thread after acquiring a permit from `sem`, so at
+/// most `sem`'s permits run concurrently and none run on async worker threads.
+async fn run_bounded<T, F>(sem: &'static tokio::sync::Semaphore, f: F) -> Result<T, ShareError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ShareError> + Send + 'static,
+{
+    let _permit = sem
+        .acquire()
+        .await
+        .map_err(|e| ShareError::Crypto(e.to_string()))?;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ShareError::Crypto(format!("key derivation task failed: {e}")))?
+}
+
+/// Async, bounded wrapper around `derive_relay_key`. All async callers MUST use
+/// this one: it keeps Argon2id off the runtime workers and caps concurrency at 2.
+pub async fn derive_relay_key_async(code: &str, passphrase: &str) -> Result<[u8; 32], ShareError> {
+    let code = code.to_owned();
+    let passphrase = passphrase.to_owned();
+    run_bounded(&RELAY_KDF, move || derive_relay_key(&code, &passphrase)).await
+}
+
+/// Lookup hash stored by the relay instead of the code itself:
+/// hex(SHA-256("cryptenv-relay-lookup-v1:" || code)). The prefix keeps it
+/// distinct from the Argon2 salt (SHA-256(code)).
+pub fn code_hash(code: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"cryptenv-relay-lookup-v1:");
+    h.update(code.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ─── Payload encryption ───────────────────────────────────────────────────────
@@ -154,149 +200,105 @@ pub fn generate_share_code() -> String {
     format!("{}-{}", &chars[..4], &chars[4..])
 }
 
-// ─── Supabase relay calls (blocking reqwest) ──────────────────────────────────
+// ─── Supabase relay calls (blocking reqwest, SQL v2 RPCs) ─────────────────────
 
+fn relay_client() -> Result<reqwest::blocking::Client, ShareError> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ShareError::Io(e.to_string()))
+}
+
+/// POST to `/rest/v1/rpc/<function>`. A missing function (HTTP 404 /
+/// PGRST202) means the project still has the v1 schema.
+fn relay_rpc<B: Serialize>(
+    supabase_url: &str,
+    anon_key: &str,
+    function: &str,
+    body: &B,
+) -> Result<reqwest::blocking::Response, ShareError> {
+    let res = relay_client()?
+        .post(format!(
+            "{}/rest/v1/rpc/{}",
+            supabase_url.trim_end_matches('/'),
+            function
+        ))
+        .header("apikey", anon_key)
+        .header("Authorization", format!("Bearer {}", anon_key))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .map_err(|e| ShareError::Io(format!("relay {function} request failed: {}", e.without_url())))?;
+
+    if res.status().is_success() {
+        return Ok(res);
+    }
+    let status = res.status().as_u16();
+    let pg_code = res
+        .json::<PostgrestError>()
+        .ok()
+        .and_then(|e| e.code)
+        .unwrap_or_default();
+    if status == 404 || pg_code == "PGRST202" {
+        return Err(ShareError::RelaySchemaOutdated);
+    }
+    if pg_code.is_empty() {
+        Err(ShareError::Io(format!("relay {function} failed ({status})")))
+    } else {
+        Err(ShareError::Io(format!("relay {function} failed ({status}, {pg_code})")))
+    }
+}
+
+/// Uploads a package via `relay_put`. The relay stores only `code_hash(code)`
+/// and enforces the 1 MiB cap and 24 h expiry.
 pub fn relay_upload(
     supabase_url: &str,
     anon_key: &str,
     code: &str,
     payload: &str,
 ) -> Result<(), ShareError> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let expires_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        + 86400; // 24 hours
-    let expires_at = format_iso8601(expires_secs);
-
-    let body = RelayInsert {
-        code,
-        payload,
-        expires_at: &expires_at,
-    };
-
-    let client = reqwest::blocking::Client::new();
-    let res = client
-        .post(format!("{}/rest/v1/relay_packages", supabase_url.trim_end_matches('/')))
-        .header("apikey", anon_key)
-        .header("Authorization", format!("Bearer {}", anon_key))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "return=minimal")
-        .json(&body)
-        .send()
-        .map_err(|e| ShareError::Io(e.to_string()))?;
-
-    if !res.status().is_success() {
-        let status = res.status().as_u16();
-        let body = res.text().unwrap_or_default();
-        return Err(ShareError::Io(format!("relay upload failed ({status}): {body}")));
-    }
+    let hash = code_hash(code);
+    relay_rpc(
+        supabase_url,
+        anon_key,
+        "relay_put",
+        &RelayPutArgs { p_code_hash: &hash, p_payload: payload },
+    )?;
     Ok(())
 }
 
-pub fn relay_download(
+/// Atomically claims a package via `relay_claim`: the relay deletes the row
+/// and returns the payload only if it exists and has not expired. This is
+/// also the burn-after-read step; there is no separate delete.
+pub fn relay_claim(
     supabase_url: &str,
     anon_key: &str,
     code: &str,
 ) -> Result<String, ShareError> {
-    let client = reqwest::blocking::Client::new();
-    let url = format!(
-        "{}/rest/v1/relay_packages?code=eq.{}&retrieved=eq.false&select=payload",
-        supabase_url.trim_end_matches('/'),
-        code,
-    );
-    let res = client
-        .get(&url)
-        .header("apikey", anon_key)
-        .header("Authorization", format!("Bearer {}", anon_key))
-        .header("Accept", "application/json")
-        .send()
-        .map_err(|e| ShareError::Io(e.to_string()))?;
-
-    if !res.status().is_success() {
-        let status = res.status().as_u16();
-        return Err(ShareError::Io(format!("relay download failed ({status})")));
-    }
-
-    let rows: Vec<RelayRow> = res
+    let hash = code_hash(code);
+    let res = relay_rpc(
+        supabase_url,
+        anon_key,
+        "relay_claim",
+        &RelayClaimArgs { p_code_hash: &hash },
+    )?;
+    let payload: Option<String> = res
         .json()
-        .map_err(|e| ShareError::Protocol(e.to_string()))?;
-
-    rows.into_iter()
-        .next()
-        .map(|r| r.payload)
-        .ok_or(ShareError::Remote("code not found or already used".into()))
+        .map_err(|e| ShareError::Protocol(format!("relay claim: unexpected response ({e})")))?;
+    payload.ok_or_else(|| ShareError::Remote("code not found or already used".into()))
 }
 
-pub fn relay_delete(
-    supabase_url: &str,
-    anon_key: &str,
-    code: &str,
-) -> Result<(), ShareError> {
-    let client = reqwest::blocking::Client::new();
-    let url = format!(
-        "{}/rest/v1/relay_packages?code=eq.{}",
-        supabase_url.trim_end_matches('/'),
-        code,
-    );
-    let _ = client
-        .delete(&url)
-        .header("apikey", anon_key)
-        .header("Authorization", format!("Bearer {}", anon_key))
-        .send()
-        .map_err(|e| ShareError::Io(e.to_string()))?;
-    Ok(())
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn format_iso8601(unix_secs: u64) -> String {
-    // Simple ISO-8601 UTC formatter without external deps
-    let s = unix_secs;
-    let secs = s % 60;
-    let mins = (s / 60) % 60;
-    let hours = (s / 3600) % 24;
-    let days = s / 86400;
-    // Days since epoch → year/month/day (Gregorian, approximation sufficient for +24h TTL)
-    let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, mins, secs
-    )
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Gregorian calendar from Unix epoch (1970-01-01)
-    let mut d = days as i64;
-    let mut y = 1970i64;
-    loop {
-        let dy = if is_leap(y) { 366 } else { 365 };
-        if d < dy {
-            break;
-        }
-        d -= dy;
-        y += 1;
+/// Probes `relay_schema_version()`. Returns `RelaySchemaOutdated` on a v1 project.
+pub fn relay_schema_version(supabase_url: &str, anon_key: &str) -> Result<i32, ShareError> {
+    let res = relay_rpc(supabase_url, anon_key, "relay_schema_version", &serde_json::json!({}))?;
+    let v: i32 = res
+        .json()
+        .map_err(|e| ShareError::Protocol(format!("relay schema probe: unexpected response ({e})")))?;
+    if v < RELAY_SCHEMA_VERSION {
+        return Err(ShareError::RelaySchemaOutdated);
     }
-    let months = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 1u64;
-    for dm in &months {
-        if d < *dm {
-            break;
-        }
-        d -= dm;
-        m += 1;
-    }
-    (y as u64, m, d as u64 + 1)
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -425,5 +427,114 @@ mod tests {
             Err(ShareError::Crypto(_)) => {}
             other => panic!("expected ShareError::Crypto, got {other:?}"),
         }
+    }
+
+    // ─── Relay RPC tests (local mock HTTP server) ───────────────────────────
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serves each canned (status, body) response to one connection, in order,
+    /// and returns the base URL plus the raw requests received.
+    fn mock_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn code_hash_is_domain_separated_hex() {
+        let h = code_hash("ABCD-1234");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        let salt: [u8; 32] = Sha256::digest(b"ABCD-1234").into();
+        let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(h, salt_hex);
+        assert!(!h.contains("ABCD"));
+    }
+
+    #[test]
+    fn claim_returns_payload_once_and_sends_hash_not_code() {
+        let (url, rx) = mock_server(vec![(200, "\"c2VjcmV0\""), (200, "null")]);
+        let first = relay_claim(&url, "anon", "ABCD-1234").unwrap();
+        assert_eq!(first, "c2VjcmV0");
+        let req = rx.recv().unwrap();
+        assert!(req.starts_with("POST /rest/v1/rpc/relay_claim"));
+        assert!(req.contains(&code_hash("ABCD-1234")));
+        assert!(!req.contains("ABCD-1234"));
+        match relay_claim(&url, "anon", "ABCD-1234") {
+            Err(ShareError::Remote(m)) => assert!(m.contains("not found or already used")),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_rpc_maps_to_schema_outdated() {
+        let (url, _rx) = mock_server(vec![
+            (404, "{\"code\":\"PGRST202\",\"message\":\"nope\"}"),
+            (404, "{}"),
+            (400, "{\"code\":\"PGRST202\"}"),
+        ]);
+        assert!(matches!(relay_claim(&url, "k", "A-B"), Err(ShareError::RelaySchemaOutdated)));
+        assert!(matches!(relay_upload(&url, "k", "A-B", "p"), Err(ShareError::RelaySchemaOutdated)));
+        assert!(matches!(relay_schema_version(&url, "k"), Err(ShareError::RelaySchemaOutdated)));
+    }
+
+    #[test]
+    fn other_failures_surface_status_without_payload() {
+        let (url, _rx) = mock_server(vec![(500, "{\"code\":\"XX000\",\"message\":\"secret-payload\"}")]);
+        match relay_upload(&url, "k", "A-B", "secret-payload") {
+            Err(ShareError::Io(m)) => {
+                assert!(m.contains("500") && m.contains("XX000"));
+                assert!(!m.contains("secret-payload"));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_version_ok_on_v2() {
+        let (url, _rx) = mock_server(vec![(200, "2")]);
+        assert_eq!(relay_schema_version(&url, "k").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn kdf_semaphore_limits_concurrency_to_two() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        static SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let (running, peak) = (running.clone(), peak.clone());
+            tasks.push(tokio::spawn(run_bounded(&SEM, move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 }

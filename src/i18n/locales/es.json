@@ -656,7 +656,12 @@
       "copySql": "Copiar SQL",
       "sqlCopied": "SQL copiado",
       "required": "Se requieren la URL y la Anon Key",
-      "saved": "Configuración del relay guardada"
+      "saved": "Configuración del relay guardada",
+      "checkSchema": "COMPROBAR ESQUEMA",
+      "checking": "Comprobando…",
+      "schemaOk": "Esquema de relay v2 detectado",
+      "schemaOutdated": "El SQL v2 del relay no está aplicado en tu proyecto de Supabase. Ejecuta el SQL de abajo en el SQL Editor de Supabase y vuelve a intentarlo.",
+      "migrateHint": "Tras aplicar v2 puedes eliminar la tabla antigua: drop table relay_packages;"
     },
     "hotkey": {
       "reset": "RESTABLECER",

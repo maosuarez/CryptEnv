@@ -72,7 +72,7 @@ pub async fn project_relay_send(
     let code = relay::generate_share_code();
     let passphrase = crate::share::crypto::generate_passphrase();
 
-    let relay_key = relay::derive_relay_key(&code, &passphrase).map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
     let payload = relay::encrypt_project(&bundle, &relay_key).map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
@@ -127,12 +127,12 @@ pub async fn project_relay_receive(
         (vault_key, supabase_url, anon_key)
     };
 
-    let relay_key = relay::derive_relay_key(&code, &passphrase).map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
     let url_clone = supabase_url.clone();
     let key_clone = anon_key.clone();
-    let payload = tokio::task::spawn_blocking(move || relay::relay_download(&url_clone, &key_clone, &code_clone))
+    let payload = tokio::task::spawn_blocking(move || relay::relay_claim(&url_clone, &key_clone, &code_clone))
         .await
         .map_err(|e| format!("relay receive failed: {e}"))?
         .map_err(|e| format!("relay receive failed: {e}"))?;
@@ -140,12 +140,7 @@ pub async fn project_relay_receive(
     let bundle = relay::decrypt_project(&payload, &relay_key)
         .map_err(|e| format!("relay receive failed: could not decrypt payload — {e}"))?;
 
-    // Burn-after-read (best-effort) — same as every other relay receive path.
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = code.clone();
-    let _ = tokio::task::spawn_blocking(move || relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)).await;
-
+    // Burn-after-read already happened server-side: `relay_claim` deletes the row.
     let mut guard = vault_state.lock().await;
     guard.touch();
     let result = receive_project_bundle(&guard.db, &vault_key, bundle, project_name_override).await?;

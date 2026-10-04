@@ -543,10 +543,46 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><span class="m post">POST</span></td><td><code>/share/export</code></td><td>Encrypted <code>.vault</code> package + passphrase</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/import</code></td><td>Scoped. Import a package</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/relay/send</code></td><td>Upload items to the relay; returns code + passphrase</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/relay/receive</code></td><td>Scoped. Download, decrypt, import; burns the payload</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/relay/receive</code></td><td>Scoped. Claim (single use), decrypt, import</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/:id/relay/send</code></td><td>Share a whole project (selected <code>environment_ids</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/relay/receive</code></td><td>Receive a project as new; <code>project_name_override</code> on collision</td></tr>
     </table></div>
+
+    <h3 id="api-relay">Internet relay (Supabase SQL v2)<a class="anchor" href="#api-relay">#</a></h3>
+    <p>The relay is your own Supabase project. Single use and the 24-hour expiry are enforced <strong>by the database</strong>, not by the client: the table has no access for the <code>anon</code> key, and every operation goes through two <code>SECURITY DEFINER</code> functions. A package can be claimed once (the claim deletes it), expired packages are never returned and are purged on every relay call, and only a hash of the code is stored. Payloads are capped at 1&nbsp;MiB and stay encrypted client-side.</p>
+    <div class="note warn"><p><strong>Breaking change.</strong> Earlier versions used a permissive <code>relay_packages</code> table that did not enforce either guarantee. Send and receive now fail with <code>RELAY_SCHEMA_OUTDATED</code> until you apply the SQL below. In-flight shares on the old table are not migrated: re-share after upgrading.</p></div>
+    <ol>
+      <li>Open <strong>Settings → Internet Sharing → Custom relay → Setup SQL</strong> (or copy the block below) and run it in the Supabase <strong>SQL Editor</strong>.</li>
+      <li>Click <strong>Check schema</strong> in the same panel; it reports whether v2 is detected.</li>
+      <li>Optional cleanup of the old table: <code>drop table relay_packages;</code></li>
+    </ol>
+    <div class="code"><span class="label">sql</span><pre><code>create table if not exists relay_packages_v2 (
+  code_hash  text primary key,
+  payload    text not null check (octet_length(payload) &lt;= 1048576),
+  expires_at timestamptz not null default now() + interval &#x27;24 hours&#x27;
+);
+alter table relay_packages_v2 enable row level security;
+revoke all on relay_packages_v2 from anon, authenticated;
+
+create or replace function relay_put(p_code_hash text, p_payload text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from relay_packages_v2 where expires_at &lt; now();
+  insert into relay_packages_v2(code_hash, payload) values (p_code_hash, p_payload);
+end $$;
+
+create or replace function relay_claim(p_code_hash text) returns text
+language plpgsql security definer set search_path = public as $$
+declare v text;
+begin
+  delete from relay_packages_v2 where expires_at &lt; now();
+  delete from relay_packages_v2 where code_hash = p_code_hash returning payload into v;
+  return v;
+end $$;
+
+create or replace function relay_schema_version() returns int language sql as $$ select 2 $$;
+grant execute on function relay_put(text,text), relay_claim(text), relay_schema_version() to anon;</code></pre></div>
+    <p>Notes: whoever guesses a live code can claim it first, which burns the package (it is still encrypted with the passphrase); the receiver sees "code not found or already used" and the sender re-shares. A wrong passphrase also consumes the package. All relay calls time out after 10&nbsp;s to connect and 30&nbsp;s total, and at most two Argon2id derivations run at once.</p>
 
     <h3 id="api-writes">Write-target gating<a class="anchor" href="#api-writes">#</a></h3>
     <p>Files written by <code>/fill</code>, <code>/environments/:id/inject</code> and <code>/environments/:id/example</code> start with a marker line:</p>
