@@ -18,3 +18,4 @@
 
 - [x] 4.1 Document the quoting rules, `NOT_REGULAR_FILE` and `failed_keys` in `docs/index.html` / `docs/reference.md`. Verify by review.
 - [x] 4.2 Run `cargo clippy --all-targets && cargo test`. All pass.
+- [x] 4.3 MCP `generate_env` (backend `generate_env_core`) serializes through `envfile::serialize_line`, so multi-line values are quoted instead of skipped; `sync::template_keys` uses `envfile::is_valid_key`. Verify with `generated_env_quotes_multiline_and_special_values` and `template_keys_accepts_dotted_keys_like_envfile`.

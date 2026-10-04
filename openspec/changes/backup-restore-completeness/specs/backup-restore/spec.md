@@ -24,6 +24,14 @@ A restore MUST either fully succeed, or leave the current vault exactly as it wa
 - **WHEN** a restore fails partway (for example, the disk becomes full)
 - **THEN** the current vault still opens with the current password and contains all of its data
 
+### Requirement: Restore ends sessions holding the old key
+
+When the vault key changes (a replace restore installing a different vault, or a re-key), REST sessions and any in-progress LAN share session MUST end, and the share session's key copies MUST be dropped.
+
+#### Scenario: Replace restore during a share session
+- **WHEN** a LAN share session is active and a replace restore installs a vault with a different key
+- **THEN** the share session is cancelled and holds no vault key
+
 ### Requirement: Restore authorization
 
 Replacing the vault from a backup MUST require the vault to be unlocked, and the backup's master password to be verified. Merging a backup into the vault MUST require the vault to be unlocked.

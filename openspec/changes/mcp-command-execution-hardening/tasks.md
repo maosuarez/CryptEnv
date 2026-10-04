@@ -24,3 +24,4 @@
 
 - [x] 5.1 Document the param charset, redaction, timeout, WSL behavior and the breaking changes in `docs/index.html` / `docs/reference.md`. Verify by review.
 - [x] 5.2 Run `cargo clippy --all-targets && cargo test`. All pass.
+- [x] 5.3 `generate_env` writes values through `envfile::serialize_line` (shared quoting); only values containing NUL are skipped. Verify with `generated_env_quotes_multiline_and_special_values`.
