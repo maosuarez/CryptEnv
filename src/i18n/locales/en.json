@@ -810,6 +810,26 @@
     "installing": "INSTALLING…",
     "install": "INSTALL"
   },
+  "approval": {
+    "title": "MCP APPROVAL REQUEST",
+    "source": "An MCP agent is asking to:",
+    "items": "ITEMS",
+    "destination": "DESTINATION",
+    "details": "DETAILS",
+    "expiresIn": "Expires in {s}s",
+    "warning": "Approve only if you expect this request. Check the names and the destination.",
+    "pendingMore": "{n} more pending",
+    "deny": "DENY",
+    "approve": "APPROVE",
+    "working": "WORKING…",
+    "denied": "Request denied.",
+    "failed": "The operation failed: {error}",
+    "doneTitle": "APPROVED",
+    "relayDone": "Share the code and passphrase with the recipient. The agent never sees them.",
+    "exportDone": "Package written to {path}. Share the passphrase separately; the agent never sees it.",
+    "passphrase": "PASSPHRASE",
+    "close": "CLOSE"
+  },
   "window": {
     "lock": "LOCK",
     "minimize": "Minimize"

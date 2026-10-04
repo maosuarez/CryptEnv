@@ -14,6 +14,7 @@ import { Toast } from './components/ui/Toast';
 import { PlaceholderModal } from './components/ui/PlaceholderModal';
 import { SetupWizard } from './components/SetupWizard';
 import { UpdateNotice } from './components/ui/UpdateNotice';
+import { ApprovalModal } from './components/ApprovalModal';
 import { useVaultStore } from './store';
 import { useUpdateStore } from './store/updateStore';
 import { useAutoLock } from './hooks/useAutoLock';
@@ -83,6 +84,7 @@ export default function App() {
 
       {/* Global overlays */}
       <UpdateNotice />
+      <ApprovalModal />
       {menu && <ContextMenu {...menu} onClose={closeMenu} />}
       {toast && <Toast msg={toast.type === 'error' ? toast.msg : `✓ ${toast.msg}`} type={toast.type} />}
       {placeholder && placeholder.type === 'command' && (

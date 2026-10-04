@@ -810,6 +810,26 @@
     "installing": "INSTALANDO…",
     "install": "INSTALAR"
   },
+  "approval": {
+    "title": "SOLICITAÇÃO DE APROVAÇÃO MCP",
+    "source": "Um agente MCP está pedindo para:",
+    "items": "ITENS",
+    "destination": "DESTINO",
+    "details": "DETALHES",
+    "expiresIn": "Expira em {s}s",
+    "warning": "Aprove apenas se você espera esta solicitação. Confira os nomes e o destino.",
+    "pendingMore": "mais {n} pendentes",
+    "deny": "NEGAR",
+    "approve": "APROVAR",
+    "working": "PROCESSANDO…",
+    "denied": "Solicitação negada.",
+    "failed": "A operação falhou: {error}",
+    "doneTitle": "APROVADO",
+    "relayDone": "Compartilhe o código e a frase secreta com o destinatário. O agente nunca os vê.",
+    "exportDone": "Pacote gravado em {path}. Compartilhe a frase secreta separadamente; o agente nunca a vê.",
+    "passphrase": "FRASE SECRETA",
+    "close": "FECHAR"
+  },
   "window": {
     "lock": "BLOQUEAR",
     "minimize": "Minimizar"

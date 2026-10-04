@@ -192,3 +192,36 @@ export interface WslError {
   kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling';
   message?: string;
 }
+
+/** Non-secret description of an MCP request awaiting the user's approval
+ *  (`approval_list`). Field names mirror the backend's serde output. */
+export interface ApprovalSummary {
+  operation:    string;
+  kind:         string;
+  items:        string[];
+  item_count:   number;
+  details:      string[];
+  destination:  string | null;
+  requested_by: string;
+}
+
+export interface PendingApproval {
+  id:        string;
+  kind:      string;
+  status:    'pending' | 'approved' | 'denied' | 'expired';
+  summary:   ApprovalSummary;
+  /** Seconds left to decide when the list was loaded. */
+  expiresIn: number;
+  meta:      Record<string, unknown>;
+}
+
+/** Result of `approval_resolve`. `secret` is shown to the user only. */
+export interface ApprovalResolution {
+  id:      string;
+  status:  'approved' | 'denied';
+  summary: ApprovalSummary;
+  secret?:
+    | { type: 'relay'; code: string; passphrase: string }
+    | { type: 'export'; path: string; passphrase: string };
+  meta:    Record<string, unknown>;
+}
