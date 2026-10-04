@@ -937,47 +937,8 @@ async fn handle_update_item(
         return resp;
     }
 
-    // Decrypt existing item so we can merge — secrets stay server-side
-    let items = match decrypt_all_items(&state).await {
-        Ok(i) => i,
-        Err(StatusCode::FORBIDDEN) => {
-            return err_json(StatusCode::FORBIDDEN, "bóveda bloqueada", "VAULT_LOCKED")
-                .into_response()
-        }
-        Err(_) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "error interno", "INTERNAL_ERROR")
-                .into_response()
-        }
-    };
-
-    let existing = match items.into_iter().find(|item| item.id == id) {
-        Some(e) => e,
-        None => return err_json(StatusCode::NOT_FOUND, "item no encontrado", "NOT_FOUND").into_response(),
-    };
-
-    // Merge: body fields override existing; None/empty keeps the existing value.
-    // Secret fields (value, password, content) are preserved from the encrypted
-    // store when the caller does not supply them — they never leave this process.
-    let merged = VaultItem {
-        id,
-        item_type: if body.item_type.is_empty() { existing.item_type } else { body.item_type },
-        name:        body.name.or(existing.name),
-        value:       body.value.or(existing.value),
-        url:         body.url.or(existing.url),
-        username:    body.username.or(existing.username),
-        password:    body.password.or(existing.password),
-        title:       body.title.or(existing.title),
-        description: body.description.or(existing.description),
-        command:     body.command.or(existing.command),
-        shell:       body.shell.or(existing.shell),
-        notes:       body.notes.or(existing.notes),
-        content:     body.content.or(existing.content),
-        // None = not sent → keep existing. Some([]) = explicitly clear. Some([...]) = replace.
-        categories: body.categories.or(existing.categories),
-        created: existing.created,
-        is_global: body.is_global.or(existing.is_global),
-    };
-
+    // Hold the vault lock across read-merge-write so concurrent GUI/CLI updates
+    // never merge into a stale copy. Secrets stay server-side.
     let vault = state.vault.lock().await;
     let key = match vault.key.as_ref() {
         Some(k) => k.clone(),
@@ -987,30 +948,16 @@ async fn handle_update_item(
         }
     };
 
-    let encrypted = match crate::vault::encrypt_item(&key, &merged) {
-        Ok(e) => e,
-        Err(_) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "error cifrando item",
-                "INTERNAL_ERROR",
-            )
-            .into_response()
+    let merged = match crate::vault::update_item_merged(&vault.db, &key, id, body).await {
+        Ok(m) => m,
+        Err(crate::vault::UpdateItemError::NotFound) => {
+            return err_json(StatusCode::NOT_FOUND, "item no encontrado", "NOT_FOUND").into_response()
         }
-    };
-
-    let is_global = merged.is_global.unwrap_or(false);
-    match vault
-        .db
-        .upsert_item(id, &merged.item_type, &encrypted, &merged.created, is_global)
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
+        Err(crate::vault::UpdateItemError::Other(e)) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
                 .into_response()
         }
-    }
+    };
 
     (StatusCode::OK, Json(redact_item(merged))).into_response()
 }

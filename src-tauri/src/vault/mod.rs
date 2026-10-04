@@ -140,6 +140,9 @@ pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &CryptoKey)
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     );
 
+    // Encrypt everything first, then write in a single transaction so a
+    // failure midway never leaves half-migrated vars or a set flag.
+    let mut entries = Vec::new();
     for (env_var_id, key_name, literal, project_id) in db.list_unmigrated_literal_vars().await? {
         let item = VaultItem {
             id: 0,
@@ -160,13 +163,10 @@ pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &CryptoKey)
             is_global: Some(false),
         };
         let encrypted = encrypt_item(key, &item)?;
-        let new_id = db.upsert_item(0, "secret", &encrypted, &item.created, false).await?;
-        db.add_item_owner(new_id, project_id).await?;
-        db.set_environment_var_item(env_var_id, new_id).await?;
+        entries.push((env_var_id, project_id, encrypted, item.created));
     }
 
-    db.set_setting("migrated_literals_v1", "true").await?;
-    Ok(())
+    db.apply_literal_migration(&entries).await
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
@@ -199,9 +199,9 @@ async fn do_unlock(
         }
     };
 
-    s.key = Some(Zeroizing::new(key));
-    s.touch();
-
+    // The key is published to `VaultState` only after every fallible step has
+    // succeeded: REST/MCP treat `key.is_some()` as "unlocked", so a failure
+    // below must leave the vault locked.
     migrate_literal_vars_to_items(&s.db, &key).await?;
 
     let raw = s.db.list_items().await?;
@@ -222,6 +222,9 @@ async fn do_unlock(
             description: c.description,
         })
         .collect();
+
+    s.key = Some(Zeroizing::new(key));
+    s.touch();
 
     Ok(UnlockPayload {
         items,
@@ -273,6 +276,62 @@ pub async fn vault_get_items(state: State<'_, SharedState>) -> Result<Vec<VaultI
         .into_iter()
         .filter_map(|(id, _, data, _, is_global)| decrypt_item(&key, id, &data, is_global).ok())
         .collect())
+}
+
+/// Why `update_item_merged` failed. `NotFound` lets the HTTP layer answer 404
+/// without inspecting error strings.
+pub enum UpdateItemError {
+    NotFound,
+    Other(String),
+}
+
+impl From<String> for UpdateItemError {
+    fn from(e: String) -> Self {
+        UpdateItemError::Other(e)
+    }
+}
+
+/// Read-decrypt-merge-encrypt-write of one item inside a single transaction.
+/// Callers MUST hold the vault lock for the whole call, so a concurrent update
+/// from another interface merges into the latest stored state instead of a
+/// stale copy. Merge rules: body fields override; `None` keeps the existing
+/// value (secret fields never leave this process).
+pub async fn update_item_merged(
+    db: &VaultDb,
+    key: &CryptoKey,
+    id: i64,
+    body: VaultItem,
+) -> Result<VaultItem, UpdateItemError> {
+    let mut tx = db.begin().await?;
+    let (data, stored_global) = VaultDb::get_item_tx(&mut tx, id)
+        .await?
+        .ok_or(UpdateItemError::NotFound)?;
+    let existing = decrypt_item(key, id, &data, stored_global)?;
+
+    let merged = VaultItem {
+        id,
+        item_type: if body.item_type.is_empty() { existing.item_type } else { body.item_type },
+        name:        body.name.or(existing.name),
+        value:       body.value.or(existing.value),
+        url:         body.url.or(existing.url),
+        username:    body.username.or(existing.username),
+        password:    body.password.or(existing.password),
+        title:       body.title.or(existing.title),
+        description: body.description.or(existing.description),
+        command:     body.command.or(existing.command),
+        shell:       body.shell.or(existing.shell),
+        notes:       body.notes.or(existing.notes),
+        content:     body.content.or(existing.content),
+        // None = not sent → keep existing. Some([]) = explicitly clear. Some([...]) = replace.
+        categories: body.categories.or(existing.categories),
+        created: existing.created,
+        is_global: body.is_global.or(existing.is_global),
+    };
+
+    let encrypted = encrypt_item(key, &merged)?;
+    VaultDb::update_item_tx(&mut tx, id, &encrypted, merged.is_global.unwrap_or(false)).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(merged)
 }
 
 #[tauri::command]
@@ -639,20 +698,21 @@ pub async fn set_item_global(
         .ok_or("item not found")?;
     let original = decrypt_item(key, id, &data, true)?;
 
+    // Encrypt every copy up front; the DB then inserts, links, repoints and
+    // deletes the original in one transaction.
     let mut forked = Vec::with_capacity(owners.len());
+    let mut encrypted_copies = Vec::with_capacity(owners.len());
     for project_id in &owners {
         let mut copy = original.clone();
         copy.id = 0;
         copy.is_global = Some(false);
-        let encrypted = encrypt_item(key, &copy)?;
-        let new_id = db.upsert_item(0, &item_type, &encrypted, &created, false).await?;
-        db.add_item_owner(new_id, *project_id).await?;
-        db.repoint_env_var_item(*project_id, id, new_id).await?;
-        copy.id = new_id;
+        encrypted_copies.push((*project_id, encrypt_item(key, &copy)?));
         forked.push(copy);
     }
-
-    db.delete_item(id).await?;
+    let new_ids = db.fork_item_per_owner(id, &item_type, &created, &encrypted_copies).await?;
+    for (copy, new_id) in forked.iter_mut().zip(new_ids) {
+        copy.id = new_id;
+    }
 
     Ok(GlobalToggleResult { updated: None, forked })
 }
@@ -1918,5 +1978,87 @@ mod tests {
         assert!(err.contains("'C'"));
         assert!(!err.contains("secret-value"), "error leaked a value: {err}");
         assert_nothing_created(&db).await;
+    }
+
+    // ─── vault-db-transactional-integrity ─────────────────────────────
+
+    #[tokio::test]
+    async fn failed_unlock_migration_leaves_vault_locked_and_rest_rejects_token() {
+        use crate::test_support::{locked_vault, req, router};
+        let v = locked_vault().await;
+        {
+            let s = v.state.lock().await;
+            literal_var(&s.db, "legacy", "LEGACY_KEY", "legacy-secret").await;
+            sqlx::query(
+                "CREATE TRIGGER boom BEFORE INSERT ON items
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .execute(&s.db.pool)
+            .await
+            .unwrap();
+        }
+
+        {
+            let mut s = v.state.lock().await;
+            let res = do_unlock(v.master_password.as_bytes(), &mut s).await;
+            assert!(res.is_err());
+            assert!(s.key.is_none(), "key must stay None when unlock fails");
+        }
+
+        let app = router(&v);
+        let (status, _) = req(&app, "GET", "/items", Some(&v.token), None).await;
+        assert_eq!(status.as_u16(), 403);
+    }
+
+    #[tokio::test]
+    async fn set_item_global_fork_failure_leaves_original_and_links_unchanged() {
+        let (_dir, db, key) = test_db().await;
+        let project_a = db.upsert_project(0, "proj-a", None, "generic").await.unwrap();
+        let project_b = db.upsert_project(0, "proj-b", None, "generic").await.unwrap();
+        let env_a = db.upsert_environment(0, project_a, "production", true).await.unwrap();
+        let item = plain_secret("SHARED", "shared-value", true);
+        let encrypted = encrypt_item(&key, &item).unwrap();
+        let original_id = db.upsert_item(0, &item.item_type, &encrypted, &item.created, true).await.unwrap();
+        db.add_item_owner(original_id, project_a).await.unwrap();
+        db.add_item_owner(original_id, project_b).await.unwrap();
+        db.upsert_environment_var(env_a, "SHARED", original_id).await.unwrap();
+
+        // Fails after the first copy row is inserted (on its ownership link).
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON item_projects
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(set_item_global(&db, &key, original_id, false).await.is_err());
+
+        let items = db.list_items().await.unwrap();
+        assert_eq!(items.len(), 1, "no copy may remain");
+        assert_eq!(items[0].0, original_id);
+        assert_eq!(db.list_owning_projects(original_id).await.unwrap().len(), 2);
+        let vars = db.get_environment_vars(env_a).await.unwrap();
+        assert_eq!(vars[0].item_id, Some(original_id));
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_and_does_not_set_flag() {
+        let (_dir, db, key) = test_db().await;
+        let (_, env_id) = literal_var(&db, "proj-a", "LITERAL_KEY", "literal-secret").await;
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON item_projects
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(migrate_literal_vars_to_items(&db, &key).await.is_err());
+
+        assert!(db.list_items().await.unwrap().is_empty());
+        assert!(db.get_setting("migrated_literals_v1").await.unwrap().is_none());
+        let vars = db.get_environment_vars(env_id).await.unwrap();
+        assert!(vars[0].item_id.is_none() && vars[0].literal.is_some());
     }
 }
