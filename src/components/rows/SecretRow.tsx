@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { copySecret } from '../../lib/clipboard';
 import { Icon } from '../ui/Icon';
 import { CopyBtn } from '../ui/CopyBtn';
 import { KebabBtn } from '../ui/KebabBtn';
@@ -90,8 +90,7 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
       fmt === 'bash' ? `export ${item.name}=${item.value}` :
                       `$env:${item.name} = "${item.value}"`;
     try {
-      await writeText(text);
-      showToast(t('rows.copiedAs', { fmt: fmt === 'ps1' ? 'PowerShell' : fmt }));
+      await copySecret(text, t('rows.copiedAs', { fmt: fmt === 'ps1' ? 'PowerShell' : fmt }));
     } catch {
       showToast(t('rows.clipboardError'));
     }

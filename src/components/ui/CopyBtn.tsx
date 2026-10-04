@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { copySecret } from '../../lib/clipboard';
 import { Icon } from './Icon';
 import { useTranslation } from '../../i18n';
 
@@ -16,7 +16,7 @@ export function CopyBtn({ value, label, title }: CopyBtnProps) {
   const handle = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await writeText(value);
+      await copySecret(value);
       setOk(true);
       setTimeout(() => setOk(false), 1800);
     } catch {}

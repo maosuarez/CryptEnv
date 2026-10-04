@@ -49,6 +49,9 @@
     "deleteTitle": "Excluir \"{name}\"?",
     "deleteBody": "Esta categoria será removida de todos os {n} itens que a usam."
   },
+  "clipboard": {
+    "secretCopied": "{label} · apagado em 30 s"
+  },
   "common": {
     "back": "Voltar",
     "cancel": "CANCELAR",

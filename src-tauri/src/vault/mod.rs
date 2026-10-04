@@ -240,9 +240,13 @@ pub async fn vault_unlock(
 
 /// Internal lock used by both the Tauri command and the background auto-lock task.
 pub async fn lock_vault(shared: &SharedState) {
-    let mut s = shared.lock().await;
-    s.key = None;
-    s.last_activity = None;
+    {
+        let mut s = shared.lock().await;
+        s.key = None;
+        s.last_activity = None;
+    }
+    // A secret still on the clipboard must not outlive the session.
+    let _ = tokio::task::spawn_blocking(crate::clipboard::clear_if_ours).await;
 }
 
 #[tauri::command]

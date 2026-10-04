@@ -49,6 +49,9 @@
     "deleteTitle": "¿Eliminar \"{name}\"?",
     "deleteBody": "Esta categoría se quitará de los {n} elementos que la usan."
   },
+  "clipboard": {
+    "secretCopied": "{label} · se borra en 30 s"
+  },
   "common": {
     "back": "Atrás",
     "cancel": "CANCELAR",

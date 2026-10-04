@@ -43,6 +43,8 @@ interface VaultStore {
   menu:        MenuState | null;
   toast:       ToastState | null;
   placeholder: VaultItem | null;
+  /** First-run setup wizard (shows the MCP token); closed on lock. */
+  wizardOpen:  boolean;
   lockTimeout: number;   // minutes; 0 = never
   hotkey:      string;
 
@@ -53,6 +55,7 @@ interface VaultStore {
   closeMenu:      () => void;
   showToast:      (msg: string, type?: 'success' | 'error') => void;
   setPlaceholder: (item: VaultItem | null) => void;
+  setWizardOpen:  (open: boolean) => void;
   setLockTimeout: (mins: number) => void;
   setHotkey:      (key: string) => void;
   unlock:              (password: string) => Promise<void>;
@@ -71,6 +74,21 @@ interface VaultStore {
 
 let toastTimer: ReturnType<typeof setTimeout>;
 
+/** State patch that drops everything secret-bearing and shows the lock screen.
+ *  Shared by `lock`, `lockedByBackend` and `wipe` so none can forget a field. */
+export function resetSecretUi(): Partial<VaultStore> {
+  return {
+    screen:      'lock',
+    history:     [],
+    items:       [],
+    cats:        [],
+    editTarget:  null,
+    menu:        null,
+    placeholder: null,
+    wizardOpen:  false,
+  };
+}
+
 export const useVaultStore = create<VaultStore>((set, get) => ({
   screen:      'lock',
   history:     [],
@@ -80,6 +98,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   menu:        null,
   toast:       null,
   placeholder: null,
+  wizardOpen:  false,
   lockTimeout: 5,
   hotkey:      'Ctrl+Alt+Z',
 
@@ -106,6 +125,8 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   setPlaceholder: (placeholder) => set({ placeholder }),
+
+  setWizardOpen: (wizardOpen) => set({ wizardOpen }),
 
   setLockTimeout: (lockTimeout) => set({ lockTimeout }),
 
@@ -144,18 +165,18 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     try {
       await invoke('vault_lock');
     } catch {}
-    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+    set(resetSecretUi());
   },
 
   lockedByBackend: () => {
     if (get().screen === 'lock') return;
-    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+    set(resetSecretUi());
     get().showToast(t('lock.sessionLocked'), 'error');
   },
 
   wipe: async () => {
     await invoke('vault_wipe');
-    set({ screen: 'lock', history: [], items: [], cats: [], editTarget: null, menu: null });
+    set(resetSecretUi());
   },
 
   saveItem: async (form) => {

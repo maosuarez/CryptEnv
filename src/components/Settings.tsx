@@ -8,6 +8,7 @@ import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
 import { WslIntegrationSection } from './settings/WslIntegrationSection';
 import { useVaultStore } from '../store';
+import { copyPlain, copySecret } from '../lib/clipboard';
 import { useSystemInfo } from '../hooks/useSystemInfo';
 import { useThemeStore, type Theme } from '../store/themeStore';
 import { LANGUAGES, LANGUAGE_NAMES, useTranslation, type Language } from '../i18n';
@@ -279,7 +280,7 @@ function RelayConfigSection({ showToast }: { showToast: (msg: string, type?: 'su
               <div className="flex items-center justify-between px-3 py-2 border-b border-bd">
                 <span className="text-[11px] font-mono text-tx3 tracking-[0.06em]">{t('settings.relay.runInEditor')}</span>
                 <button
-                  onClick={() => navigator.clipboard.writeText(RELAY_SQL).then(() => showToast(t('settings.relay.sqlCopied')))}
+                  onClick={() => copyPlain(RELAY_SQL).then(() => showToast(t('settings.relay.sqlCopied')))}
                   className="text-tx3 hover:text-accent transition-colors"
                   title={t('settings.relay.copySql')}
                   aria-label={t('settings.relay.copySql')}
@@ -739,7 +740,7 @@ export function Settings() {
               <Icon name={mcpTokenVisible ? 'eyeOff' : 'eye'} size={13} />
             </button>
             <button
-              onClick={() => { navigator.clipboard.writeText(mcpToken); showToast(t('settings.toast.tokenCopied')); }}
+              onClick={() => { copySecret(mcpToken, t('settings.toast.tokenCopied')).catch(() => {}); }}
               className="text-tx3 hover:text-tx transition-colors shrink-0"
               title={t('common.copy')}
               aria-label={t('settings.copyToken')}
