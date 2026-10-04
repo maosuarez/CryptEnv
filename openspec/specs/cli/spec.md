@@ -60,12 +60,17 @@ The CLI client SHALL load the REST API's TLS certificate from the path in `CRYPT
 
 ### Requirement: Session-token storage and permissions
 
-The CLI client SHALL resolve the session-token file path from `CRYPTENV_TOKEN_PATH` when set and non-empty, and SHALL otherwise use the current default location. On non-Windows targets, a failure to restrict the token file's permissions to owner-only SHALL NOT abort the operation, provided the token content was written successfully; the token write itself SHALL still surface an error if it fails.
+The CLI client SHALL resolve the session-token file path from `CRYPTENV_TOKEN_PATH` when set and non-empty, and SHALL otherwise use the current default location. A token file MUST be created with owner-only permissions from the moment it exists: it must never be readable by other users, even briefly. It SHALL replace any previous token at the same path atomically. When the client creates the token directory, it SHALL create it with owner-only permissions. On non-Windows targets, a failure to apply owner-only permissions on a filesystem that cannot honor them SHALL NOT abort the operation, provided the token content was written successfully; the token write itself SHALL still surface an error if it fails.
 
 #### Scenario: Default token location unchanged
 
 - **WHEN** `CRYPTENV_TOKEN_PATH` is unset
 - **THEN** the client reads and writes the session token at its current default path
+
+#### Scenario: Token never world-readable on native filesystems
+
+- **WHEN** the client writes a token on a native Linux filesystem with umask `022`
+- **THEN** at no point does a file containing the token exist with group or other read permission
 
 #### Scenario: Permission hardening best-effort off native filesystems
 
@@ -254,16 +259,20 @@ The CLI SHALL provide a `crypt-env sync [--global]` subcommand that parses a loc
 
 ### Requirement: Secret environment variable injection via inject
 
-The CLI SHALL provide a `crypt-env inject <KEY>` subcommand that injects a secret's value directly into the calling shell environment without displaying the secret value on the screen or in terminal logs. The `inject` command MUST require a live per-terminal CLI session, prompting for the master password when there is none.
+The CLI SHALL provide a `crypt-env inject <KEY>` subcommand that injects a secret's value directly into the calling shell environment without displaying the secret value on the screen or in terminal logs. The `inject` command MUST require a live per-terminal CLI session, prompting for the master password when there is none. The emitted assignment MUST follow the *shell-export-quoting* guarantees. Documentation and help text SHALL show the quoted invocation `eval "$(crypt-env inject KEY)"` for POSIX shells and `crypt-env inject KEY | Invoke-Expression` for PowerShell.
 
 #### Scenario: Inject secret variable into terminal session
-- **WHEN** user runs `eval $(crypt-env inject DATABASE_URL)` and provides the master password
+- **WHEN** user runs `eval "$(crypt-env inject DATABASE_URL)"` and provides the master password
 - **THEN** `crypt-env inject` outputs the shell export expression without logging the plaintext secret to stderr or interactive console display
-- **AND** the variable `DATABASE_URL` becomes available in the invoking shell
+- **AND** the variable `DATABASE_URL` becomes available in the invoking shell with exactly the stored value
 
 #### Scenario: Inject with invalid password
 - **WHEN** user runs `crypt-env inject DATABASE_URL` without a live session and enters an incorrect master password
 - **THEN** the command exits with an authentication error and outputs no shell assignments
+
+#### Scenario: Inject with an invalid key name
+- **WHEN** the stored key is not a valid shell variable name
+- **THEN** the command exits with an invalid-key error and outputs no shell assignments
 
 ### Requirement: Variable search and listing via search
 
@@ -353,3 +362,31 @@ Stale per-terminal session files SHALL be pruned only if their name is exactly t
 #### Scenario: Pruning leaves unrelated files alone
 - **WHEN** `CRYPTENV_TOKEN_PATH` is `~/secrets/cli` and the directory also holds `cli.bak` and `cli.json`, both older than one day
 - **THEN** pruning deletes only stale `cli.<16-hex>` files and leaves `cli.bak` and `cli.json` untouched
+
+### Requirement: Terminal identity is not reusable
+
+The identity used to bind a CLI session to a terminal MUST include a value that differs between two terminals opened one after another, even if the operating system reuses the handle or session number. On Windows it SHALL include the console host process's creation time. A process without a console SHALL NOT share a session with any other process. In the WSL launcher, the identity SHALL include the session leader's start time.
+
+#### Scenario: Recycled console handle
+- **WHEN** terminal A authenticates and is closed, and a new terminal B receives the same console window handle
+- **THEN** terminal B prompts for the master password
+
+#### Scenario: Console-less processes
+- **WHEN** two detached processes without a console run gated commands
+- **THEN** each one needs its own authentication
+
+### Requirement: Session token retained on transient errors
+
+The CLI SHALL delete a cached session token only when the server rejects it as unauthenticated (401). A server error (5xx), a throttling response (429), or a network failure SHALL leave the token in place, and SHALL be reported as an error.
+
+#### Scenario: Backend restarting
+- **WHEN** the backend answers 503 during a gated command
+- **THEN** the command fails with a server error, and the next command after the backend recovers does not prompt for the password
+
+### Requirement: add reports failures in its exit status
+
+`crypt-env add` SHALL exit with a non-zero status when any key fails to be added. It SHALL print, by key name only, which keys were added and which failed.
+
+#### Scenario: Partial failure
+- **WHEN** `crypt-env add .env` adds 3 keys and 1 key's request fails
+- **THEN** the command lists the 3 added keys and the 1 failed key, and exits non-zero
