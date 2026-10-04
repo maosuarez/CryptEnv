@@ -20,3 +20,21 @@ The application MUST dynamically register and re-register the global shortcut to
 #### Scenario: Cross-platform modifier adaptation
 - **WHEN** the application is running on macOS
 - **THEN** modifier keys adapt to macOS conventions (displaying `Cmd` instead of `Ctrl`), and shortcut parsing accepts macOS Command/Super modifiers.
+
+## ADDED Requirements
+
+### Requirement: Unlock Failure Feedback
+The lock screen MUST distinguish unlock failures. A wrong master password SHALL show the existing shake and "incorrect password" message. A throttled attempt SHALL show a distinct, non-shake message with a live countdown of the remaining wait and SHALL disable both the password and biometric submit actions until the countdown reaches 0. An unlock aborted by a concurrent lock, wipe, restore or unlock SHALL show a neutral "try again" message. The desktop commands MUST signal throttled and aborted with stable machine-readable codes, not by the GUI parsing English text; the REST API response shape MUST NOT change.
+
+#### Scenario: Throttled unlock shows a countdown
+- **WHEN** the user submits a password while the unlock throttle is active
+- **THEN** the lock screen shows the remaining seconds counting down, without the wrong-password shake
+- **AND** the submit buttons are disabled until the countdown reaches 0.
+
+#### Scenario: Wrong password keeps the shake
+- **WHEN** the user submits a wrong password and the attempt is not throttled
+- **THEN** the lock screen shakes and shows "incorrect password".
+
+#### Scenario: Aborted unlock is neutral
+- **WHEN** an unlock is aborted because the vault changed during key derivation
+- **THEN** the lock screen shows a neutral "try again" message, not the wrong-password message.

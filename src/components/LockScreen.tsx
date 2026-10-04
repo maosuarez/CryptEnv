@@ -4,6 +4,7 @@ import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
 import { useSystemInfo } from '../hooks/useSystemInfo';
 import { useTranslation } from '../i18n';
+import { classifyUnlockError, tickCountdown } from '../lib/unlockError';
 import type { VaultItem, Category } from '../types';
 
 export function LockScreen() {
@@ -21,6 +22,9 @@ export function LockScreen() {
   const [bioLoading,   setBioLoading]   = useState(false);
   const [bioError,     setBioError]     = useState('');
   const [bioNotice,    setBioNotice]    = useState(false);
+  // Seconds left of an unlock throttle (shared by password and biometric); 0 = not throttled.
+  const [waitSecs,     setWaitSecs]     = useState(0);
+  const [aborted,      setAborted]      = useState(false);
   const ref = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -38,15 +42,30 @@ export function LockScreen() {
     }).catch(() => {});
   }, []);
 
+  // Live countdown while throttled; the submit buttons stay disabled until it hits 0.
+  useEffect(() => {
+    if (waitSecs <= 0) return;
+    const id = setInterval(() => setWaitSecs(tickCountdown), 1000);
+    return () => clearInterval(id);
+  }, [waitSecs > 0]);
+
   const handle = async () => {
-    if (!pw.trim()) return;
+    if (!pw.trim() || waitSecs > 0) return;
     setLoading(true);
     setError(false);
+    setAborted(false);
     try {
       await unlock(pw);
-    } catch {
-      setError(true);
-      setTimeout(() => setError(false), 600);
+    } catch (e: unknown) {
+      const failure = classifyUnlockError(e);
+      if (failure.kind === 'throttled') {
+        setWaitSecs(failure.retryAfterSecs);
+      } else if (failure.kind === 'aborted') {
+        setAborted(true);
+      } else {
+        setError(true);
+        setTimeout(() => setError(false), 600);
+      }
     } finally {
       setLoading(false);
     }
@@ -55,12 +74,20 @@ export function LockScreen() {
   const handleBiometric = async () => {
     setBioLoading(true);
     setBioError('');
+    setAborted(false);
     try {
       const payload = await invoke<{ items: VaultItem[]; categories: Category[] }>('biometric_unlock');
       await unlockWithPayload(payload);
     } catch (e: unknown) {
-      setBioError(e instanceof Error ? e.message : String(e));
-      setTimeout(() => setBioError(''), 3000);
+      const failure = classifyUnlockError(e);
+      if (failure.kind === 'throttled') {
+        setWaitSecs(failure.retryAfterSecs);
+      } else if (failure.kind === 'aborted') {
+        setAborted(true);
+      } else {
+        setBioError(failure.message);
+        setTimeout(() => setBioError(''), 3000);
+      }
     } finally {
       setBioLoading(false);
     }
@@ -129,17 +156,23 @@ export function LockScreen() {
             {error && (
               <div className="text-[11px] text-danger font-mono">// {t('lock.incorrectPassword')}</div>
             )}
+            {waitSecs > 0 && (
+              <div role="status" className="text-[11px] text-warn font-mono">// {t('lock.throttled', { n: waitSecs })}</div>
+            )}
+            {aborted && waitSecs === 0 && (
+              <div role="status" className="text-[11px] text-tx2 font-mono">// {t('lock.retry')}</div>
+            )}
           </div>
 
           {/* Button */}
           <button
             onClick={handle}
-            disabled={loading}
+            disabled={loading || waitSecs > 0}
             className={[
               'w-full h-[52px] border-none rounded-[3px]',
               'text-[14px] font-bold tracking-[0.07em] font-ui',
               'flex items-center justify-center gap-2 transition-all duration-150 cursor-pointer',
-              loading ? 'bg-accent-d text-[#020504]' : 'bg-accent text-[#020504] hover:opacity-90',
+              loading || waitSecs > 0 ? 'bg-accent-d text-[#020504]' : 'bg-accent text-[#020504] hover:opacity-90',
             ].join(' ')}
           >
             {loading ? (
@@ -147,6 +180,8 @@ export function LockScreen() {
                 <div className="w-3 h-3 rounded-full border-2 border-transparent border-t-[#020504] animate-spin-fast" />
                 {isSetup === false ? t('lock.creating') : t('lock.unlocking')}
               </>
+            ) : waitSecs > 0 ? (
+              t('lock.throttledBtn', { n: waitSecs })
             ) : (
               <>
                 <Icon name="unlock" size={14} color="#020504" />
@@ -174,7 +209,7 @@ export function LockScreen() {
             <div className="flex flex-col gap-1">
               <button
                 onClick={handleBiometric}
-                disabled={bioLoading}
+                disabled={bioLoading || waitSecs > 0}
                 className={[
                   'w-full h-[44px] rounded-[3px] border',
                   'text-[13px] font-semibold tracking-[0.05em] font-ui',

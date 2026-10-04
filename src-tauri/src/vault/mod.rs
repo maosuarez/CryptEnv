@@ -238,7 +238,7 @@ pub async fn vault_unlock(
 async fn unlock_for_gui(state: &SharedState, password: &[u8]) -> Result<UnlockPayload, String> {
     let outcome = unlock::unlock_with_password(state, password, true, true)
         .await
-        .map_err(|e| e.message())?;
+        .map_err(|e| e.gui_error())?;
     outcome.payload.ok_or_else(|| "unlock payload missing".to_string())
 }
 
@@ -1357,7 +1357,7 @@ pub async fn biometric_enroll(
 pub async fn biometric_unlock(state: State<'_, SharedState>) -> Result<UnlockPayload, String> {
     let outcome = unlock::unlock_with_biometric(&state, crate::biometric::platform_signer(), true)
         .await
-        .map_err(|e| e.message())?;
+        .map_err(|e| e.gui_error())?;
     outcome.payload.ok_or_else(|| "unlock payload missing".to_string())
 }
 
