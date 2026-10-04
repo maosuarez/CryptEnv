@@ -92,13 +92,28 @@ pub fn read_file(path: &Path) -> Result<Manifest, String> {
     parse(&content).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Writes `m` to `<dir>/.crypt-env.yaml` via a sibling temp file + rename.
+/// Writes `m` to `<dir>/.crypt-env.yaml` via a uniquely named temp file in the
+/// same directory, then renames it over the target. The temp file is created
+/// exclusively (random name, `O_EXCL` / `CREATE_NEW`), so a planted file or
+/// symlink at any fixed name is never opened; the rename replaces a symlink at
+/// the target itself instead of following it. On failure the temp file is
+/// removed on drop and an existing manifest stays intact.
 pub fn write_file(dir: &Path, m: &Manifest) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+
     let target = dir.join(FILE_NAME);
-    let tmp = dir.join(format!("{FILE_NAME}.tmp"));
     let content = to_yaml(m)?;
-    std::fs::write(&tmp, content).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    tmp.write_all(content.as_bytes()).map_err(|e| format!("{}: {e}", target.display()))?;
+    tmp.as_file().sync_all().map_err(|e| format!("{}: {e}", target.display()))?;
+    // The manifest is meant to be committed: keep the usual shared mode
+    // rather than the temp file's owner-only 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644));
+    }
+    tmp.persist(&target).map_err(|e| format!("{}: {}", target.display(), e.error))?;
     Ok(target)
 }
 
@@ -248,5 +263,53 @@ mod tests {
         let path = write_file(dir.path(), &m).unwrap();
         assert_eq!(read_file(&path).unwrap(), m);
         assert!(!dir.path().join(".crypt-env.yaml.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_never_follows_a_planted_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".crypt-env.yaml.tmp")).unwrap();
+
+        let m = from_project(&project(), &|p| p.to_string());
+        let path = write_file(dir.path(), &m).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(read_file(&path).unwrap(), m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_replaces_a_symlinked_manifest_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(FILE_NAME)).unwrap();
+
+        let m = from_project(&project(), &|p| p.to_string());
+        write_file(dir.path(), &m).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(!std::fs::symlink_metadata(dir.path().join(FILE_NAME)).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn write_file_failure_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory at the target makes the final rename fail.
+        let blocker = dir.path().join(FILE_NAME);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), "x").unwrap();
+
+        let m = from_project(&project(), &|p| p.to_string());
+        assert!(write_file(dir.path(), &m).is_err());
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![FILE_NAME.to_string()]);
     }
 }

@@ -113,8 +113,10 @@ export interface InjectResult {
  *  so the GUI can show a confirm dialog before an inject that would
  *  overwrite unmanaged files. */
 export interface InjectPreview {
-  paths:   string[];
-  foreign: string[];
+  paths:    string[];
+  foreign:  string[];
+  /** Targets that are symlinks; injection refuses to write through them. */
+  symlinks: string[];
 }
 
 export interface ProjectDeleteImpact {

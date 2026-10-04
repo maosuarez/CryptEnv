@@ -86,6 +86,9 @@ rfd = "0.14"
 # rustls-tls-native-roots: use the OS trust store PLUS our custom cert addition
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls-native-roots"] }
 
+# Atomic, exclusively-created temp files for `.crypt-env.yaml` writes
+tempfile = "3"
+
 # base64 encoding for relay payloads
 base64 = "0.22"
 
@@ -106,7 +109,6 @@ windows = { version = "0.58", features = [
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 # Issue #12: integration tests need to seed a DB that already contains a

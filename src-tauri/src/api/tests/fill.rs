@@ -105,3 +105,23 @@ async fn unresolvable_scope_is_422_before_any_file_is_touched() {
     assert_eq!(json.get("code").and_then(|c| c.as_str()), Some("VALIDATION_ERROR"));
     assert!(!output_path.exists(), "scope must be resolved before any file write is attempted");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fill_to_a_symlink_output_path_is_409_target_symlink() {
+    let v = unlocked_vault().await;
+    let app = router(&v);
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let link = dir.path().join(".env");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+    let uri = format!("/fill?environment_id={}", v.env_id);
+    let body = serde_json::json!({ "template": "DB_HOST=x\n", "output_path": link.to_str().unwrap(), "overwrite": true });
+    let (status, json) = req(&app, "POST", &uri, Some(&v.token), Some(body)).await;
+
+    assert_eq!(status.as_u16(), 409, "{json:?}");
+    assert_eq!(json.get("code").and_then(|c| c.as_str()), Some("TARGET_SYMLINK"));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
