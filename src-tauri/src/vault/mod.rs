@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::biometric;
@@ -78,6 +79,10 @@ pub struct VaultState {
     pub key: Option<Zeroizing<[u8; 32]>>,
     /// Monotonic timestamp of the last vault operation. None when the vault is locked.
     pub last_activity: Option<std::time::Instant>,
+    /// Lock epoch: bumped by `set_key` whenever the key changes (unlock, lock,
+    /// reset, restore, re-key). REST sessions record the epoch they were issued
+    /// in and are rejected once it moves on. In-memory only, not secret.
+    pub epoch: u64,
 }
 
 impl VaultState {
@@ -86,6 +91,22 @@ impl VaultState {
             db,
             key: None,
             last_activity: None,
+            epoch: 0,
+        }
+    }
+
+    /// The only place `key` is assigned. Bumps `epoch` unless the key is
+    /// unchanged (re-unlocking an already unlocked vault must not end the
+    /// other terminals' sessions).
+    pub fn set_key(&mut self, key: Option<Zeroizing<[u8; 32]>>) {
+        let unchanged = match (&self.key, &key) {
+            (None, None) => true,
+            (Some(a), Some(b)) => bool::from(a.as_slice().ct_eq(b.as_slice())),
+            _ => false,
+        };
+        self.key = key;
+        if !unchanged {
+            self.epoch = self.epoch.wrapping_add(1);
         }
     }
 
@@ -199,7 +220,7 @@ async fn do_unlock(
         }
     };
 
-    s.key = Some(Zeroizing::new(key));
+    s.set_key(Some(Zeroizing::new(key)));
     s.touch();
 
     migrate_literal_vars_to_items(&s.db, &key).await?;
@@ -241,7 +262,7 @@ pub async fn vault_unlock(
 /// Internal lock used by both the Tauri command and the background auto-lock task.
 pub async fn lock_vault(shared: &SharedState) {
     let mut s = shared.lock().await;
-    s.key = None;
+    s.set_key(None);
     s.last_activity = None;
 }
 
@@ -902,7 +923,7 @@ pub async fn vault_change_password(
     s.db.rekey(&new_salt, &new_token, re_encrypted).await?;
 
     // Update in-memory key
-    s.key = Some(Zeroizing::new(new_key));
+    s.set_key(Some(Zeroizing::new(new_key)));
     s.touch();
 
     Ok(())
@@ -911,7 +932,7 @@ pub async fn vault_change_password(
 #[tauri::command]
 pub async fn vault_wipe(state: State<'_, SharedState>) -> Result<(), String> {
     let mut s = state.lock().await;
-    s.key = None;
+    s.set_key(None);
     s.last_activity = None;
     s.db.wipe_and_reset().await
 }
@@ -1154,10 +1175,10 @@ async fn do_restore_backup(
     if !merge {
         // Wipe the current vault and restore the backup's crypto material verbatim.
         // After init_vault the in-memory key equals the backup key.
-        s.key = None;
+        s.set_key(None);
         s.db.wipe_and_reset().await?;
         s.db.init_vault(&backup.salt, &backup.token).await?;
-        s.key = Some(Zeroizing::new(backup_key));
+        s.set_key(Some(Zeroizing::new(backup_key)));
         s.touch();
 
         // Insert items using their original encrypted blobs (already keyed with backup_key).

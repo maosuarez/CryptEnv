@@ -160,7 +160,7 @@ async fn build(seed_data: bool) -> TestVault {
     let state: SharedState = Arc::new(Mutex::new(VaultState::new(db)));
     {
         let mut s = state.lock().await;
-        s.key = Some(Zeroizing::new(key));
+        s.set_key(Some(Zeroizing::new(key)));
         s.touch();
     }
 
@@ -197,7 +197,7 @@ pub async fn unlocked_vault_empty() -> TestVault {
 /// the request.
 pub async fn locked_vault() -> TestVault {
     let v = build(true).await;
-    v.state.lock().await.key = None;
+    v.state.lock().await.set_key(None);
     v
 }
 

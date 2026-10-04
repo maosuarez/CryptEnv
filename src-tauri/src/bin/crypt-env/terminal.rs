@@ -80,17 +80,32 @@ pub fn per_terminal_path(base: &Path, id: &str) -> PathBuf {
     base.with_file_name(name)
 }
 
+/// `name` is exactly `<stem>.<16 lowercase hex chars>` — the shape
+/// [`per_terminal_path`] produces. Nothing else next to the token file
+/// (`<stem>.bak`, `<stem>.json`, ...) is ours to delete.
+fn is_terminal_token_name(name: &str, stem: &str) -> bool {
+    name.strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .map(|hex| hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .unwrap_or(false)
+}
+
 /// Deletes sibling per-terminal token files of `base` unused for a day.
+/// Only regular files named `<stem>.<16 hex>` are considered; symlinks are
+/// never followed or removed.
 pub fn prune_stale(base: &Path, now: SystemTime) {
     let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|n| n.to_str())) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let prefix = format!("{stem}.");
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) {
+        if !is_terminal_token_name(name, stem) {
+            continue;
+        }
+        // `DirEntry::file_type` does not follow symlinks.
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
         let stale = entry
@@ -135,18 +150,56 @@ mod tests {
         let base = dir.path().join(".cli_token");
         let old = per_terminal_path(&base, "old");
         let fresh = per_terminal_path(&base, "fresh");
-        let other = dir.path().join("unrelated");
-        for p in [&old, &fresh, &other] {
+        let others = [
+            dir.path().join("unrelated"),
+            dir.path().join(".cli_token.bak"),
+            dir.path().join(".cli_token.json"),
+            dir.path().join(".cli_token.ABCDEF0123456789"), // uppercase hex
+            dir.path().join(".cli_token.0123456789abcde"),  // 15 chars
+            dir.path().join(".cli_token.0123456789abcdef0"), // 17 chars
+        ];
+        for p in [&old, &fresh].into_iter().chain(others.iter()) {
             std::fs::write(p, "t").unwrap();
         }
+        // A symlink with a token-shaped name, pointing at a file that must survive.
+        #[cfg(unix)]
+        let linked_target = dir.path().join("precious");
+        #[cfg(unix)]
+        let link = dir.path().join(".cli_token.00000000deadbeef");
+        #[cfg(unix)]
+        {
+            std::fs::write(&linked_target, "keep").unwrap();
+            std::os::unix::fs::symlink(&linked_target, &link).unwrap();
+        }
         let now = SystemTime::now();
-        let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
-        f.set_modified(now - Duration::from_secs(2 * 24 * 3600)).unwrap();
-        let f = std::fs::OpenOptions::new().write(true).open(&other).unwrap();
-        f.set_modified(now - Duration::from_secs(2 * 24 * 3600)).unwrap();
+        let age = |p: &Path| {
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(now - Duration::from_secs(2 * 24 * 3600)).unwrap();
+        };
+        age(&old);
+        for p in &others {
+            age(p);
+        }
+        #[cfg(unix)]
+        age(&linked_target);
         prune_stale(&base, now);
         assert!(!old.exists());
         assert!(fresh.exists());
-        assert!(other.exists());
+        for p in &others {
+            assert!(p.exists(), "{} must survive", p.display());
+        }
+        #[cfg(unix)]
+        {
+            assert!(std::fs::symlink_metadata(&link).is_ok(), "token-shaped symlink must survive");
+            assert!(linked_target.exists());
+        }
+    }
+
+    #[test]
+    fn token_name_shape() {
+        assert!(is_terminal_token_name(".cli_token.0123456789abcdef", ".cli_token"));
+        assert!(!is_terminal_token_name(".cli_token.0123456789abcdeF", ".cli_token"));
+        assert!(!is_terminal_token_name(".cli_token0123456789abcdef", ".cli_token"));
+        assert!(!is_terminal_token_name(".cli_token.", ".cli_token"));
     }
 }

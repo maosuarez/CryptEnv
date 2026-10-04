@@ -354,7 +354,7 @@
 
     <!-- ===================== 5. CLI ===================== -->
     <h2 id="cli"><span class="num">04</span>CLI reference<a class="anchor" href="#cli">#</a></h2>
-    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
+    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. <strong>Locking the vault ends every CLI session</strong> (a locked vault never renews one, and after the next unlock each terminal asks for the password again). Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
     <div class="table-wrap"><table>
       <tr><th>Command</th><th>Purpose</th></tr>
       <tr><td><code>init [NAME] [--path PATH]</code></td><td>Register this directory as a project root and write <code>.crypt-env.yaml</code></td></tr>
@@ -372,12 +372,13 @@
 
     <h3 id="cli-projects">Project workflow<a class="anchor" href="#cli-projects">#</a></h3>
     <h4>crypt-env init [NAME] [--path PATH]</h4>
-    <p>Creates the vault project (or links an existing one with that name), records the current directory as its root and writes <code>.crypt-env.yaml</code>. <code>NAME</code> defaults to the folder name. <code>--path</code> sets the default environment's target: a directory (its <code>.env</code>) or a <code>.env*</code> file; default <code>.env</code>. An existing <code>.crypt-env.yaml</code> is never overwritten.</p>
+    <p>Creates the vault project (or links an existing one with that name), records the current directory as its root and writes <code>.crypt-env.yaml</code>. <code>NAME</code> defaults to the folder name. <code>--path</code> sets the default environment's target: a directory (its <code>.env</code>) or a <code>.env*</code> file; default <code>.env</code>. An existing <code>.crypt-env.yaml</code> is never overwritten. If a project with that name is already bound to another directory, <code>init</code> fails (use <code>config --relink</code>); if it has no root yet, adopting this directory needs the same confirmation as <code>config</code>.</p>
     <div class="code"><span class="label">shell</span><pre><code>cd ~/code/my-service
 crypt-env init                           <span class="c"># project "my-service", default env → .env</span>
 crypt-env init backend-api --path ./app  <span class="c"># default env → app/.env</span></code></pre></div>
-    <h4>crypt-env config</h4>
+    <h4>crypt-env config [--relink] [--yes]</h4>
     <p>Compares the file's modification time with the vault's last change (project or any environment). File newer → the vault is updated (description, categories — created if missing —, environments and their paths, root). Vault newer → the file is regenerated. Vault environments missing from the file are kept (they may hold secrets) and reported.</p>
+    <p><strong>Root binding:</strong> a project with a root belongs to that directory. From any other directory (for example a fresh clone) <code>config</code> and <code>fill</code> fail with <code>project 'X' is bound to &lt;root&gt;, not this directory</code> and change nothing; <code>config --relink</code> is the only way to move it, and always asks for confirmation. <strong>Consent:</strong> a push that changes the root or any environment's target paths prints a diff, needs a live session and a <kbd>y</kbd>/<kbd>N</kbd> answer (default no); with stdin not a terminal pass <code>--yes</code>. Metadata-only changes and brand-new projects need no confirmation.</p>
 
     <h3 id="cli-items">Secrets &amp; env files<a class="anchor" href="#cli-items">#</a></h3>
     <h4>crypt-env add KEY=value | $VARNAME | FILE [--env NAME] [--global]</h4>
@@ -387,7 +388,7 @@ crypt-env add '$DATABASE_URL'
 crypt-env add .env.local --env staging
 crypt-env add "SHARED_AUTH_URL=https://auth.example" --global</code></pre></div>
     <h4>crypt-env fill [--env NAME] 🔒</h4>
-    <p>Writes every environment (or only <code>--env</code>) into its configured paths — the app does the writing, so WSL repos work with a Windows vault — and writes/extends a keys-only <code>.env.example</code> next to each target. A pre-existing file not created by CryptEnv is backed up to <code>&lt;path&gt;.bak</code> first.</p>
+    <p>Writes every environment (or only <code>--env</code>) into its configured paths — the app does the writing, so WSL repos work with a Windows vault — and writes/extends a keys-only <code>.env.example</code> next to each target. A pre-existing file not created by CryptEnv is backed up to <code>&lt;path&gt;.bak</code> first. <code>.env.example</code> goes next to each <code>.env</code> actually written. A symlink target is refused (<code>TARGET_SYMLINK</code>, nothing written) and a relative path may not leave the project root through a symlinked directory.</p>
     <h4>crypt-env sync [--global] [--env NAME] [--example PATH] 🔒</h4>
     <p>Reads <code>.env.example</code> (current directory, then the project root) and creates each key missing from the environment with the value <code>change-me</code>. With <code>--global</code>, keys matching a global secret are linked to it instead and the environment is then written to its <code>.env</code> target(s).</p>
     <h4>crypt-env inject KEY... [--env NAME] [--shell pwsh|bash|zsh|sh] 🔒</h4>
@@ -421,13 +422,13 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><kbd>/</kbd></td><td>Filter variables (<kbd>Esc</kbd> clears)</td></tr>
       <tr><td><kbd>v</kbd></td><td>Reveal value — asks for the master password unless the terminal has a live session; wiped from memory when the popup closes</td></tr>
       <tr><td><kbd>i</kbd></td><td><code>init</code> the current directory</td></tr>
-      <tr><td><kbd>c</kbd></td><td><code>config</code> sync</td></tr>
+      <tr><td><kbd>c</kbd></td><td><code>config</code> sync (a path change opens a confirmation modal)</td></tr>
       <tr><td><kbd>f</kbd></td><td><code>fill</code> (session or master password)</td></tr>
       <tr><td><kbd>s</kbd> / <kbd>S</kbd></td><td><code>sync</code> / <code>sync --global</code> (session or master password)</td></tr>
       <tr><td><kbd>d</kbd></td><td><code>doctor</code></td></tr>
       <tr><td><kbd>r</kbd></td><td>Reload</td></tr>
       <tr><td><kbd>?</kbd></td><td>Help</td></tr>
-      <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+      <tr><td><kbd>q</kbd> / <kbd>Ctrl</kbd>+<kbd>C</kbd></td><td>Quit (Ctrl+C works in every state, including password prompts)</td></tr>
     </table></div>
 
     <!-- ===================== 7. MCP ===================== -->
@@ -507,7 +508,7 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td colspan="3"><strong>System</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/health</code></td><td>No auth. <code>version</code>, <code>status</code>, <code>vault_locked</code>, <code>mcp_token_configured</code></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request. Locking the vault invalidates all sessions: requests get <code>403</code> while locked and <code>401</code> with a pre-lock token after the next unlock</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code></td></tr>
       <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings</td></tr>
       <tr><td colspan="3"><strong>Items</strong></td></tr>
@@ -556,6 +557,7 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <li>With <code>overwrite: true</code> the old content is copied to <code>&lt;path&gt;.bak</code> first (<code>409 BACKUP_EXISTS</code> if a backup is already there).</li>
       <li>Paths configured on the environment itself are always written through, with the same backup, and reported in <code>unmanagedPaths</code>. Relative configured paths resolve against the project's <code>rootPath</code> and may not leave it; a relative path on a project without a root is an error.</li>
       <li>Names derived from <code>output_dir</code> are contained to that directory (<code>422 PATH_NOT_CONTAINED</code> otherwise).</li>
+      <li>A target whose final component is a symlink (or Windows reparse point) is refused with <code>409 TARGET_SYMLINK</code>; nothing is written and no <code>.bak</code> is made.</li>
     </ul>
     <p>Add <code>*.bak</code> to <code>.gitignore</code> wherever CryptEnv writes.</p>
 
@@ -605,6 +607,8 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <tr><td>Vault locked / 401</td><td>Unlock in the app, or run any CLI command and enter the master password.</td></tr>
       <tr><td><code>no .crypt-env.yaml found</code></td><td>Run <code>crypt-env init</code> in the project root (or <code>cd</code> into it).</td></tr>
       <tr><td><code>project '…' does not exist in the vault</code></td><td>Run <code>crypt-env config</code> to register it from <code>.crypt-env.yaml</code>.</td></tr>
+      <tr><td><code>project '…' is bound to … not this directory</code></td><td>The project belongs to another checkout. Work there, or run <code>crypt-env config --relink</code> here to move it (asks for confirmation).</td></tr>
+      <tr><td><code>refusing to write through a symlink</code></td><td>The configured <code>.env</code> is a symlink. Point the environment at the real file.</td></tr>
       <tr><td><code>path '…' is relative but the project has no root directory</code></td><td>Set the project root in the GUI project form, or run <code>crypt-env config</code> from the project root.</td></tr>
       <tr><td><code>authentication failed (demasiados intentos…)</code></td><td>Five unlock attempts per minute — wait a minute and retry.</td></tr>
       <tr><td>Prompted on every command from WSL</td><td>Re-run <strong>Settings → WSL Integration → Configure</strong> so the managed <code>crypt-env</code> launcher forwards <code>CRYPTENV_TERMINAL_ID</code>.</td></tr>

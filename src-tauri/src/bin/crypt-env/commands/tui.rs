@@ -6,7 +6,7 @@
 
 use clap::Args;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::client::{self, CliError, ItemSummary, Project};
+use crate::client::{self, CliError, ItemSummary, Project, VaultApi};
 use crate::commands::{config, doctor, fill, init, scope, search, sync};
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
@@ -50,19 +50,32 @@ enum Pane {
     Variables,
 }
 
-/// What a password prompt unlocks once verified.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What a password prompt unlocks once verified. Every action that reaches
+/// the vault goes through [`gate`] with one of these, so the client never has
+/// to prompt on the raw terminal.
+#[derive(Clone, PartialEq, Eq)]
 enum Gated {
     Login,
+    Reload,
     Reveal,
     Fill,
     Sync { global: bool },
+    /// `config`: plan, and ask for confirmation when it changes secret routing.
+    Config,
+    /// `config` after the user confirmed the diff.
+    ConfigPush,
+    /// `init` for this project name.
+    Init { name: String },
+    /// `init` after the user confirmed adopting a rootless project.
+    InitAdopt { name: String },
 }
 
 enum Modal {
     None,
     Password { purpose: Gated, input: String, error: Option<String> },
     Input { title: &'static str, value: String },
+    /// A secret-routing change awaiting `y`; `then` runs through [`gate`].
+    Confirm { title: String, lines: Vec<String>, then: Gated },
     Reveal { key: String, value: Zeroizing<String> },
     Report { title: String, lines: Vec<(String, Color)> },
     Help,
@@ -76,6 +89,7 @@ struct VarRow {
 }
 
 struct App {
+    api: Box<dyn VaultApi>,
     projects: Vec<Project>,
     globals: Vec<ItemSummary>,
     pane: Pane,
@@ -91,8 +105,9 @@ struct App {
 }
 
 impl App {
-    fn new(workspace_dir: PathBuf) -> Self {
+    fn new(workspace_dir: PathBuf, api: Box<dyn VaultApi>) -> Self {
         App {
+            api,
             projects: Vec::new(),
             globals: Vec::new(),
             pane: Pane::Projects,
@@ -160,7 +175,7 @@ impl App {
 
     fn reload(&mut self) -> Result<(), CliError> {
         let selected = self.project().map(|p| p.id);
-        self.projects = client::fetch_projects()?;
+        self.projects = self.api.fetch_projects()?;
         let ws_name = scope::find_config(&self.workspace_dir)
             .and_then(|p| scope::load_config(&p).ok())
             .map(|w| w.project.to_lowercase());
@@ -172,7 +187,7 @@ impl App {
         self.globals = match self.projects.iter().find(|p| !p.environments.is_empty()) {
             Some(p) => {
                 let env = p.environments.iter().find(|e| e.is_default).unwrap_or(&p.environments[0]);
-                client::list_items(&p.name, &env.name, "only")?
+                self.api.list_items(&p.name, &env.name, "only")?
             }
             None => Vec::new(),
         };
@@ -198,6 +213,17 @@ impl App {
     fn error(&mut self, e: CliError) {
         self.report("Error", vec![(e.to_string(), DANGER)]);
     }
+
+    /// Reports `e`; a session that lapsed mid-action (`SessionRequired`)
+    /// instead opens the password modal for `purpose`.
+    fn fail(&mut self, e: CliError, purpose: Gated) {
+        match e {
+            CliError::SessionRequired => {
+                self.modal = Modal::Password { purpose, input: String::new(), error: None };
+            }
+            other => self.error(other),
+        }
+    }
 }
 
 // ─── Entry / loop ─────────────────────────────────────────────────────────────
@@ -211,17 +237,22 @@ pub fn run(_args: TuiArgs) -> Result<(), CliError> {
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        client::set_non_interactive(false);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         default_hook(info);
     }));
 
-    let mut app = App::new(cwd);
-    if !matches!(client::session_alive(), Ok(true)) || app.reload().is_err() {
+    // From here the TUI owns the terminal: the client must never prompt on it.
+    client::set_non_interactive(true);
+
+    let mut app = App::new(cwd, Box::new(client::Live));
+    if !matches!(app.api.session_alive(), Ok(true)) || app.reload().is_err() {
         app.modal = Modal::Password { purpose: Gated::Login, input: String::new(), error: None };
     }
     let result = run_loop(&mut terminal, &mut app);
 
+    client::set_non_interactive(false);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -234,7 +265,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
         if event::poll(Duration::from_millis(100)).map_err(CliError::Io)? {
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(app, key.code);
+                    handle_key(app, key);
                 }
             }
         }
@@ -244,7 +275,20 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 
 // ─── Input ────────────────────────────────────────────────────────────────────
 
-fn handle_key(app: &mut App, code: KeyCode) {
+fn handle_key(app: &mut App, key: KeyEvent) {
+    // Control combinations are never plain letters. Ctrl+C always quits, in
+    // every state including modals. AltGr is reported as Ctrl+Alt on Windows
+    // and types real characters, so Ctrl together with Alt is not "control".
+    if key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
+        if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if let Modal::Password { input, .. } = &mut app.modal {
+                input.zeroize();
+            }
+            app.quit = true;
+        }
+        return;
+    }
+    let code = key.code;
     match &mut app.modal {
         Modal::None => {}
         Modal::Password { input, purpose, .. } => {
@@ -259,10 +303,22 @@ fn handle_key(app: &mut App, code: KeyCode) {
                     app.modal = Modal::None;
                 }
                 KeyCode::Enter => {
-                    let purpose = *purpose;
+                    let purpose = purpose.clone();
                     let pw = Zeroizing::new(std::mem::take(input));
                     submit_password(app, purpose, &pw);
                 }
+                _ => {}
+            }
+            return;
+        }
+        Modal::Confirm { then, .. } => {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let then = then.clone();
+                    app.modal = Modal::None;
+                    gate(app, then);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
                 _ => {}
             }
             return;
@@ -277,7 +333,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 KeyCode::Enter => {
                     let name = std::mem::take(value);
                     app.modal = Modal::None;
-                    run_init(app, &name);
+                    gate(app, Gated::Init { name });
                 }
                 _ => {}
             }
@@ -340,18 +396,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 gate(app, Gated::Reveal);
             }
         }
-        KeyCode::Char('r') => {
-            if let Err(e) = app.reload() {
-                app.error(e);
-            } else {
-                app.status = Some(("Reloaded".into(), false));
-            }
-        }
+        KeyCode::Char('r') => gate(app, Gated::Reload),
         KeyCode::Char('i') => {
             let default = app.workspace_dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             app.modal = Modal::Input { title: " init — project name (Enter to confirm) ", value: default };
         }
-        KeyCode::Char('c') => run_config(app),
+        KeyCode::Char('c') => gate(app, Gated::Config),
         KeyCode::Char('f') => gate(app, Gated::Fill),
         KeyCode::Char('s') => gate(app, Gated::Sync { global: false }),
         KeyCode::Char('S') => gate(app, Gated::Sync { global: true }),
@@ -400,7 +450,7 @@ fn step(app: &mut App, delta: i32) {
 /// Runs a gated action directly while this terminal's session is live (the
 /// check renews it); otherwise asks for the master password first.
 fn gate(app: &mut App, purpose: Gated) {
-    match client::session_alive() {
+    match app.api.session_alive() {
         Ok(true) => run_gated(app, purpose),
         Ok(false) => app.modal = Modal::Password { purpose, input: String::new(), error: None },
         Err(e) => app.error(e),
@@ -408,7 +458,7 @@ fn gate(app: &mut App, purpose: Gated) {
 }
 
 fn submit_password(app: &mut App, purpose: Gated, pw: &str) {
-    if let Err(e) = client::authenticate(pw) {
+    if let Err(e) = app.api.authenticate(pw) {
         app.modal = Modal::Password { purpose, input: String::new(), error: Some(e.to_string()) };
         return;
     }
@@ -417,27 +467,31 @@ fn submit_password(app: &mut App, purpose: Gated, pw: &str) {
 }
 
 fn run_gated(app: &mut App, purpose: Gated) {
-    match purpose {
+    match purpose.clone() {
         Gated::Login => {
             if let Err(e) = app.reload() {
-                app.error(e);
+                app.fail(e, purpose);
             }
         }
+        Gated::Reload => match app.reload() {
+            Ok(()) => app.status = Some(("Reloaded".into(), false)),
+            Err(e) => app.fail(e, purpose),
+        },
         Gated::Reveal => {
             let rows = app.rows();
             let Some(row) = app.var_state.selected().and_then(|i| rows.get(i)) else { return };
-            match client::reveal_item(row.item_id) {
+            match app.api.reveal_item(row.item_id) {
                 Ok(value) => app.modal = Modal::Reveal { key: row.key.clone(), value },
-                Err(e) => app.error(e),
+                Err(e) => app.fail(e, purpose),
             }
         }
-        Gated::Fill => match workspace(app).and_then(|ws| fill::execute(&ws, None)) {
+        Gated::Fill => match workspace(app).and_then(|ws| fill::execute(&*app.api, &ws, None)) {
             Ok(r) => {
                 let mut lines: Vec<(String, Color)> = r.lines.into_iter().map(|l| (l, TX)).collect();
                 lines.extend(r.examples.into_iter().map(|e| (format!("wrote {}", e.display()), TX2)));
                 app.report("fill", lines);
             }
-            Err(e) => app.error(e),
+            Err(e) => app.fail(e, purpose),
         },
         Gated::Sync { global } => {
             let result = workspace(app).and_then(|ws| {
@@ -455,9 +509,26 @@ fn run_gated(app: &mut App, purpose: Gated) {
                     app.report(if global { "sync --global" } else { "sync" }, lines);
                     let _ = app.reload();
                 }
-                Err(e) => app.error(e),
+                Err(e) => app.fail(e, purpose),
             }
         }
+        Gated::Config => run_config(app, false),
+        Gated::ConfigPush => run_config(app, true),
+        Gated::Init { name } => {
+            let dir = app.workspace_dir.clone();
+            match init::check(&*app.api, &dir, Some(&name)) {
+                Ok(init::Existing::Adopt { lines, .. }) => {
+                    app.modal = Modal::Confirm {
+                        title: " init — bind existing project to this directory? ".into(),
+                        lines,
+                        then: Gated::InitAdopt { name },
+                    };
+                }
+                Ok(_) => run_init(app, &name, false),
+                Err(e) => app.fail(e, purpose),
+            }
+        }
+        Gated::InitAdopt { name } => run_init(app, &name, true),
     }
 }
 
@@ -474,9 +545,9 @@ fn workspace(app: &App) -> Result<scope::Workspace, CliError> {
     scope::load_config(&path)
 }
 
-fn run_init(app: &mut App, name: &str) {
+fn run_init(app: &mut App, name: &str, adopt_confirmed: bool) {
     let dir = app.workspace_dir.clone();
-    match init::execute(&dir, Some(name), None) {
+    match init::execute(&*app.api, &dir, Some(name), None, adopt_confirmed) {
         Ok(r) => {
             let verb = if r.created { "created" } else { "linked" };
             app.report(
@@ -488,15 +559,38 @@ fn run_init(app: &mut App, name: &str) {
             );
             let _ = app.reload();
         }
-        Err(e) => app.error(e),
+        Err(e) => app.fail(e, Gated::Init { name: name.to_string() }),
     }
 }
 
-fn run_config(app: &mut App) {
-    let result = workspace(app).and_then(|ws| match ws.manifest.clone() {
-        Some(m) => config::execute(&ws.root, &ws.config_path, &m),
+/// `config`. Unconfirmed, a secret-routing change opens the confirm modal
+/// instead of being applied; `confirmed` (the user pressed `y`) applies it.
+fn run_config(app: &mut App, confirmed: bool) {
+    let purpose = if confirmed { Gated::ConfigPush } else { Gated::Config };
+    let loaded = workspace(app).and_then(|ws| match ws.manifest.clone() {
+        Some(m) => Ok((ws, m)),
         None => Err(CliError::Config("legacy crypt-env.json — press `i` to init".into())),
     });
+    let (ws, m) = match loaded {
+        Ok(v) => v,
+        Err(e) => return app.fail(e, purpose),
+    };
+    let result = if confirmed {
+        config::execute_confirmed(&*app.api, &ws.root, &ws.config_path, &m)
+    } else {
+        match config::prepare(&*app.api, &ws.root, &ws.config_path, &m, false) {
+            Ok(prep) if prep.needs_consent() => {
+                app.modal = Modal::Confirm {
+                    title: " config — apply these changes to the vault? ".into(),
+                    lines: prep.diff_lines(&m.project.name),
+                    then: Gated::ConfigPush,
+                };
+                return;
+            }
+            Ok(prep) => config::apply(&*app.api, &ws.root, &m, &prep),
+            Err(e) => Err(e),
+        }
+    };
     match result {
         Ok(config::Outcome::Pushed { untracked_envs, .. }) => {
             let mut lines = vec![("vault updated from .crypt-env.yaml".to_string(), TX)];
@@ -508,7 +602,7 @@ fn run_config(app: &mut App) {
         }
         Ok(config::Outcome::Pulled) => app.report("config", vec![(".crypt-env.yaml updated from the vault".into(), TX)]),
         Ok(config::Outcome::InSync) => app.report("config", vec![("already in sync".into(), TX)]),
-        Err(e) => app.error(e),
+        Err(e) => app.fail(e, purpose),
     }
 }
 
@@ -609,10 +703,13 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
             let r = centered(area, 60, 7);
             let what = match purpose {
                 Gated::Login => "open a session in this terminal",
+                Gated::Reload => "reload vault data",
                 Gated::Reveal => "reveal this value",
                 Gated::Fill => "fill .env files",
                 Gated::Sync { global: false } => "sync .env.example",
                 Gated::Sync { global: true } => "sync --global",
+                Gated::Config | Gated::ConfigPush => "sync .crypt-env.yaml",
+                Gated::Init { .. } | Gated::InitAdopt { .. } => "init this project",
             };
             let mut lines = vec![
                 Line::from(Span::styled(format!("Master password to {what}:"), Style::default().fg(TX2))),
@@ -624,6 +721,15 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled("Enter confirm · Esc cancel", Style::default().fg(TX3))));
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(lines).block(modal_block(" password ", ACCENT)).wrap(Wrap { trim: true }), r);
+        }
+        Modal::Confirm { title, lines, .. } => {
+            let h = (lines.len() as u16 + 3).min(area.height.saturating_sub(2));
+            let r = centered(area, 96, h);
+            let mut body: Vec<Line> =
+                lines.iter().map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(TX)))).collect();
+            body.push(Line::from(Span::styled("y apply · n/Esc cancel", Style::default().fg(WARN))));
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(body).block(modal_block(title, WARN)).wrap(Wrap { trim: false }), r);
         }
         Modal::Input { title, value } => {
             let r = centered(area, 60, 5);
@@ -670,12 +776,12 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 ("/", "filter variables (regex, or %substring)"),
                 ("v", "reveal value (master password)"),
                 ("i", "init: register this directory as a project"),
-                ("c", "config: sync .crypt-env.yaml ⇄ vault"),
+                ("c", "config: sync .crypt-env.yaml ⇄ vault (path changes ask first)"),
                 ("f", "fill .env + .env.example (master password)"),
                 ("s / S", "sync from .env.example / with --global (master password)"),
                 ("d", "doctor diagnostics"),
                 ("r", "reload"),
-                ("q", "quit"),
+                ("q / Ctrl+C", "quit"),
             ];
             let r = centered(area, 76, rows.len() as u16 + 3);
             let body: Vec<Line> = rows
@@ -689,6 +795,153 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 .collect();
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(body).block(modal_block(" help ", ACCENT)), r);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::scope::manifest;
+    use crate::testing::{env, project, FakeVault};
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn app_with(vault: FakeVault, dir: &std::path::Path) -> App {
+        App::new(dir.to_path_buf(), Box::new(vault))
+    }
+
+    fn password_purpose(app: &App) -> Option<Gated> {
+        match &app.modal {
+            Modal::Password { purpose, .. } => Some(purpose.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expired_session_opens_the_password_modal_for_reload_config_and_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FakeVault::new(vec![]);
+        vault.alive.set(false);
+        let mut app = app_with(vault, dir.path());
+
+        handle_key(&mut app, key('r'));
+        assert!(password_purpose(&app) == Some(Gated::Reload));
+        app.modal = Modal::None;
+
+        handle_key(&mut app, key('c'));
+        assert!(password_purpose(&app) == Some(Gated::Config));
+        app.modal = Modal::None;
+
+        handle_key(&mut app, key('i'));
+        assert!(matches!(app.modal, Modal::Input { .. }));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(password_purpose(&app), Some(Gated::Init { .. })));
+    }
+
+    #[test]
+    fn session_required_from_the_client_opens_the_password_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(FakeVault::new(vec![]), dir.path());
+        app.fail(CliError::SessionRequired, Gated::Fill);
+        assert!(password_purpose(&app) == Some(Gated::Fill));
+        app.fail(CliError::VaultLocked, Gated::Fill);
+        assert!(matches!(app.modal, Modal::Report { .. }));
+    }
+
+    #[test]
+    fn ctrl_c_and_q_quit_and_other_ctrl_keys_are_not_plain_letters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(FakeVault::new(vec![]), dir.path());
+
+        // Ctrl+C must not run `config` (it is not a plain `c`).
+        handle_key(&mut app, ctrl('r'));
+        handle_key(&mut app, ctrl('f'));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(!app.quit);
+
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit);
+        assert!(matches!(app.modal, Modal::None));
+
+        let mut app = app_with(FakeVault::new(vec![]), dir.path());
+        app.modal = Modal::Password { purpose: Gated::Fill, input: "secret".into(), error: None };
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit, "Ctrl+C exits even from a modal");
+
+        let mut app = app_with(FakeVault::new(vec![]), dir.path());
+        handle_key(&mut app, key('q'));
+        assert!(app.quit);
+    }
+
+    /// A workspace whose manifest adds `apps/web/.env`; the vault project is
+    /// bound to the directory, so only the path diff needs consent.
+    fn config_fixture() -> (tempfile::TempDir, FakeVault) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "project:\n  name: app\n  environments:\n    - {name: default, isDefault: true, paths: ['.env', 'apps/web/.env']}\n";
+        std::fs::write(dir.path().join(manifest::FILE_NAME), yaml).unwrap();
+        let host = crate::paths::to_host(dir.path());
+        let vault = FakeVault::new(vec![project("app", Some(&host), vec![env(1, "default", true, &[".env"])])]);
+        (dir, vault)
+    }
+
+    #[test]
+    fn config_path_change_opens_a_confirm_modal_and_applies_only_on_y() {
+        let (dir, vault) = config_fixture();
+        let mut app = app_with(vault, dir.path());
+
+        handle_key(&mut app, key('c'));
+        match &app.modal {
+            Modal::Confirm { lines, then, .. } => {
+                assert!(lines.iter().any(|l| l.contains("apps/web/.env")), "{lines:?}");
+                assert!(*then == Gated::ConfigPush);
+            }
+            _ => panic!("expected the confirm modal"),
+        }
+        assert!(app.api.session_alive().is_ok());
+
+        // `n` cancels: nothing written.
+        handle_key(&mut app, key('n'));
+        assert!(matches!(app.modal, Modal::None));
+
+        handle_key(&mut app, key('c'));
+        handle_key(&mut app, key('y'));
+        assert!(matches!(app.modal, Modal::Report { .. }), "applied and reported");
+    }
+
+    #[test]
+    fn config_confirm_is_gated_again_when_the_session_lapsed() {
+        let (dir, vault) = config_fixture();
+        let alive = vault.alive.clone();
+        let mut app = app_with(vault, dir.path());
+        handle_key(&mut app, key('c'));
+        assert!(matches!(app.modal, Modal::Confirm { .. }));
+
+        // The session expires while the diff is on screen: `y` must ask for
+        // the password rather than prompting on the terminal.
+        alive.set(false);
+        handle_key(&mut app, key('y'));
+        assert!(password_purpose(&app) == Some(Gated::ConfigPush));
+    }
+
+    #[test]
+    fn config_root_mismatch_is_an_error_without_relink_offer() {
+        let (dir, _) = config_fixture();
+        let vault = FakeVault::new(vec![project("app", Some("/home/u/elsewhere"), vec![env(1, "default", true, &[".env"])])]);
+        let mut app = app_with(vault, dir.path());
+        handle_key(&mut app, key('c'));
+        match &app.modal {
+            Modal::Report { title, lines } => {
+                assert_eq!(title, "Error");
+                assert!(lines[0].0.contains("/home/u/elsewhere"), "{:?}", lines[0].0);
+            }
+            _ => panic!("expected an error report"),
         }
     }
 }

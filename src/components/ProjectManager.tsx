@@ -1558,6 +1558,9 @@ export function ProjectManager() {
       targets = picked ?? undefined;
     }
     const preview = await previewInject(id, targets);
+    if (preview.symlinks.length > 0) {
+      throw new Error(`Refusing to write through a symlink: ${preview.symlinks.join(', ')}. Point the environment at the real file instead.`);
+    }
     if (preview.foreign.length === 0) return inject(id, false, targets);
     return new Promise<InjectResult>((resolve, reject) => {
       pendingInjectRef.current = { resolve, reject };

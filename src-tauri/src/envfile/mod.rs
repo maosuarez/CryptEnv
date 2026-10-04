@@ -37,6 +37,9 @@ pub const TARGET_EXISTS_PREFIX: &str = "refusing to overwrite existing file not 
 /// Leading text of the message surfaced as a `409 BACKUP_EXISTS`.
 pub const BACKUP_EXISTS_PREFIX: &str = "backup already exists, refusing to overwrite it:";
 
+/// Leading text of the message surfaced as a `409 TARGET_SYMLINK`.
+pub const SYMLINK_PREFIX: &str = "refusing to write through a symlink:";
+
 /// Classification of a resolved write target. `Foreign` deliberately
 /// carries no content — a file crypt-env doesn't own is never inspected
 /// beyond "is it ours", so its bytes can never leak into an error message.
@@ -51,6 +54,9 @@ pub enum Target {
     /// A file exists but was not created by crypt-env — an unrelated file,
     /// or one whose marker the user removed.
     Foreign,
+    /// The final path component is a symlink (or a Windows reparse point).
+    /// Never read through and never written: secrets must not follow a link.
+    Symlink,
 }
 
 /// Whether the written file should be created at owner-only permissions
@@ -85,6 +91,8 @@ pub struct Committed {
 pub enum EnvFileError {
     TargetExists(PathBuf),
     BackupExists(PathBuf),
+    /// The target is a symlink / reparse point; nothing was written.
+    Symlink(PathBuf),
     Io(PathBuf, io::ErrorKind),
 }
 
@@ -95,6 +103,7 @@ impl fmt::Display for EnvFileError {
                 write!(f, "{}", refuse_message(std::slice::from_ref(path)))
             }
             EnvFileError::BackupExists(path) => write!(f, "{}", backup_exists_message(path)),
+            EnvFileError::Symlink(path) => write!(f, "{}", symlink_message(path)),
             EnvFileError::Io(path, kind) => {
                 write!(f, "io error on {}: {kind:?}", path.display())
             }
@@ -122,6 +131,14 @@ pub fn refuse_message(paths: &[PathBuf]) -> String {
     )
 }
 
+/// The exact "target is a symlink" message. Names only the path.
+pub fn symlink_message(path: &Path) -> String {
+    format!(
+        "{SYMLINK_PREFIX} {}\n — point the environment at the real file instead of a link",
+        path.display()
+    )
+}
+
 /// The exact "a previous `.bak` already exists" message.
 pub fn backup_exists_message(path: &Path) -> String {
     format!("{BACKUP_EXISTS_PREFIX} {}", path.display())
@@ -145,6 +162,23 @@ fn is_managed(content: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Symlink on every platform; on Windows also any other reparse point
+/// (junctions, mount points).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 fn bak_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".bak");
@@ -154,6 +188,14 @@ fn bak_path(path: &Path) -> PathBuf {
 /// Classifies a resolved write target. Never touches its contents beyond
 /// what is needed to decide `Managed` vs `Foreign`.
 pub fn inspect(path: &Path) -> Result<Target, EnvFileError> {
+    // `symlink_metadata` does not follow the final component, so a link is
+    // reported as such instead of being read through.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_link(&meta) => return Ok(Target::Symlink),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Target::Absent),
+        Err(e) => return Err(EnvFileError::Io(path.to_path_buf(), e.kind())),
+    }
     match std::fs::read_to_string(path) {
         Ok(content) if is_managed(&content) => Ok(Target::Managed(content)),
         // Content deliberately dropped here — a `Foreign` file's bytes are
@@ -180,6 +222,11 @@ pub fn commit(
     opts: &WriteOptions,
 ) -> Result<Committed, EnvFileError> {
     let target = inspect(path)?;
+    if matches!(target, Target::Symlink) {
+        // Checked before the `.bak` step: a backup must never be copied
+        // through a link either.
+        return Err(EnvFileError::Symlink(path.to_path_buf()));
+    }
     let pre_existed = !matches!(target, Target::Absent);
 
     let mut backup: Option<PathBuf> = None;
@@ -226,13 +273,13 @@ pub fn commit(
     Ok(Committed { pre_existed, backup })
 }
 
-/// Creates (or truncates) `path` at open time with the requested mode —
-/// not write-then-`chmod`, which leaves a window where a secret file exists
-/// at umask permissions and, if the `chmod` fails, returns `Err` after the
-/// target is already truncated with no guard armed.
-fn write_with_mode(path: &Path, content: &str, mode: FileMode) -> Result<(), EnvFileError> {
+/// Opens `path` for create+truncate at the requested mode without ever
+/// following a symlink at the final component. Unix: `O_NOFOLLOW` (race-free,
+/// `ELOOP` becomes `EnvFileError::Symlink`). Windows: `symlink_metadata`
+/// immediately before the open; reparse points are refused (a small TOCTOU
+/// window remains, see the harden-cli-manifest-and-sessions design).
+pub fn open_nofollow(path: &Path, mode: FileMode) -> Result<std::fs::File, EnvFileError> {
     use std::fs::OpenOptions;
-    use std::io::Write as _;
 
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -240,14 +287,38 @@ fn write_with_mode(path: &Path, content: &str, mode: FileMode) -> Result<(), Env
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
         if matches!(mode, FileMode::Private0600) {
             options.mode(0o600);
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if is_link(&meta) {
+                return Err(EnvFileError::Symlink(path.to_path_buf()));
+            }
+        }
+    }
 
-    let mut file = options
-        .open(path)
-        .map_err(|e| EnvFileError::Io(path.to_path_buf(), e.kind()))?;
+    options.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return EnvFileError::Symlink(path.to_path_buf());
+        }
+        EnvFileError::Io(path.to_path_buf(), e.kind())
+    })
+}
+
+/// Creates (or truncates) `path` at open time with the requested mode —
+/// not write-then-`chmod`, which leaves a window where a secret file exists
+/// at umask permissions and, if the `chmod` fails, returns `Err` after the
+/// target is already truncated with no guard armed.
+fn write_with_mode(path: &Path, content: &str, mode: FileMode) -> Result<(), EnvFileError> {
+    use std::io::Write as _;
+
+    let mut file = open_nofollow(path, mode)?;
     file.write_all(content.as_bytes())
         .map_err(|e| EnvFileError::Io(path.to_path_buf(), e.kind()))?;
 
@@ -459,5 +530,42 @@ mod tests {
         let path = dir.path().join("noop");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"x").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_target_is_refused_and_nothing_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        write_file(&victim, "important: config\n");
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        assert_eq!(inspect(&link).unwrap(), Target::Symlink);
+
+        let marker = marker_line("p", "e");
+        for overwrite in [false, true] {
+            let opts = WriteOptions { overwrite, mode: FileMode::Private0600 };
+            let err = commit(&link, "KEY=1", &marker, &opts).unwrap_err();
+            assert!(matches!(err, EnvFileError::Symlink(p) if p == link));
+        }
+        assert_eq!(read_file(&victim), b"important: config\n");
+        assert_eq!(std::fs::read_link(&link).unwrap(), victim);
+        assert!(!bak_path(&link).exists(), "no .bak from a symlink");
+        assert!(!bak_path(&victim).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_target_is_refused_without_creating_its_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("not-yet.txt");
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&dest, &link).unwrap();
+
+        let marker = marker_line("p", "e");
+        let opts = WriteOptions { overwrite: true, mode: FileMode::Inherit };
+        assert!(matches!(commit(&link, "KEY=1", &marker, &opts), Err(EnvFileError::Symlink(_))));
+        assert!(!dest.exists());
     }
 }

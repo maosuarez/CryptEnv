@@ -128,6 +128,8 @@ pub struct InjectResult {
 pub struct InjectPreview {
     pub paths: Vec<String>,
     pub foreign: Vec<String>,
+    /// Targets that are symlinks; injecting into them is refused.
+    pub symlinks: Vec<String>,
 }
 
 /// Where a write-target path came from, for gating purposes (§4.4 of the
@@ -380,12 +382,16 @@ pub fn validate_root_path(root: &str) -> Result<String, String> {
     Ok(if trimmed.is_empty() || trimmed.ends_with(':') { root.to_string() } else { trimmed.to_string() })
 }
 
+fn is_absolute_config_path(path: &str) -> bool {
+    Path::new(path).is_absolute() || path.starts_with("\\\\")
+}
+
 /// Resolves one configured environment path to the path actually written.
 /// Absolute paths are returned unchanged (legacy behavior). Relative paths
 /// (`.env`, `apps/api/.env`, `./x`, either separator) are joined onto the
 /// project `root`; they may not climb out of it (`..`) and require a root.
 pub fn resolve_env_path(root: Option<&str>, path: &str) -> Result<String, String> {
-    if Path::new(path).is_absolute() || path.starts_with("\\\\") {
+    if is_absolute_config_path(path) {
         return Ok(path.to_string());
     }
     let root = root.ok_or_else(|| {
@@ -639,7 +645,17 @@ async fn resolve_and_inspect(
     let root = if configured.is_empty() { None } else { db.get_project_root(env.project_id).await? };
     let mut resolved: Vec<(String, PathOrigin)> = Vec::with_capacity(configured.len());
     for p in configured {
-        let r = resolve_env_path(root.as_deref(), p)?;
+        let mut r = resolve_env_path(root.as_deref(), p)?;
+        // A relative path must stay inside the root even through symlinked
+        // directories. Absolute paths are the owner's explicit choice and
+        // keep their location (the final component is still no-follow).
+        if !is_absolute_config_path(p) {
+            if let Some(root) = root.as_deref() {
+                let contained = crate::fsguard::contain_relative(Path::new(root), p)
+                    .map_err(|e| format!("path '{p}' must stay inside the project root ({e})"))?;
+                r = contained.to_string_lossy().into_owned();
+            }
+        }
         if !resolved.iter().any(|(existing, _)| existing == &r) {
             resolved.push((r, PathOrigin::Configured));
         }
@@ -691,7 +707,13 @@ pub async fn inject_environment_preview(
         .map(|(p, _)| p.clone())
         .collect();
 
-    Ok(InjectPreview { paths, foreign })
+    let symlinks: Vec<String> = resolved
+        .iter()
+        .filter(|(p, _)| matches!(inspected.get(p), Some(envfile::Target::Symlink)))
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    Ok(InjectPreview { paths, foreign, symlinks })
 }
 
 /// Decrypt referenced vault items and write KEY=VALUE pairs into every path
@@ -731,6 +753,14 @@ pub async fn inject_environment(
     }
 
     // Phase 2 — gate, strictly before any decryption or write.
+    // A symlink target is refused outright (never overridable by
+    // `overwrite`), so nothing is written for any path of this environment.
+    if let Some((path, _)) = resolved
+        .iter()
+        .find(|(p, _)| matches!(cached.get(p), Some(envfile::Target::Symlink)))
+    {
+        return Err(envfile::symlink_message(Path::new(path)));
+    }
     let mut refused: Vec<PathBuf> = Vec::new();
     let mut unmanaged: Vec<String> = Vec::new();
     for (path, origin) in &resolved {
@@ -837,7 +867,9 @@ pub async fn inject_environment(
                 }
                 done.push(path.clone());
             }
-            Err(e @ envfile::EnvFileError::BackupExists(_)) | Err(e @ envfile::EnvFileError::TargetExists(_)) => {
+            Err(e @ envfile::EnvFileError::BackupExists(_))
+            | Err(e @ envfile::EnvFileError::TargetExists(_))
+            | Err(e @ envfile::EnvFileError::Symlink(_)) => {
                 // Keep the bare message so `err.starts_with(BACKUP_EXISTS_PREFIX
                 // | TARGET_EXISTS_PREFIX)` still matches in the HTTP handler
                 // and this maps to 409, not the generic 500 below.
@@ -1003,22 +1035,36 @@ pub async fn project_check_root(root: String) -> Result<RootCheck, String> {
 /// (same serializer as `crypt-env init`/`config`). Refuses to replace an
 /// existing file unless `overwrite`; that refusal is the stable error
 /// `"manifest exists"` so the GUI can offer overwrite / link.
+///
+/// Split in two so callers can drop the vault lock between the steps:
+/// [`load_manifest_source`] reads vault state, [`write_manifest_at`] is pure
+/// filesystem I/O (a `\\wsl.localhost` root can stall it for a long time).
 pub async fn write_project_manifest(db: &VaultDb, project_id: i64, overwrite: bool) -> Result<String, String> {
+    let (project, root) = load_manifest_source(db, project_id).await?;
+    write_manifest_at(&root, &project, overwrite)
+}
+
+/// Vault-state half of [`write_project_manifest`]: the project and its root.
+pub async fn load_manifest_source(db: &VaultDb, project_id: i64) -> Result<(Project, PathBuf), String> {
     let project = list_projects(db)
         .await?
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("project not found")?;
     let root = project.root_path.clone().ok_or("project has no root directory")?;
-    let dir = PathBuf::from(&root);
+    Ok((project, PathBuf::from(root)))
+}
+
+/// Filesystem half of [`write_project_manifest`]. Touches no vault state.
+pub fn write_manifest_at(dir: &Path, project: &Project, overwrite: bool) -> Result<String, String> {
     if !dir.is_dir() {
         return Err("root directory does not exist".into());
     }
     if dir.join(manifest::FILE_NAME).exists() && !overwrite {
         return Err("manifest exists".into());
     }
-    let m = manifest::from_project(&project, &|p| p.to_string());
-    let path = manifest::write_file(&dir, &m)?;
+    let m = manifest::from_project(project, &|p| p.to_string());
+    let path = manifest::write_file(dir, &m)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1028,8 +1074,15 @@ pub async fn project_write_yaml(
     project_id: i64,
     overwrite: bool,
 ) -> Result<String, String> {
-    let s = state.lock().await;
-    write_project_manifest(&s.db, project_id, overwrite).await
+    // The vault lock covers only the DB read; the guard is dropped before any
+    // filesystem call, which runs on a blocking thread.
+    let (project, root) = {
+        let s = state.lock().await;
+        load_manifest_source(&s.db, project_id).await?
+    };
+    tokio::task::spawn_blocking(move || write_manifest_at(&root, &project, overwrite))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ─── Export / Import ──────────────────────────────────────────────────────────
@@ -1062,12 +1115,16 @@ pub struct ExportedProject {
 
 #[tauri::command]
 pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> Result<(), String> {
-    let s = state.lock().await;
-    let project = list_projects(&s.db)
-        .await?
-        .into_iter()
-        .find(|p| p.id == project_id)
-        .ok_or("project not found")?;
+    // Lock only for the DB read: the save dialog and the file write below
+    // must not run under the vault lock.
+    let project = {
+        let s = state.lock().await;
+        list_projects(&s.db)
+            .await?
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or("project not found")?
+    };
 
     let exported = ExportedProject {
         version: 1,
@@ -1108,7 +1165,10 @@ pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> R
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "cancelled".to_string())?;
 
-    std::fs::write(&path, &json).map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &json))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1721,5 +1781,54 @@ mod tests {
             let env = resolve_environment(&db, None, Some("demo"), Some(name)).await.unwrap();
             assert_eq!(env.id, env_id);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_rejects_relative_path_through_symlinked_directory() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let project_id = db.get_environment(env_id).await.unwrap().unwrap().project_id;
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("config")).unwrap();
+        db.set_project_root(project_id, root.to_str()).await.unwrap();
+        db.set_environment_paths(env_id, &["config/.env".to_string()]).await.unwrap();
+
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
+        assert!(err.contains("must stay inside the project root"), "got: {err}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside the root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_refuses_symlink_target_and_writes_nothing() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let plain = dir.path().join("plain.env");
+        db.set_environment_paths(
+            env_id,
+            &[plain.to_str().unwrap().to_string(), link.to_str().unwrap().to_string()],
+        )
+        .await
+        .unwrap();
+
+        let preview = inject_environment_preview(&db, env_id, None).await.unwrap();
+        assert_eq!(preview.symlinks, vec![link.to_str().unwrap().to_string()]);
+
+        for overwrite in [false, true] {
+            let err = inject_environment(&db, &key, env_id, None, None, overwrite, None).await.unwrap_err();
+            assert!(err.starts_with(envfile::SYMLINK_PREFIX), "got: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!plain.exists(), "no path is written when any target is a symlink");
     }
 }

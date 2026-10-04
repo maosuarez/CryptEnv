@@ -46,6 +46,8 @@ struct Session {
     expires: Instant,
     ttl: Duration,
     last_used: Instant,
+    /// Vault lock epoch at issue time; a session is dead once it differs.
+    epoch: u64,
 }
 
 /// Upper bound on concurrently live sessions; the least recently used one
@@ -60,19 +62,21 @@ fn session_ttl(minutes: u64) -> Duration {
 }
 
 impl SessionStore {
-    fn insert(&mut self, token: String, ttl: Duration, now: Instant) {
+    fn insert(&mut self, token: String, ttl: Duration, now: Instant, epoch: u64) {
         self.entries.retain(|e| e.expires > now);
         if self.entries.len() >= MAX_SESSIONS {
             if let Some(i) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].last_used) {
                 self.entries.swap_remove(i);
             }
         }
-        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now });
+        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now, epoch });
     }
 
-    /// `true` when `provided` is a live session; renews it. Every entry is
+    /// `true` when `provided` is a live session of the current lock `epoch`;
+    /// renews it. Entries from an older epoch are dropped. Every entry is
     /// compared in constant time (no early exit on a match).
-    fn touch(&mut self, provided: &str, now: Instant) -> bool {
+    fn touch(&mut self, provided: &str, now: Instant, epoch: u64) -> bool {
+        self.entries.retain(|e| e.epoch == epoch);
         let mut hit: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if bool::from(e.token.as_bytes().ct_eq(provided.as_bytes())) && now < e.expires {
@@ -221,6 +225,9 @@ fn err_envfile(e: envfile::EnvFileError) -> axum::response::Response {
         envfile::EnvFileError::BackupExists(_) => {
             err_json(StatusCode::CONFLICT, &e.to_string(), "BACKUP_EXISTS").into_response()
         }
+        envfile::EnvFileError::Symlink(_) => {
+            err_json(StatusCode::CONFLICT, &e.to_string(), "TARGET_SYMLINK").into_response()
+        }
         envfile::EnvFileError::Io(..) => {
             err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot write file: {e}"), "INTERNAL_ERROR")
                 .into_response()
@@ -236,10 +243,19 @@ async fn verify_token(headers: &HeaderMap, state: &ApiState) -> Result<(), Statu
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // --- Verificar session token (expiración deslizante) ---
-    if state.sessions.lock().await.touch(provided, Instant::now()) {
+    // Lock state first: a locked vault must never renew (or drop) a session.
+    // The vault lock is released before `sessions` is taken (never nested).
+    let epoch = {
         let vault = state.vault.lock().await;
-        return if vault.key.is_some() { Ok(()) } else { Err(StatusCode::FORBIDDEN) };
+        if vault.key.is_none() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        vault.epoch
+    };
+
+    // --- Verificar session token (expiración deslizante, misma época) ---
+    if state.sessions.lock().await.touch(provided, Instant::now(), epoch) {
+        return Ok(());
     }
 
     // --- Fallback: MCP token estático (sin expiración) ---
@@ -636,7 +652,7 @@ async fn handle_unlock(
         }
     };
 
-    vault.key = Some(Zeroizing::new(key));
+    vault.set_key(Some(Zeroizing::new(key)));
 
     if let Err(e) = crate::vault::migrate_literal_vars_to_items(&vault.db, &key).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
@@ -648,6 +664,7 @@ async fn handle_unlock(
         _ => 5,
     };
 
+    let epoch = vault.epoch;
     drop(vault);
 
     // Generar token de sesión: 16 bytes = 32 chars hex
@@ -659,7 +676,7 @@ async fn handle_unlock(
         .sessions
         .lock()
         .await
-        .insert(session_token.clone(), session_ttl(minutes), Instant::now());
+        .insert(session_token.clone(), session_ttl(minutes), Instant::now(), epoch);
 
     (StatusCode::OK, Json(UnlockResponse { token: session_token })).into_response()
 }
@@ -1609,8 +1626,13 @@ impl Drop for TempEnvFile {
         // Use max(content_len, 1) so we always issue at least one write attempt
         // even if content_len is somehow zero. A zero pass is defense-in-depth,
         // not an erasure guarantee, on journaling/copy-on-write filesystems.
+        // Opened no-follow like the original write: a path swapped for a
+        // symlink since then is never written through.
         let zeros = vec![0u8; self.content_len.max(1)];
-        let _ = std::fs::write(&self.path, &zeros);
+        if let Ok(mut f) = envfile::open_nofollow(&self.path, envfile::FileMode::Inherit) {
+            use std::io::Write as _;
+            let _ = f.write_all(&zeros);
+        }
 
         if self.pre_existed {
             // The original bytes are already gone by this point (and
@@ -1619,7 +1641,7 @@ impl Drop for TempEnvFile {
             // deleting a path we did not create would destroy the inode,
             // its permissions and its existence, which callers may depend
             // on. Truncate to zero length instead of removing it.
-            let _ = std::fs::File::create(&self.path);
+            let _ = envfile::open_nofollow(&self.path, envfile::FileMode::Inherit);
         } else {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -2575,6 +2597,9 @@ async fn handle_inject_environment(
         }
         Err(e) if e.starts_with(envfile::BACKUP_EXISTS_PREFIX) => {
             err_json(StatusCode::CONFLICT, &e, "BACKUP_EXISTS").into_response()
+        }
+        Err(e) if e.starts_with(envfile::SYMLINK_PREFIX) => {
+            err_json(StatusCode::CONFLICT, &e, "TARGET_SYMLINK").into_response()
         }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
     }
