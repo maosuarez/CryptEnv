@@ -281,6 +281,7 @@
       "injected_other": "Injected {n} variables → {target}",
       "unmanaged_one": " (warning: {n} unmanaged path written, backup kept)",
       "unmanaged_other": " (warning: {n} unmanaged paths written, backup kept)",
+      "failedKeys": " (not written: {keys})",
       "keyRequired": "Key is required",
       "pickGlobalFirst": "Pick a global secret first",
       "environmentDuplicated": "Environment duplicated",

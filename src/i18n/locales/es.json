@@ -281,6 +281,7 @@
       "injected_other": "Se inyectaron {n} variables → {target}",
       "unmanaged_one": " (aviso: se escribió {n} ruta no administrada, se guardó respaldo)",
       "unmanaged_other": " (aviso: se escribieron {n} rutas no administradas, se guardó respaldo)",
+      "failedKeys": " (no escritas: {keys})",
       "keyRequired": "La clave es obligatoria",
       "pickGlobalFirst": "Primero elige un secreto global",
       "environmentDuplicated": "Entorno duplicado",

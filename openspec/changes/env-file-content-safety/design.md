@@ -33,6 +33,7 @@ fn serialize_value(v) -> String:
 The merge of existing managed lines replaces the whole line with `KEY=serialize(v)`. The crypt-env `.env` reader (`add .env`, `sync`) is updated to the same grammar, so its round trip holds (verified by a property test).
 
 *Compatibility matrix* (task 1.3 checks it with fixtures): python-dotenv, Node `dotenv` ≥16 (multiline double quotes), docker compose v2, and bash `source` for the single-quoted and bare forms.
+- *Results (task 1.3, `envfile::content_safety_tests::compat_fixture_*`, 2026-10-04, Linux/WSL):* python-dotenv (current pip release) and Node `dotenv` (current npm release) read bare, single-quoted, `'`-containing and multi-line PEM values back exactly. bash `set -a; . file` reads the bare and single-quoted forms exactly (values with spaces, `$` and `#` included); the double-quoted form is not shell-compatible by design (`\n` stays literal). docker compose v2 was not run (not installed).
 - Node `dotenv` does not unescape `\$`. Its behavior for `$` inside double quotes is documented as a limitation: values that contain both `$` and a newline or `'`.
 
 *Rejected:* always double-quote (breaks the bare-value expectations of some tools and changes every line); base64 (unreadable).

@@ -852,6 +852,10 @@ pub struct InjectResult {
     pub written: Vec<String>,
     #[serde(default)]
     pub backups: Vec<String>,
+    /// Keys the vault host could not write (undecryptable item or invalid
+    /// name). Names only.
+    #[serde(default, rename = "failedKeys")]
+    pub failed_keys: Vec<String>,
 }
 
 /// Materializes an environment into its configured target files (written by

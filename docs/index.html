@@ -622,6 +622,17 @@ grant execute on function relay_put(text,text), relay_claim(text), relay_schema_
       <li>Paths configured on the environment itself are always written through, with the same backup, and reported in <code>unmanagedPaths</code>. Relative configured paths resolve against the project's <code>rootPath</code> and may not leave it; a relative path on a project without a root is an error.</li>
       <li>Names derived from <code>output_dir</code> are contained to that directory (<code>422 PATH_NOT_CONTAINED</code> otherwise).</li>
       <li>A target whose final component is a symlink (or Windows reparse point) is refused with <code>409 TARGET_SYMLINK</code>; nothing is written and no <code>.bak</code> is made.</li>
+      <li>A target that exists but is not a regular file (device, FIFO, socket, directory) is refused with <code>409 NOT_REGULAR_FILE</code> without being read. An existing target is read for classification up to 1&nbsp;MiB; a larger file counts as foreign.</li>
+      <li>Writes are atomic: content goes to a <code>.cenv-*</code> temp file in the same directory (mode 0600 on Unix), is flushed, then renamed over the target. A failed write leaves the previous file intact and no temp file behind.</li>
+    </ul>
+    <h3 id="api-dotenv">Value quoting<a class="anchor" href="#api-dotenv">#</a></h3>
+    <p>Each variable is written as one <code>KEY=VALUE</code> line that common dotenv parsers read back exactly:</p>
+    <ul>
+      <li>Values made only of <code>A-Za-z0-9_./:@+,=-</code> are written bare.</li>
+      <li>Other values without a newline, carriage return or <code>'</code> are single-quoted (literal).</li>
+      <li>Everything else (multi-line values such as PEM keys, values containing <code>'</code>) is double-quoted with <code>\\</code>, <code>\"</code>, <code>\$</code>, <code>\n</code> and <code>\r</code> escaped.</li>
+      <li>Keys must match <code>^[A-Za-z_][A-Za-z0-9_.]*$</code>; other keys are not written. Inject also decrypts only the items the environment references. Keys that were not written (undecryptable item or invalid name) are listed by name in <code>failedKeys</code> of the inject response; the other keys are still written. <code>crypt-env fill</code> prints them.</li>
+      <li>Single-quoted and bare values also work with <code>source</code> in bash; double-quoted escapes are understood by python-dotenv and Node <code>dotenv</code>, not by the shell. Node <code>dotenv</code> does not unescape <code>\$</code>.</li>
     </ul>
     <p>Add <code>*.bak</code> to <code>.gitignore</code> wherever CryptEnv writes.</p>
 
