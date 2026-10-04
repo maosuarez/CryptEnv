@@ -22,6 +22,8 @@
 - [x] 3.2 Rename-first `wipe_and_reset` with WAL handling, shared connection options, zero+fsync+remove of the renamed files, and a startup sweep of `vault.db.wipe-*`. Verify with tests: a rename failure (simulated via a read-only dir on unix) keeps the DB usable; success leaves no `wipe-*` after the sweep.
 - [ ] 3.3 (implemented; move-aside naming unit-tested; the manual `pnpm tauri dev` corrupt-`vault.db` run and `app.restart()` check on Windows are still open) Add startup recovery mode: no `expect` on DB open; `RecoveryScreen` with move-aside (timestamped rename) and quit; restart after move-aside. Verify with a manual test that corrupts `vault.db` and launches (`pnpm tauri dev`), and with a unit test of the move-aside naming.
 
+- [x] 2.3 Lock screen distinguishes unlock failures: `UnlockError::gui_error` gives the Tauri `vault_unlock`/`biometric_unlock` stable codes (`unlock_throttled:<secs>`, `unlock_aborted`); the GUI shows a countdown with disabled submit for throttled, a neutral message for aborted, and keeps the shake for a wrong password. Verify with `src/lib/unlockError.test.ts` and `gui_error_codes_are_stable`.
+
 ## 4. Docs and verification
 
 - [x] 4.1 Document the `auto_lock_timeout` range, the throttle behavior (429 + Retry-After) and the recovery screen in `docs/index.html` / `docs/reference.md`. Verify by review.

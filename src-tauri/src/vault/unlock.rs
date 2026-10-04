@@ -172,6 +172,26 @@ impl UnlockError {
     }
 }
 
+impl UnlockError {
+    /// Error string for the Tauri unlock commands. Throttled and aborted carry
+    /// a stable machine-readable prefix the GUI classifies (`src/lib/unlockError.ts`);
+    /// everything else is the plain `message()`. The REST API is unaffected.
+    pub fn gui_error(&self) -> String {
+        match self {
+            UnlockError::Throttled(wait) => {
+                format!("{GUI_CODE_THROTTLED}{}", wait.as_secs().max(1))
+            }
+            UnlockError::Aborted => GUI_CODE_ABORTED.to_string(),
+            other => other.message(),
+        }
+    }
+}
+
+/// `unlock_throttled:<seconds>` prefix of [`UnlockError::gui_error`].
+pub const GUI_CODE_THROTTLED: &str = "unlock_throttled:";
+/// Exact `gui_error` string for [`UnlockError::Aborted`].
+pub const GUI_CODE_ABORTED: &str = "unlock_aborted";
+
 /// Result of the derivation phase.
 pub struct Derived {
     key: VaultKey,
@@ -526,6 +546,14 @@ mod tests {
         assert_eq!(backoff(6), Duration::from_secs(32));
         assert_eq!(backoff(7), Duration::from_secs(60));
         assert_eq!(backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn gui_error_codes_are_stable() {
+        assert_eq!(UnlockError::Throttled(Duration::from_millis(16_200)).gui_error(), "unlock_throttled:16");
+        assert_eq!(UnlockError::Throttled(Duration::from_millis(10)).gui_error(), "unlock_throttled:1");
+        assert_eq!(UnlockError::Aborted.gui_error(), "unlock_aborted");
+        assert_eq!(UnlockError::IncorrectPassword.gui_error(), crypto::INCORRECT_PASSWORD);
     }
 
     #[tokio::test]
