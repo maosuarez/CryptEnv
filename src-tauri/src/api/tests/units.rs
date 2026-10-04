@@ -197,3 +197,28 @@ fn environment_item_ids_is_empty_for_an_environment_with_no_vars() {
     let env = make_env(vec![]);
     assert!(environment_item_ids(&env).is_empty());
 }
+
+/// Internal errors must go through `internal_error()` (generic body plus a
+/// correlation id); echoing the raw error text in a 500 leaks SQL, schema and
+/// file paths.
+#[test]
+fn no_raw_error_echo_in_internal_error_responses() {
+    let sources = [
+        ("api/mod.rs", include_str!("../mod.rs")),
+        // exec_routes.rs is excluded on purpose: its `EXEC_FAILED` body carries
+        // `ExecError` text, which is sanitised by construction (never a path,
+        // command or value).
+        ("api/auth.rs", include_str!("../auth.rs")),
+        ("api/approvals.rs", include_str!("../approvals.rs")),
+        ("api/mcp_servers.rs", include_str!("../mcp_servers.rs")),
+    ];
+    for (name, src) in sources {
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in [
+            "err_json(StatusCode::INTERNAL_SERVER_ERROR,&e",
+            "err_json(StatusCode::INTERNAL_SERVER_ERROR,&format!",
+        ] {
+            assert!(!squashed.contains(needle), "{name} echoes a raw error: {needle}");
+        }
+    }
+}

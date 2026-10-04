@@ -184,3 +184,29 @@ async fn concurrent_updates_to_different_fields_are_both_kept() {
     assert_eq!(stored.value.as_deref(), Some("new-value"));
     assert_eq!(stored.description.as_deref(), Some("new-description"));
 }
+
+#[tokio::test]
+async fn delete_item_db_failure_returns_generic_error_with_correlation_id() {
+    let v = unlocked_vault().await;
+    let app = router(&v);
+    let id = v.item_ids[0];
+
+    // Force a database error whose text would name the table.
+    {
+        let state = v.state.lock().await;
+        sqlx::query("DROP TABLE environment_vars")
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+    }
+
+    let (status, json) = req(&app, "DELETE", &format!("/items/{id}"), Some(&v.token), None).await;
+    assert_eq!(status.as_u16(), 500);
+    assert_eq!(json.get("code").and_then(|c| c.as_str()), Some("INTERNAL_ERROR"));
+    assert_eq!(json.get("error").and_then(|c| c.as_str()), Some("internal error"));
+    let cid = json.get("id").and_then(|c| c.as_str()).expect("correlation id");
+    assert_eq!(cid.len(), 8);
+    assert!(cid.bytes().all(|b| b.is_ascii_hexdigit()));
+    let text = json.to_string();
+    assert!(!text.contains("environment_vars") && !text.contains("no such table"));
+}

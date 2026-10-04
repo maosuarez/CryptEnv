@@ -8,6 +8,7 @@ import { ImportModal } from './ImportModal';
 import { BackupModal } from './BackupModal';
 import { ReceiveModal } from './ReceiveModal';
 import { WslIntegrationSection } from './settings/WslIntegrationSection';
+import { ApiStatusBanner } from './settings/ApiStatusBanner';
 import { useVaultStore } from '../store';
 import { useSystemInfo } from '../hooks/useSystemInfo';
 import { useThemeStore, type Theme } from '../store/themeStore';
@@ -566,6 +567,7 @@ export function Settings() {
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto px-6 py-4 bg-surface">
+        <ApiStatusBanner />
         <Sec title={t('settings.sections.security')} />
         <Row icon="key" label={t('settings.rows.masterPassword')}>
           <button

@@ -879,5 +879,20 @@
       "skipped": "Comando crypt-env ignorado ({reason})",
       "unknownReason": "motivo desconhecido"
     }
+  },
+  "apiStatus": {
+    "title": "API REST INDISPONÍVEL",
+    "reason": {
+      "port_in_use": "A porta 47821 já está em uso por outro programa. Feche-o e reinicie o CryptEnv.",
+      "tls_error": "Não foi possível inicializar o certificado TLS.",
+      "bind_error": "O servidor não conseguiu associar o seu endereço.",
+      "server_error": "O servidor parou inesperadamente.",
+      "stopped": "O servidor está parado."
+    },
+    "impact": "A CLI, a TUI e o servidor MCP não conseguem acessar o cofre até que a API esteja em execução.",
+    "regenerate": "REGENERAR CERTIFICADO",
+    "regenerating": "REGENERANDO…",
+    "regenerated": "Certificado regenerado. Se você usa WSL, execute `crypt-env setup wsl` novamente para que ele confie no novo certificado.",
+    "regenerateFailed": "Não foi possível regenerar o certificado: {error}"
   }
 }
