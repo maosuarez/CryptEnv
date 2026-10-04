@@ -83,6 +83,9 @@ pub struct VaultState {
     /// reset, restore, re-key). REST sessions record the epoch they were issued
     /// in and are rejected once it moves on. In-memory only, not secret.
     pub epoch: u64,
+    /// LAN share session slot, shared by the Tauri commands and the REST API.
+    /// Lives here so locking the vault can cancel any session (and drop its key copy).
+    pub share: Arc<crate::share::ShareState>,
 }
 
 impl VaultState {
@@ -92,6 +95,7 @@ impl VaultState {
             key: None,
             last_activity: None,
             epoch: 0,
+            share: Arc::new(crate::share::ShareState::new()),
         }
     }
 
@@ -265,9 +269,15 @@ pub async fn vault_unlock(
 
 /// Internal lock used by both the Tauri command and the background auto-lock task.
 pub async fn lock_vault(shared: &SharedState) {
-    let mut s = shared.lock().await;
-    s.set_key(None);
-    s.last_activity = None;
+    let share = {
+        let mut s = shared.lock().await;
+        s.set_key(None);  // Bumps epoch via harden-cli's set_key method
+        s.last_activity = None;
+        s.share.clone()
+    };
+    // A share session holds its own copy of the vault key and may have a
+    // listener open; locking ends it.
+    crate::share::cancel_all(&share).await;
 }
 
 #[tauri::command]

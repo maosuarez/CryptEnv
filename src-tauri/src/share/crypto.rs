@@ -2,46 +2,149 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use x25519_dalek::{PublicKey, StaticSecret};
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
 use super::ShareError;
 
-/// Generate an ephemeral X25519 keypair.
-pub fn generate_keypair() -> (StaticSecret, PublicKey) {
-    let secret = StaticSecret::random_from_rng(rand::thread_rng());
-    let public = PublicKey::from(&secret);
-    (secret, public)
+type HmacSha256 = Hmac<Sha256>;
+
+// ─── LAN pairing: SPAKE2 + key confirmation ───────────────────────────────────
+
+/// Protocol identity, also used as the SPAKE2 identity and transcript prefix.
+const LAN_PROTOCOL_ID: &[u8] = b"cryptenv-lan-v2";
+const SESSION_KEY_INFO: &[u8] = b"cryptenv-lan-v2 session";
+const CONFIRM_KEY_INFO: &[u8] = b"cryptenv-lan-v2 confirm";
+
+/// Which end of the LAN pairing we are. Labels the key-confirmation MACs so a
+/// reflected MAC never verifies, and orders the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRole {
+    Sender,
+    Receiver,
 }
 
-/// Derive a 32-byte shared session key via X25519 + HKDF-SHA256.
-/// info = b"cryptenv-share-v1" ensures domain separation.
-pub fn derive_shared_key(
-    secret: &StaticSecret,
-    peer_pub: &PublicKey,
-) -> Zeroizing<[u8; 32]> {
-    let dh = secret.diffie_hellman(peer_pub);
-    let hk = Hkdf::<Sha256>::new(None, dh.as_bytes());
-    let mut okm = [0u8; 32];
-    hk.expand(b"cryptenv-share-v1", &mut okm)
-        .expect("HKDF expand with 32-byte output is always valid");
-    Zeroizing::new(okm)
+impl PairRole {
+    fn label(self) -> &'static [u8] {
+        match self {
+            PairRole::Sender => b"A",
+            PairRole::Receiver => b"B",
+        }
+    }
+
+    fn peer(self) -> PairRole {
+        match self {
+            PairRole::Sender => PairRole::Receiver,
+            PairRole::Receiver => PairRole::Sender,
+        }
+    }
 }
 
-/// Compute fingerprint: first 8 hex chars of SHA-256(sender_pub || receiver_pub).
-pub fn compute_fingerprint(sender_pub: &[u8; 32], receiver_pub: &[u8; 32]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(sender_pub);
-    hasher.update(receiver_pub);
-    let result = hasher.finalize();
-    // First 4 bytes = 8 hex chars
-    result[..4]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+/// First half of the SPAKE2 exchange: holds our state and the message to send.
+pub struct PakeStart {
+    state: Spake2<Ed25519Group>,
+    our_msg: Vec<u8>,
+    role: PairRole,
+}
+
+/// Result of a completed SPAKE2 exchange. The keys are only trustworthy after
+/// `verify_peer_confirmation` succeeds.
+pub struct PakeKeys {
+    pub session_key: Zeroizing<[u8; 32]>,
+    confirm_key: Zeroizing<[u8; 32]>,
+    transcript: Vec<u8>,
+    role: PairRole,
+}
+
+impl PakeStart {
+    /// Begin the exchange keyed by the pairing code (symmetric SPAKE2, Ed25519 group).
+    pub fn new(pairing_code: &str, role: PairRole) -> Self {
+        let (state, our_msg) = Spake2::<Ed25519Group>::start_symmetric(
+            &Password::new(pairing_code.as_bytes()),
+            &Identity::new(LAN_PROTOCOL_ID),
+        );
+        PakeStart { state, our_msg, role }
+    }
+
+    pub fn message(&self) -> &[u8] {
+        &self.our_msg
+    }
+
+    /// Combine with the peer's SPAKE2 message. A wrong pairing code does not
+    /// fail here; it yields different keys and is caught by key confirmation.
+    pub fn finish(self, peer_msg: &[u8]) -> Result<PakeKeys, ShareError> {
+        // Symmetric mode would accept our own message reflected back.
+        if peer_msg == self.our_msg.as_slice() {
+            return Err(ShareError::Protocol("reflected pairing message".into()));
+        }
+        let (sender_msg, receiver_msg) = match self.role {
+            PairRole::Sender => (self.our_msg.as_slice(), peer_msg),
+            PairRole::Receiver => (peer_msg, self.our_msg.as_slice()),
+        };
+        let mut transcript =
+            Vec::with_capacity(LAN_PROTOCOL_ID.len() + sender_msg.len() + receiver_msg.len());
+        transcript.extend_from_slice(LAN_PROTOCOL_ID);
+        transcript.extend_from_slice(sender_msg);
+        transcript.extend_from_slice(receiver_msg);
+
+        let role = self.role;
+        let shared = Zeroizing::new(
+            self.state
+                .finish(peer_msg)
+                .map_err(|_| ShareError::Protocol("invalid pairing message".into()))?,
+        );
+        let hk = Hkdf::<Sha256>::new(None, &shared);
+        let mut session = [0u8; 32];
+        let mut confirm = [0u8; 32];
+        hk.expand(SESSION_KEY_INFO, &mut session)
+            .map_err(|_| ShareError::Crypto("HKDF expand failed".into()))?;
+        hk.expand(CONFIRM_KEY_INFO, &mut confirm)
+            .map_err(|_| ShareError::Crypto("HKDF expand failed".into()))?;
+        Ok(PakeKeys {
+            session_key: Zeroizing::new(session),
+            confirm_key: Zeroizing::new(confirm),
+            transcript,
+            role,
+        })
+    }
+}
+
+impl PakeKeys {
+    fn mac_for(&self, role: PairRole) -> Result<HmacSha256, ShareError> {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&*self.confirm_key)
+            .map_err(|_| ShareError::Crypto("invalid confirmation key".into()))?;
+        mac.update(role.label());
+        mac.update(&self.transcript);
+        Ok(mac)
+    }
+
+    /// Our key-confirmation MAC, to send to the peer.
+    pub fn our_confirmation(&self) -> Result<Vec<u8>, ShareError> {
+        Ok(self.mac_for(self.role)?.finalize().into_bytes().to_vec())
+    }
+
+    /// Verify the peer's key-confirmation MAC (constant time). Failure means
+    /// the peer does not know the pairing code (or the transcript was altered).
+    pub fn verify_peer_confirmation(&self, mac: &[u8]) -> Result<(), ShareError> {
+        self.mac_for(self.role.peer())?
+            .verify_slice(mac)
+            .map_err(|_| ShareError::PairingFailed)
+    }
+
+    /// 64-bit transcript fingerprint, formatted `XXXX-XXXX-XXXX-XXXX`.
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        let digest = Sha256::digest(&self.transcript);
+        let hex: String = digest[..8].iter().map(|b| format!("{:02X}", b)).collect();
+        hex.as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
 }
 
 /// AES-256-GCM encrypt. Prepends 12-byte random nonce to ciphertext.
@@ -95,4 +198,66 @@ pub fn generate_passphrase() -> String {
         out.push(ALPHABET[(byte as usize) % ALPHABET.len()] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs both sides in-process; returns (sender keys, receiver keys).
+    fn pair(sender_code: &str, receiver_code: &str) -> (PakeKeys, PakeKeys) {
+        let s = PakeStart::new(sender_code, PairRole::Sender);
+        let r = PakeStart::new(receiver_code, PairRole::Receiver);
+        let (s_msg, r_msg) = (s.message().to_vec(), r.message().to_vec());
+        (s.finish(&r_msg).unwrap(), r.finish(&s_msg).unwrap())
+    }
+
+    #[test]
+    fn same_code_gives_same_key_fingerprint_and_valid_confirmations() {
+        let (s, r) = pair("123456", "123456");
+        assert_eq!(*s.session_key, *r.session_key);
+        assert_eq!(s.fingerprint(), r.fingerprint());
+        r.verify_peer_confirmation(&s.our_confirmation().unwrap()).unwrap();
+        s.verify_peer_confirmation(&r.our_confirmation().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wrong_code_fails_confirmation_both_ways() {
+        let (s, r) = pair("123456", "654321");
+        assert_ne!(*s.session_key, *r.session_key);
+        assert!(matches!(
+            r.verify_peer_confirmation(&s.our_confirmation().unwrap()),
+            Err(ShareError::PairingFailed)
+        ));
+        assert!(matches!(
+            s.verify_peer_confirmation(&r.our_confirmation().unwrap()),
+            Err(ShareError::PairingFailed)
+        ));
+    }
+
+    #[test]
+    fn fingerprint_differs_across_sessions_and_has_64_bit_format() {
+        let (a, _) = pair("123456", "123456");
+        let (b, _) = pair("123456", "123456");
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        let fp = a.fingerprint();
+        let groups: Vec<&str> = fp.split('-').collect();
+        assert_eq!(groups.len(), 4);
+        assert!(groups
+            .iter()
+            .all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit())));
+    }
+
+    #[test]
+    fn own_confirmation_is_not_accepted_as_peer_confirmation() {
+        let (s, _) = pair("123456", "123456");
+        assert!(s.verify_peer_confirmation(&s.our_confirmation().unwrap()).is_err());
+    }
+
+    #[test]
+    fn reflected_pake_message_is_rejected() {
+        let s = PakeStart::new("123456", PairRole::Sender);
+        let own = s.message().to_vec();
+        assert!(s.finish(&own).is_err());
+    }
 }

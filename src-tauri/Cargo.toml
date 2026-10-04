@@ -64,7 +64,9 @@ pem = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Secret sharing — LAN bridge + encrypted packages
-x25519-dalek = { version = "2", features = ["static_secrets", "reusable_secrets"] }
+# LAN pairing: SPAKE2 (RustCrypto, pure Rust) keyed by the pairing code + HMAC key confirmation
+spake2 = "=0.4.0"
+hmac = "0.12"
 mdns-sd = "0.11"
 sha2 = "0.10"
 hkdf = "0.12"

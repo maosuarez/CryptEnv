@@ -2,7 +2,7 @@
 
 CryptEnv offers three secure methods for sharing secrets with team members without third-party plain-text services:
 
-1. **LAN Bridge** — Real-time local network sharing via mDNS and ECDH.
+1. **LAN Bridge** — Real-time local network sharing via mDNS and a pairing-code-authenticated key exchange (SPAKE2).
 2. **Encrypted Packages** — Offline portable `.vault` files with Argon2id-derived keys.
 3. **Internet Relay** — Remote team sharing via an ephemeral, burn-after-read Supabase table.
 
@@ -13,9 +13,12 @@ CryptEnv offers three secure methods for sharing secrets with team members witho
 Ideal for colleagues on the same Wi-Fi / local network.
 
 ### How It Works:
-- **Discovery**: Uses encrypted mDNS pairing.
-- **Key Exchange**: X25519 ECDH for forward secrecy.
-- **Pairing & Verification**: Sender displays a 6-digit code (valid 5 min) and both parties verify a SHA-256 fingerprint of the exchanged keys.
+- **Discovery**: mDNS advertises only a random session id and the protocol version. Nothing derived from the pairing code is broadcast; the receiver tries each advertised service (at most 5) until one accepts its code.
+- **Key Exchange**: SPAKE2 keyed by the 6-digit pairing code. Only a peer that knows the code can derive the session key, an online guess costs one connection attempt, and nothing useful for offline guessing is exposed.
+- **Pairing & Verification**: Sender displays a 6-digit code (valid 5 min). Both sides first exchange key-confirmation MACs (a wrong code fails here and no item is sent), then show a 64-bit transcript fingerprint (`XXXX-XXXX-XXXX-XXXX`) that both users compare and confirm in the desktop app.
+- **Limits**: 30 s socket read/write timeouts, 60 s handshake deadline, 3 failed pairing attempts abort the session, one session at a time (a second start is rejected until the first is cancelled or finished).
+- **Lifetime**: Locking the vault or closing the share/receive dialog cancels the session, closes the listener, removes the mDNS advertisement and drops the session's copy of the vault key.
+- **Compatibility**: Protocol v2 is incompatible with v1.0.6. A version mismatch ends the session with an "update the other device" message; update both devices.
 - **Data Transfer**: Direct AES-256-GCM encrypted TCP stream.
 
 ---

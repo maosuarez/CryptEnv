@@ -99,10 +99,15 @@ pub struct ApiState {
     vault: SharedState,
     sessions: Mutex<SessionStore>,
     unlock_rate: Mutex<RateLimitState>,
-    share: Arc<ShareState>,
 }
 
 impl ApiState {
+    /// LAN share session slot. Owned by the vault state (shared with the Tauri
+    /// commands) so that locking the vault cancels any active session.
+    async fn share(&self) -> Arc<ShareState> {
+        self.vault.lock().await.share.clone()
+    }
+
     /// Builds a fresh state: no active session, rate limiter reset, new share
     /// session. Used by `start_server` and by `crate::test_support::router`
     /// so both build `ApiState` identically — no duplicated initialisation to
@@ -116,7 +121,6 @@ impl ApiState {
                 attempts: 0,
                 window_start: Instant::now(),
             }),
-            share: Arc::new(ShareState::new()),
         }
     }
 }
@@ -1904,16 +1908,16 @@ async fn handle_share_listen(
     }
 
     // Extract vault key
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => zeroize::Zeroizing::new(**k),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
 
     let pairing_code = match crate::share::start_listen_session(
-        state.share.clone(),
+        state.share().await,
         body.items,
         vault_key,
         state.vault.clone(),
@@ -1923,6 +1927,14 @@ async fn handle_share_listen(
     .await
     {
         Ok(code) => code,
+        Err(crate::share::ShareError::SessionActive) => {
+            return err_json(
+                StatusCode::CONFLICT,
+                "a share session is already active; cancel it first",
+                "SESSION_ACTIVE",
+            )
+            .into_response()
+        }
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1986,16 +1998,16 @@ async fn handle_share_connect(
         Err(resp) => return resp,
     };
 
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => zeroize::Zeroizing::new(**k),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
 
     let fingerprint = match crate::share::connect_to_peer(
-        state.share.clone(),
+        state.share().await,
         body.pairing_code,
         vault_key,
         state.vault.clone(),
@@ -2005,6 +2017,14 @@ async fn handle_share_connect(
     .await
     {
         Ok(fp) => fp,
+        Err(crate::share::ShareError::SessionActive) => {
+            return err_json(
+                StatusCode::CONFLICT,
+                "a share session is already active; cancel it first",
+                "SESSION_ACTIVE",
+            )
+            .into_response()
+        }
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2049,7 +2069,7 @@ async fn handle_share_confirm(
         return err_json(code, msg, err_code).into_response();
     }
 
-    match crate::share::confirm_fingerprint(&state.share, body.confirmed).await {
+    match crate::share::confirm_fingerprint(&state.share().await, body.confirmed).await {
         Ok(()) => {
             let status = if body.confirmed { "active" } else { "cancelled" };
             (StatusCode::OK, Json(ShareConfirmResponse { status: status.to_string() })).into_response()
@@ -2083,7 +2103,8 @@ async fn handle_share_status(
         return err_json(code, msg, err_code).into_response();
     }
 
-    let guard = state.share.session.lock().await;
+    let share = state.share().await;
+    let guard = share.session.lock().await;
     match guard.as_ref() {
         None => (
             StatusCode::OK,
@@ -2137,7 +2158,7 @@ async fn handle_share_cancel(
         return err_json(code, msg, err_code).into_response();
     }
 
-    match crate::share::cancel_session(&state.share).await {
+    match crate::share::cancel_session(&state.share().await).await {
         Ok(()) => (StatusCode::OK, Json(ShareCancelResponse { cancelled: true })).into_response(),
         Err(e) => err_json(StatusCode::BAD_REQUEST, &e.to_string(), "BAD_REQUEST").into_response(),
     }

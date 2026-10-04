@@ -6,14 +6,21 @@ pub mod relay;
 
 use rand::RngCore;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use uuid::Uuid;
-use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use crypto::PairRole;
 use package::PlainItem;
+
+/// Pairing attempts with a wrong code allowed per session before it aborts.
+const MAX_FAILED_ATTEMPTS: u8 = 3;
+/// How long a session waits for a peer to connect, and then for fingerprint confirmation.
+const SESSION_WAIT: Duration = Duration::from_secs(300);
+/// Listener poll interval; bounds how long cancellation takes to be observed.
+const LISTENER_POLL: Duration = Duration::from_millis(500);
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -37,6 +44,14 @@ pub enum ShareError {
     InvalidState(String),
     /// Relay backend lacks the v2 RPCs; the user must apply the relay SQL v2
     RelaySchemaOutdated,
+    /// Peer failed key confirmation (wrong pairing code)
+    PairingFailed,
+    /// Peer speaks a different LAN protocol version
+    VersionMismatch,
+    /// A share session is already running
+    SessionActive,
+    /// The session was cancelled
+    Cancelled,
 }
 
 impl std::fmt::Display for ShareError {
@@ -54,6 +69,14 @@ impl std::fmt::Display for ShareError {
                 f,
                 "RELAY_SCHEMA_OUTDATED: apply relay SQL v2 in your Supabase SQL editor (Settings → Internet Sharing shows the SQL)"
             ),
+            ShareError::PairingFailed => {
+                write!(f, "pairing failed: the peer did not prove knowledge of the pairing code")
+            }
+            ShareError::VersionMismatch => write!(f, "{}", lan::VERSION_MISMATCH_HINT),
+            ShareError::SessionActive => {
+                write!(f, "a share session is already active; cancel it first")
+            }
+            ShareError::Cancelled => write!(f, "session cancelled"),
         }
     }
 }
@@ -83,6 +106,15 @@ impl ShareSessionState {
             ShareSessionState::Cancelled => "cancelled",
         }
     }
+
+    /// Done, Failed and Cancelled sessions no longer own any resources and
+    /// may be replaced by a new session.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ShareSessionState::Done | ShareSessionState::Failed(_) | ShareSessionState::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,40 +132,26 @@ impl ShareDirection {
     }
 }
 
-/// Ephemeral keypair that zeroizes the secret on drop.
-pub struct EphemeralKeypair {
-    pub secret: StaticSecret,
-    pub public: PublicKey,
-}
-
-impl EphemeralKeypair {
-    pub fn generate() -> Self {
-        let (secret, public) = crypto::generate_keypair();
-        EphemeralKeypair { secret, public }
-    }
-}
-
-impl Drop for EphemeralKeypair {
-    fn drop(&mut self) {
-        // StaticSecret implements Zeroize internally; calling drop here is sufficient.
-        // We rely on the x25519-dalek guarantee that StaticSecret zeroes on drop.
-    }
-}
-
 pub struct ShareSession {
-    pub id: Uuid,
+    /// Monotonic id from `ShareState`; background tasks exit when it no longer matches.
+    pub id: u64,
     pub pairing_code: String,
-    pub our_pubkey: [u8; 32],
-    pub peer_pubkey: Option<[u8; 32]>,
-    /// Shared key wrapped in Zeroizing — cleared on drop.
+    /// Session key from the PAKE handshake, wrapped in Zeroizing — cleared on drop.
     pub shared_key: Option<Zeroizing<[u8; 32]>>,
+    /// Copy of the vault key used to read/import items. Dropped (and zeroized)
+    /// when the session ends, is cancelled, or the vault locks.
+    pub vault_key: Option<Zeroizing<[u8; 32]>>,
+    /// Set on cancel so blocking socket reads in background threads abort.
+    pub cancel: Arc<AtomicBool>,
+    /// Pairing attempts that failed key confirmation (sender side).
+    pub failed_attempts: u8,
     pub state: ShareSessionState,
     pub created_at: Instant,
     pub last_active: Instant,
     /// Item IDs to send (sender side only).
     pub items_to_send: Vec<i64>,
     pub direction: ShareDirection,
-    /// Hex fingerprint computed after ECDH.
+    /// Fingerprint (`XXXX-XXXX-XXXX-XXXX`) computed after the handshake.
     pub fingerprint: Option<String>,
     /// Received plain items (receiver side, after Done).
     pub received_items: Vec<PlainItem>,
@@ -157,18 +175,169 @@ pub struct ShareSession {
     pub environment_id: Option<i64>,
 }
 
-/// Top-level share state — one optional active session at a time.
-/// The `Option` is intentional: a new session replaces or rejects while one is active.
+impl ShareSession {
+    /// Change state; entering a terminal state drops the key copies.
+    fn set_state(&mut self, state: ShareSessionState) {
+        if state.is_terminal() {
+            self.vault_key = None;
+            self.shared_key = None;
+        }
+        self.state = state;
+        self.last_active = Instant::now();
+    }
+}
+
+/// Top-level share state — at most one non-terminal session at a time.
 pub struct ShareState {
     pub session: Arc<Mutex<Option<ShareSession>>>,
+    next_id: AtomicU64,
+    /// Socket timeouts; shortened by tests.
+    pub lan: lan::LanConfig,
 }
 
 impl ShareState {
     pub fn new() -> Self {
+        Self::with_config(lan::LanConfig::default())
+    }
+
+    pub fn with_config(lan: lan::LanConfig) -> Self {
         ShareState {
             session: Arc::new(Mutex::new(None)),
+            next_id: AtomicU64::new(1),
+            lan,
         }
     }
+}
+
+// ─── Session helpers ──────────────────────────────────────────────────────────
+
+/// Register a new session. Rejected with `SessionActive` while another session
+/// is still running; finished sessions are replaced.
+async fn begin_session(
+    share_state: &Arc<ShareState>,
+    pairing_code: String,
+    direction: ShareDirection,
+    state: ShareSessionState,
+    items_to_send: Vec<i64>,
+    vault_key: Zeroizing<[u8; 32]>,
+    project_id: Option<i64>,
+    environment_id: Option<i64>,
+) -> Result<(u64, Arc<AtomicBool>), ShareError> {
+    let mut guard = share_state.session.lock().await;
+    if guard.as_ref().is_some_and(|s| !s.state.is_terminal()) {
+        return Err(ShareError::SessionActive);
+    }
+    let id = share_state.next_id.fetch_add(1, Ordering::Relaxed);
+    let cancel = Arc::new(AtomicBool::new(false));
+    *guard = Some(ShareSession {
+        id,
+        pairing_code,
+        shared_key: None,
+        vault_key: Some(vault_key),
+        cancel: cancel.clone(),
+        failed_attempts: 0,
+        state,
+        created_at: Instant::now(),
+        last_active: Instant::now(),
+        items_to_send,
+        direction,
+        fingerprint: None,
+        received_items: Vec::new(),
+        received_names: Vec::new(),
+        skipped_keys: Vec::new(),
+        note: None,
+        project_id,
+        environment_id,
+    });
+    Ok((id, cancel))
+}
+
+/// Run `f` on the session only if it is still the session with `id`.
+/// Returns `None` when the session is gone or has been replaced.
+async fn with_session<R>(
+    share_state: &Arc<ShareState>,
+    id: u64,
+    f: impl FnOnce(&mut ShareSession) -> R,
+) -> Option<R> {
+    let mut guard = share_state.session.lock().await;
+    match guard.as_mut() {
+        Some(s) if s.id == id => Some(f(s)),
+        _ => None,
+    }
+}
+
+/// State of session `id`, or `None` when it no longer exists / was replaced.
+async fn session_status(share_state: &Arc<ShareState>, id: u64) -> Option<ShareSessionState> {
+    with_session(share_state, id, |s| s.state.clone()).await
+}
+
+/// Mark session `id` failed unless it already finished (never clobbers Cancelled/Done).
+async fn fail_session(share_state: &Arc<ShareState>, id: u64, message: String) {
+    with_session(share_state, id, |s| {
+        if !s.state.is_terminal() {
+            s.set_state(ShareSessionState::Failed(message));
+        }
+    })
+    .await;
+}
+
+/// Record the handshake result and move to AwaitingFingerprint.
+/// Returns false when the session was cancelled/replaced meanwhile.
+async fn set_awaiting_fingerprint(
+    share_state: &Arc<ShareState>,
+    id: u64,
+    fingerprint: &str,
+    shared_key: &Zeroizing<[u8; 32]>,
+) -> bool {
+    with_session(share_state, id, |s| {
+        if s.state.is_terminal() {
+            return false;
+        }
+        s.fingerprint = Some(fingerprint.to_string());
+        s.shared_key = Some(shared_key.clone());
+        s.set_state(ShareSessionState::AwaitingFingerprint);
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+enum ConfirmOutcome {
+    Confirmed,
+    /// The user rejected the fingerprint (or the session was cancelled).
+    Rejected,
+    /// The session ended or was replaced; the task must exit silently.
+    Stop,
+}
+
+/// Poll until the user confirms the fingerprint, up to `SESSION_WAIT`.
+async fn wait_for_confirmation(
+    share_state: &Arc<ShareState>,
+    id: u64,
+) -> Result<ConfirmOutcome, ShareError> {
+    let deadline = Instant::now() + SESSION_WAIT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ShareError::Timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        match session_status(share_state, id).await {
+            Some(ShareSessionState::Active) => return Ok(ConfirmOutcome::Confirmed),
+            Some(ShareSessionState::Cancelled) => return Ok(ConfirmOutcome::Rejected),
+            Some(ShareSessionState::AwaitingFingerprint) => continue,
+            _ => return Ok(ConfirmOutcome::Stop),
+        }
+    }
+}
+
+/// Clone the session's vault key, if the session still holds one.
+async fn session_vault_key(
+    share_state: &Arc<ShareState>,
+    id: u64,
+) -> Option<Zeroizing<[u8; 32]>> {
+    with_session(share_state, id, |s| s.vault_key.clone())
+        .await
+        .flatten()
 }
 
 // ─── Pairing code generation ──────────────────────────────────────────────────
@@ -186,209 +355,204 @@ pub fn generate_pairing_code() -> String {
 /// Start a sender session: generate a session, start the mDNS listener in a
 /// background Tokio task, and return the pairing code.
 ///
-/// The background task:
-/// 1. Accepts one TCP connection.
-/// 2. Runs the ECDH handshake.
-/// 3. Sets state to AwaitingFingerprint with the fingerprint.
-/// 4. Waits for the fingerprint to be confirmed (state → Active) or cancelled.
-/// 5. If Active: sends items, sets state Done.
-/// 6. If not: sends Error, sets state Cancelled or Failed.
+/// Rejected with `ShareError::SessionActive` while another session is running.
 ///
-/// The vault key and DB are passed in so the task can decrypt items independently.
+/// The background task:
+/// 1. Accepts TCP connections one at a time and runs the SPAKE2 handshake;
+///    wrong-code peers are dropped and counted (3 strikes abort the session).
+/// 2. Sets state to AwaitingFingerprint with the fingerprint.
+/// 3. Waits for the fingerprint to be confirmed (state → Active) or cancelled.
+/// 4. If Active: sends items, sets state Done.
+/// 5. If not: sends Error, state stays Cancelled or Failed.
+///
+/// The vault key lives in the session (zeroized when it ends) so the task can
+/// decrypt items independently and a lock/cancel can drop it.
 pub async fn start_listen_session(
     share_state: Arc<ShareState>,
     item_ids: Vec<i64>,
-    vault_key: [u8; 32],
+    vault_key: Zeroizing<[u8; 32]>,
     db: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
     environment_id: Option<i64>,
 ) -> Result<String, ShareError> {
-    let keypair = EphemeralKeypair::generate();
-    let our_pub = *keypair.public.as_bytes();
     let pairing_code = generate_pairing_code();
 
-    let session = ShareSession {
-        id: Uuid::new_v4(),
-        pairing_code: pairing_code.clone(),
-        our_pubkey: our_pub,
-        peer_pubkey: None,
-        shared_key: None,
-        state: ShareSessionState::Listening,
-        created_at: Instant::now(),
-        last_active: Instant::now(),
-        items_to_send: item_ids.clone(),
-        direction: ShareDirection::Sending,
-        fingerprint: None,
-        received_items: Vec::new(),
-        received_names: Vec::new(),
-        skipped_keys: Vec::new(),
-        note: None,
+    let (id, cancel) = begin_session(
+        &share_state,
+        pairing_code.clone(),
+        ShareDirection::Sending,
+        ShareSessionState::Listening,
+        item_ids.clone(),
+        vault_key,
         project_id,
         environment_id,
-    };
-
-    {
-        let mut guard = share_state.session.lock().await;
-        *guard = Some(session);
-    }
+    )
+    .await?;
 
     let state_clone = share_state.clone();
     let code_clone = pairing_code.clone();
-    let item_ids_clone = item_ids.clone();
 
     tokio::spawn(async move {
-        let result = run_send_background(
-            state_clone.clone(),
-            keypair,
-            code_clone,
-            item_ids_clone,
-            vault_key,
-            db,
-        )
-        .await;
+        let result =
+            run_send_background(state_clone.clone(), id, cancel, code_clone, item_ids, db).await;
 
         if let Err(e) = result {
-            let mut guard = state_clone.session.lock().await;
-            if let Some(ref mut s) = *guard {
-                s.state = ShareSessionState::Failed(e.to_string());
-            }
+            fail_session(&state_clone, id, e.to_string()).await;
         }
     });
 
     Ok(pairing_code)
 }
 
+/// Accept connections on `listener` until one completes the pairing handshake.
+///
+/// Returns `Ok(None)` when the session ended (cancelled, replaced, aborted by
+/// too many wrong-code attempts, or version mismatch) — the session state has
+/// already been updated in those cases. Silent or garbled peers are dropped
+/// without counting as attempts, so a port scanner cannot burn the session.
+async fn accept_and_pair(
+    share_state: &Arc<ShareState>,
+    id: u64,
+    listener: &std::net::TcpListener,
+    pairing_code: &str,
+    cfg: &lan::LanConfig,
+    accept_timeout: Duration,
+) -> Result<Option<(std::net::TcpStream, Zeroizing<[u8; 32]>, String)>, ShareError> {
+    // Non-blocking so we can poll with cancellation checks.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| ShareError::Io(e.to_string()))?;
+    let start = Instant::now();
+
+    loop {
+        if start.elapsed() >= accept_timeout {
+            fail_session(share_state, id, "pairing code expired".into()).await;
+            return Err(ShareError::Timeout);
+        }
+
+        match session_status(share_state, id).await {
+            Some(s) if !s.is_terminal() => {}
+            _ => return Ok(None),
+        }
+
+        let stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                tokio::time::sleep(LISTENER_POLL).await;
+                continue;
+            }
+            Err(e) => return Err(ShareError::Io(format!("accept: {e}"))),
+        };
+
+        // The listener is non-blocking for polling and accepted streams may
+        // inherit that; the handshake reads need blocking mode with timeouts.
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| ShareError::Io(format!("set stream blocking: {e}")))?;
+
+        let code = pairing_code.to_string();
+        let cfg_clone = cfg.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut stream = stream;
+            lan::pair_handshake(&mut stream, &code, PairRole::Sender, &cfg_clone)
+                .map(|(key, fp)| (stream, key, fp))
+        })
+        .await
+        .map_err(|e| ShareError::Io(e.to_string()))?;
+
+        match outcome {
+            Ok((stream, key, fp)) => return Ok(Some((stream, key, fp))),
+            Err(ShareError::PairingFailed) => {
+                let attempts = with_session(share_state, id, |s| {
+                    s.failed_attempts += 1;
+                    s.failed_attempts
+                })
+                .await;
+                match attempts {
+                    None => return Ok(None),
+                    Some(n) if n >= MAX_FAILED_ATTEMPTS => {
+                        fail_session(
+                            share_state,
+                            id,
+                            "too many failed pairing attempts".into(),
+                        )
+                        .await;
+                        return Ok(None);
+                    }
+                    Some(_) => {}
+                }
+            }
+            Err(ShareError::VersionMismatch) => {
+                fail_session(share_state, id, ShareError::VersionMismatch.to_string()).await;
+                return Ok(None);
+            }
+            Err(ShareError::Cancelled) => return Ok(None),
+            // Silent, slow or garbled peer: dropped; keep waiting for the real receiver.
+            Err(_) => {}
+        }
+    }
+}
+
 async fn run_send_background(
     share_state: Arc<ShareState>,
-    keypair: EphemeralKeypair,
+    id: u64,
+    cancel: Arc<AtomicBool>,
     pairing_code: String,
     item_ids: Vec<i64>,
-    vault_key: [u8; 32],
     db_state: Arc<Mutex<crate::vault::VaultState>>,
 ) -> Result<(), ShareError> {
-    use std::time::Duration;
-
     // Start mDNS listener — keep daemon alive in this scope
-    let (listener, port, _mdns_daemon) = lan::start_listener(&pairing_code)?;
+    let session_id = lan::generate_session_id();
+    let (listener, port, mdns_daemon) = lan::start_listener(&session_id)?;
 
     // Inform the frontend that the app is listening on a LAN port and that
     // Windows Firewall may block inbound connections.  The user must allow the
     // app through the firewall (or add an inbound rule for the port) if they
     // see connection failures on the receiver side.
-    {
-        let mut guard = share_state.session.lock().await;
-        if let Some(ref mut s) = *guard {
-            s.note = Some(format!(
-                "Listening on port {port}. If the receiver cannot connect, \
-                 allow this app through Windows Firewall or add an inbound \
-                 TCP rule for port {port}."
-            ));
-        }
-    }
+    with_session(&share_state, id, |s| {
+        s.note = Some(format!(
+            "Listening on port {port}. If the receiver cannot connect, \
+             allow this app through Windows Firewall or add an inbound \
+             TCP rule for port {port}."
+        ));
+    })
+    .await;
 
-    let accept_timeout = Duration::from_secs(300); // 5 minutes
-    let start = Instant::now();
-
-    // Set the listener to non-blocking so we can poll with cancellation checks.
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| ShareError::Io(e.to_string()))?;
-
-    // Poll for accept with periodic cancellation checks
-    let mut stream = loop {
-        if start.elapsed() >= accept_timeout {
-            let mut guard = share_state.session.lock().await;
-            if let Some(ref mut s) = *guard {
-                s.state = ShareSessionState::Failed("pairing code expired".into());
-            }
-            return Err(ShareError::Timeout);
-        }
-
-        // Check if cancelled
-        {
-            let guard = share_state.session.lock().await;
-            if let Some(ref s) = *guard {
-                if s.state == ShareSessionState::Cancelled {
-                    return Ok(());
-                }
-            }
-        }
-
-        match listener.accept() {
-            Ok((s, _)) => break s,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-            Err(e) => return Err(ShareError::Io(format!("accept: {e}"))),
-        }
+    let cfg = share_state.lan.clone().with_cancel(cancel);
+    let paired = accept_and_pair(&share_state, id, &listener, &pairing_code, &cfg, SESSION_WAIT).await?;
+    // One peer only: stop accepting and stop advertising as soon as pairing is over.
+    drop(listener);
+    drop(mdns_daemon);
+    let (stream, shared_key, fingerprint) = match paired {
+        Some(p) => p,
+        None => return Ok(()),
     };
 
-    // The TcpListener was put into non-blocking mode for polling; accepted
-    // streams inherit that flag.  The handshake uses blocking read_exact /
-    // write_all, so we must switch back to blocking mode before proceeding.
-    stream
-        .set_nonblocking(false)
-        .map_err(|e| ShareError::Io(format!("set stream blocking: {e}")))?;
-
-    // ECDH handshake
-    let our_pub = keypair.public;
-    let (stream_after, shared_key, fingerprint) =
-        tokio::task::spawn_blocking(move || {
-            lan::sender_handshake(stream, &keypair.secret, &our_pub)
-        })
-        .await
-        .map_err(|e| ShareError::Io(e.to_string()))??;
-
-    stream = stream_after;
-
-    // Update session: AwaitingFingerprint
-    {
-        let mut guard = share_state.session.lock().await;
-        if let Some(ref mut s) = *guard {
-            s.fingerprint = Some(fingerprint.clone());
-            s.state = ShareSessionState::AwaitingFingerprint;
-            s.last_active = Instant::now();
-        }
+    if !set_awaiting_fingerprint(&share_state, id, &fingerprint, &shared_key).await {
+        return Ok(());
     }
 
     // Wait for user to confirm fingerprint (up to 5 minutes)
-    let confirm_deadline = Instant::now() + Duration::from_secs(300);
-    let confirmed;
-    loop {
-        if Instant::now() >= confirm_deadline {
-            return Err(ShareError::Timeout);
+    match wait_for_confirmation(&share_state, id).await? {
+        ConfirmOutcome::Confirmed => {}
+        ConfirmOutcome::Rejected => {
+            // Notify peer — use the local shared_key we derived during handshake
+            let _ = tokio::task::spawn_blocking(move || {
+                lan::sender_reject(stream, &shared_key, "user rejected fingerprint")
+            })
+            .await;
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let guard = share_state.session.lock().await;
-        if let Some(ref s) = *guard {
-            match &s.state {
-                ShareSessionState::Active => {
-                    confirmed = true;
-                    break;
-                }
-                ShareSessionState::Cancelled => {
-                    confirmed = false;
-                    break;
-                }
-                ShareSessionState::Failed(_) => return Ok(()),
-                _ => continue,
-            }
-        }
+        ConfirmOutcome::Stop => return Ok(()),
     }
 
-    if !confirmed {
-        // Notify peer — use the local shared_key we derived during handshake
-        let _ = tokio::task::spawn_blocking(move || {
-            lan::sender_reject(stream, &shared_key, "user rejected fingerprint")
-        })
-        .await;
-        return Ok(());
-    }
+    let vault_key = match session_vault_key(&share_state, id).await {
+        Some(k) => k,
+        None => return Ok(()),
+    };
 
     // Decrypt items for sharing
     let db_items = {
@@ -402,8 +566,8 @@ async fn run_send_background(
     };
 
     let mut plain_items = Vec::new();
-    for (id, _, data, _, _) in &db_items {
-        if !item_ids.contains(id) {
+    for (item_id, _, data, _, _) in &db_items {
+        if !item_ids.contains(item_id) {
             continue;
         }
         let plaintext =
@@ -422,13 +586,18 @@ async fn run_send_background(
             command: item.command,
         });
     }
+    drop(vault_key);
 
-    let item_count = plain_items.len();
+    // Cancelled (or the vault locked) while decrypting: send nothing.
+    if session_status(&share_state, id).await != Some(ShareSessionState::Active) {
+        return Ok(());
+    }
 
     // Send items
     let shared_key_clone = shared_key.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        lan::sender_send_items(stream, &shared_key_clone, plain_items)
+    let cfg_send = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        lan::sender_send_items(stream, &shared_key_clone, plain_items, &cfg_send)
     })
     .await
     .map_err(|e| ShareError::Io(e.to_string()))??;
@@ -447,106 +616,80 @@ async fn run_send_background(
             .await;
     }
 
-    {
-        let mut guard = share_state.session.lock().await;
-        if let Some(ref mut s) = *guard {
-            s.state = ShareSessionState::Done;
-            s.last_active = Instant::now();
+    with_session(&share_state, id, |s| {
+        if s.state == ShareSessionState::Active {
+            s.set_state(ShareSessionState::Done);
         }
-    }
+    })
+    .await;
 
-    let _ = result; // ack count — not used for now
-    let _ = item_count;
     Ok(())
 }
 
-/// Start a receiver session: connect to a LAN peer, perform ECDH, and set state
-/// to AwaitingFingerprint. Returns the fingerprint.
+/// Start a receiver session: discover and pair with a LAN peer (SPAKE2 handshake),
+/// and set state to AwaitingFingerprint. Returns the fingerprint.
+///
+/// Rejected with `ShareError::SessionActive` while another session is running.
 pub async fn connect_to_peer(
     share_state: Arc<ShareState>,
     pairing_code: String,
-    vault_key: [u8; 32],
+    vault_key: Zeroizing<[u8; 32]>,
     db: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
     environment_id: Option<i64>,
 ) -> Result<String, ShareError> {
-    let keypair = EphemeralKeypair::generate();
-    let our_pub = *keypair.public.as_bytes();
-
-    let session = ShareSession {
-        id: Uuid::new_v4(),
-        pairing_code: pairing_code.clone(),
-        our_pubkey: our_pub,
-        peer_pubkey: None,
-        shared_key: None,
-        state: ShareSessionState::Connecting,
-        created_at: Instant::now(),
-        last_active: Instant::now(),
-        items_to_send: Vec::new(),
-        direction: ShareDirection::Receiving,
-        fingerprint: None,
-        received_items: Vec::new(),
-        received_names: Vec::new(),
-        skipped_keys: Vec::new(),
-        note: None,
+    let (id, cancel) = begin_session(
+        &share_state,
+        pairing_code.clone(),
+        ShareDirection::Receiving,
+        ShareSessionState::Connecting,
+        Vec::new(),
+        vault_key,
         project_id,
         environment_id,
-    };
+    )
+    .await?;
 
-    {
-        let mut guard = share_state.session.lock().await;
-        *guard = Some(session);
-    }
-
-    // Connect to peer via mDNS.  Use 60 s so slow mDNS propagation on
+    // Discover + pair via mDNS.  Use 60 s so slow mDNS propagation on
     // Windows (multicast routing delays) does not cause spurious timeouts.
-    let code_for_connect = pairing_code.clone();
-    let stream = tokio::task::spawn_blocking(move || {
-        lan::connect_to_peer(&code_for_connect, 60)
+    let cfg = share_state.lan.clone().with_cancel(cancel);
+    let cfg_connect = cfg.clone();
+    let paired = tokio::task::spawn_blocking(move || {
+        lan::connect_and_pair(&pairing_code, 60, &cfg_connect)
     })
     .await
-    .map_err(|e| ShareError::Io(e.to_string()))??;
+    .map_err(|e| ShareError::Io(e.to_string()))?;
 
-    let our_pub_key = keypair.public;
-    let (stream_after, shared_key, fingerprint) =
-        tokio::task::spawn_blocking(move || {
-            lan::receiver_handshake(stream, &keypair.secret, &our_pub_key)
-        })
-        .await
-        .map_err(|e| ShareError::Io(e.to_string()))??;
-
-    let fp_clone = fingerprint.clone();
-
-    // Store shared key + set AwaitingFingerprint
-    {
-        let mut guard = share_state.session.lock().await;
-        if let Some(ref mut s) = *guard {
-            s.shared_key = Some(shared_key.clone());
-            s.fingerprint = Some(fingerprint.clone());
-            s.state = ShareSessionState::AwaitingFingerprint;
-            s.last_active = Instant::now();
+    let (stream, shared_key, fingerprint) = match paired {
+        Ok(p) => p,
+        Err(e) => {
+            fail_session(&share_state, id, e.to_string()).await;
+            return Err(e);
         }
+    };
+
+    if !set_awaiting_fingerprint(&share_state, id, &fingerprint, &shared_key).await {
+        return Err(ShareError::Cancelled);
     }
 
     // Background task: wait for confirmation, then receive items
     let state_clone = share_state.clone();
+    let fp_clone = fingerprint.clone();
     tokio::spawn(async move {
         let result = run_receive_background(
             state_clone.clone(),
-            stream_after,
+            id,
+            cfg,
+            stream,
             shared_key,
-            fingerprint.clone(),
-            vault_key,
+            fingerprint,
             db,
             project_id,
             environment_id,
         )
         .await;
         if let Err(e) = result {
-            let mut guard = state_clone.session.lock().await;
-            if let Some(ref mut s) = *guard {
-                s.state = ShareSessionState::Failed(e.to_string());
-            }
+            fail_session(&state_clone, id, e.to_string()).await;
         }
     });
 
@@ -555,55 +698,38 @@ pub async fn connect_to_peer(
 
 async fn run_receive_background(
     share_state: Arc<ShareState>,
+    id: u64,
+    cfg: lan::LanConfig,
     stream: std::net::TcpStream,
     shared_key: Zeroizing<[u8; 32]>,
     fingerprint: String,
-    vault_key: [u8; 32],
     db_state: Arc<Mutex<crate::vault::VaultState>>,
     project_id: Option<i64>,
     environment_id: Option<i64>,
 ) -> Result<(), ShareError> {
-    use std::time::Duration;
-
     // Wait for user to confirm fingerprint (up to 5 minutes)
-    let confirm_deadline = Instant::now() + Duration::from_secs(300);
-    let confirmed;
-    loop {
-        if Instant::now() >= confirm_deadline {
-            return Err(ShareError::Timeout);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let guard = share_state.session.lock().await;
-        if let Some(ref s) = *guard {
-            match &s.state {
-                ShareSessionState::Active => {
-                    confirmed = true;
-                    break;
-                }
-                ShareSessionState::Cancelled => {
-                    confirmed = false;
-                    break;
-                }
-                ShareSessionState::Failed(_) => return Ok(()),
-                _ => continue,
-            }
-        }
+    match wait_for_confirmation(&share_state, id).await? {
+        ConfirmOutcome::Confirmed => {}
+        ConfirmOutcome::Rejected | ConfirmOutcome::Stop => return Ok(()),
     }
 
-    if !confirmed {
-        return Ok(());
-    }
-
-    // Receive items
+    // Receive items (the sender's user may still be confirming on their side)
     let shared_key_clone = shared_key.clone();
     let items = tokio::task::spawn_blocking(move || {
-        lan::receiver_receive_items(stream, &shared_key_clone)
+        lan::receiver_receive_items(stream, &shared_key_clone, &cfg, SESSION_WAIT)
     })
     .await
     .map_err(|e| ShareError::Io(e.to_string()))??;
 
-    let item_count = items.len();
+    // Cancelled (or the vault locked) while receiving: import nothing.
+    if session_status(&share_state, id).await != Some(ShareSessionState::Active) {
+        return Ok(());
+    }
+    let vault_key = match session_vault_key(&share_state, id).await {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+
     let item_ids: Vec<i64> = Vec::new(); // receiver doesn't know IDs before import
 
     // Import items into vault and log — acquire the mutex once for both operations
@@ -621,17 +747,13 @@ async fn run_receive_background(
         imported
     };
 
-    {
-        let mut guard = share_state.session.lock().await;
-        if let Some(ref mut s) = *guard {
-            s.received_names = outcome.names.clone();
-            s.skipped_keys = outcome.skipped_keys.clone();
-            s.state = ShareSessionState::Done;
-            s.last_active = Instant::now();
-        }
-    }
+    with_session(&share_state, id, |s| {
+        s.received_names = outcome.names.clone();
+        s.skipped_keys = outcome.skipped_keys.clone();
+        s.set_state(ShareSessionState::Done);
+    })
+    .await;
 
-    let _ = item_count;
     Ok(())
 }
 
@@ -774,28 +896,39 @@ pub async fn confirm_fingerprint(
                     s.state
                 )));
             }
-            s.state = if confirmed {
+            s.set_state(if confirmed {
                 ShareSessionState::Active
             } else {
                 ShareSessionState::Cancelled
-            };
-            s.last_active = Instant::now();
+            });
             Ok(())
         }
     }
 }
 
-/// Cancel the active session immediately.
+/// Cancel the active session immediately: aborts blocking socket reads, ends the
+/// background tasks (which close the listener and unregister mDNS), and drops the
+/// key copies. A session that already finished keeps its result state.
 pub async fn cancel_session(share_state: &Arc<ShareState>) -> Result<(), ShareError> {
     let mut guard = share_state.session.lock().await;
     match guard.as_mut() {
         None => Err(ShareError::InvalidState("no active session".into())),
         Some(s) => {
-            s.state = ShareSessionState::Cancelled;
-            s.last_active = Instant::now();
+            s.cancel.store(true, Ordering::Relaxed);
+            if s.state.is_terminal() {
+                s.vault_key = None;
+                s.shared_key = None;
+            } else {
+                s.set_state(ShareSessionState::Cancelled);
+            }
             Ok(())
         }
     }
+}
+
+/// Cancel whatever session exists; used when the vault locks.
+pub async fn cancel_all(share_state: &Arc<ShareState>) {
+    let _ = cancel_session(share_state).await;
 }
 
 /// Export selected items as an encrypted package file.
@@ -1014,5 +1147,227 @@ mod tests {
         let raw = db.list_items().await.unwrap();
         let (_, _, _, _, is_global) = raw[0].clone();
         assert!(!is_global, "imported items must never be created as global");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::db::VaultDb;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+
+    fn fast_cfg() -> lan::LanConfig {
+        lan::LanConfig {
+            io_timeout: Duration::from_millis(400),
+            handshake_timeout: Duration::from_secs(5),
+            cancel: None,
+        }
+    }
+
+    fn key() -> Zeroizing<[u8; 32]> {
+        Zeroizing::new([7u8; 32])
+    }
+
+    async fn start(state: &Arc<ShareState>) -> Result<(u64, Arc<AtomicBool>), ShareError> {
+        begin_session(
+            state,
+            "123456".into(),
+            ShareDirection::Sending,
+            ShareSessionState::Listening,
+            vec![],
+            key(),
+            None,
+            None,
+        )
+        .await
+    }
+
+    fn local_listener() -> (TcpListener, SocketAddr) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        (l, addr)
+    }
+
+    /// Receiver-side handshake against `addr` using `code`, on a blocking thread.
+    async fn peer_handshake(
+        addr: SocketAddr,
+        code: &'static str,
+    ) -> Result<(Zeroizing<[u8; 32]>, String), ShareError> {
+        tokio::task::spawn_blocking(move || {
+            let mut s = TcpStream::connect(addr).map_err(|e| ShareError::Io(e.to_string()))?;
+            // Generous timeout: the listener only polls for connections every 500 ms.
+            let cfg = lan::LanConfig { io_timeout: Duration::from_secs(5), ..fast_cfg() };
+            lan::pair_handshake(&mut s, code, PairRole::Receiver, &cfg)
+        })
+        .await
+        .unwrap()
+    }
+
+    type PairResult =
+        Result<Option<(std::net::TcpStream, Zeroizing<[u8; 32]>, String)>, ShareError>;
+
+    fn spawn_accept(
+        state: &Arc<ShareState>,
+        id: u64,
+        cancel: Arc<AtomicBool>,
+        listener: TcpListener,
+    ) -> tokio::task::JoinHandle<PairResult> {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let cfg = fast_cfg().with_cancel(cancel);
+            accept_and_pair(&state, id, &listener, "123456", &cfg, Duration::from_secs(20)).await
+        })
+    }
+
+    #[tokio::test]
+    async fn second_start_is_rejected_while_first_is_active() {
+        let state = Arc::new(ShareState::new());
+        start(&state).await.unwrap();
+        assert!(matches!(start(&state).await, Err(ShareError::SessionActive)));
+        // The existing session is unaffected.
+        let guard = state.session.lock().await;
+        assert_eq!(guard.as_ref().unwrap().state, ShareSessionState::Listening);
+    }
+
+    #[tokio::test]
+    async fn new_session_is_allowed_after_the_previous_one_ended() {
+        let state = Arc::new(ShareState::new());
+        let (a, _) = start(&state).await.unwrap();
+        cancel_session(&state).await.unwrap();
+        let (b, _) = start(&state).await.unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn successful_pairing_yields_matching_fingerprints() {
+        let state = Arc::new(ShareState::new());
+        let (id, cancel) = start(&state).await.unwrap();
+        let (listener, addr) = local_listener();
+        let task = spawn_accept(&state, id, cancel, listener);
+
+        let (_, peer_fp) = peer_handshake(addr, "123456").await.unwrap();
+        let (_, _, sender_fp) = task.await.unwrap().unwrap().unwrap();
+        assert_eq!(peer_fp, sender_fp);
+    }
+
+    #[tokio::test]
+    async fn wrong_code_peers_hit_the_attempt_limit_and_abort_the_session() {
+        let state = Arc::new(ShareState::new());
+        let (id, cancel) = start(&state).await.unwrap();
+        let (listener, addr) = local_listener();
+        let task = spawn_accept(&state, id, cancel, listener);
+
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            assert!(matches!(
+                peer_handshake(addr, "000000").await,
+                Err(ShareError::PairingFailed)
+            ));
+        }
+        assert!(task.await.unwrap().unwrap().is_none());
+        let guard = state.session.lock().await;
+        let s = guard.as_ref().unwrap();
+        assert!(matches!(&s.state, ShareSessionState::Failed(m) if m.contains("too many")));
+        assert!(s.fingerprint.is_none(), "no pairing completed");
+        assert!(s.vault_key.is_none(), "key copy dropped when the session ends");
+    }
+
+    #[tokio::test]
+    async fn silent_peer_is_dropped_and_session_keeps_waiting() {
+        let state = Arc::new(ShareState::new());
+        let (id, cancel) = start(&state).await.unwrap();
+        let (listener, addr) = local_listener();
+        let task = spawn_accept(&state, id, cancel, listener);
+
+        let _silent = TcpStream::connect(addr).unwrap();
+        // After the silent peer's io timeout, a legitimate peer still pairs.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(peer_handshake(addr, "123456").await.is_ok());
+        assert!(task.await.unwrap().unwrap().is_some());
+        let guard = state.session.lock().await;
+        assert_eq!(
+            guard.as_ref().unwrap().failed_attempts,
+            0,
+            "silence is not a pairing attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_task_does_nothing_after_cancel_and_a_new_session() {
+        let state = Arc::new(ShareState::new());
+        let (a, cancel_a) = start(&state).await.unwrap();
+        let (listener, addr) = local_listener();
+        let task_a = spawn_accept(&state, a, cancel_a, listener);
+
+        cancel_session(&state).await.unwrap();
+        let (b, _) = start(&state).await.unwrap();
+
+        // Task A exits without pairing, and without touching session B.
+        assert!(task_a.await.unwrap().unwrap().is_none());
+        // Its listener is gone: nobody can pair with the cancelled session.
+        assert!(TcpStream::connect(addr).is_err());
+        let guard = state.session.lock().await;
+        let s = guard.as_ref().unwrap();
+        assert_eq!(s.id, b);
+        assert_eq!(s.state, ShareSessionState::Listening);
+        assert!(s.fingerprint.is_none());
+        assert_eq!(s.failed_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_handshake_in_progress() {
+        let state = Arc::new(ShareState::new());
+        let (id, cancel) = start(&state).await.unwrap();
+        let (listener, addr) = local_listener();
+        let cfg = lan::LanConfig {
+            io_timeout: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(60),
+            cancel: Some(cancel),
+        };
+        let st = state.clone();
+        let task = tokio::spawn(async move {
+            accept_and_pair(&st, id, &listener, "123456", &cfg, Duration::from_secs(20)).await
+        });
+        let _silent = TcpStream::connect(addr).unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let started = Instant::now();
+        cancel_session(&state).await.unwrap();
+        assert!(task.await.unwrap().unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn lock_cancels_session_closes_listener_and_drops_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = VaultDb::open(dir.path().join("vault.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let vault: crate::vault::SharedState =
+            Arc::new(Mutex::new(crate::vault::VaultState::new(db)));
+        let share = vault.lock().await.share.clone();
+
+        let (id, cancel) = start(&share).await.unwrap();
+        let (listener, addr) = local_listener();
+        let task = spawn_accept(&share, id, cancel, listener);
+        assert!(share.session.lock().await.as_ref().unwrap().vault_key.is_some());
+
+        crate::vault::lock_vault(&vault).await;
+
+        assert!(task.await.unwrap().unwrap().is_none());
+        assert!(TcpStream::connect(addr).is_err(), "listener port must be closed");
+        let guard = share.session.lock().await;
+        let s = guard.as_ref().unwrap();
+        assert_eq!(s.state, ShareSessionState::Cancelled);
+        assert!(s.vault_key.is_none());
+        assert!(s.shared_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_session_drops_its_key_copies() {
+        let state = Arc::new(ShareState::new());
+        let (id, _) = start(&state).await.unwrap();
+        fail_session(&state, id, "boom".into()).await;
+        let guard = state.session.lock().await;
+        assert!(guard.as_ref().unwrap().vault_key.is_none());
     }
 }
