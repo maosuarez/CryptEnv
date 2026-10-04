@@ -339,6 +339,14 @@
     <h3 id="globals">Global items<a class="anchor" href="#globals">#</a></h3>
     <p>Items marked <strong>global</strong> are reusable across projects (the GUI's Global Secrets view). Discovery surfaces — <code>search</code>, <code>GET /items</code>, <code>GET /commands</code>, the MCP list/search tools — union globals in by default and tag each row as <code>linked</code>, <code>global</code> or <code>global+linked</code>. Materialization surfaces — <code>fill</code>, <code>inject</code>, env example generation, LAN share — only ever use what is <strong>linked</strong>. Linking a global into an environment is always an explicit act.</p>
 
+    <h3 id="backup">Backup &amp; restore<a class="anchor" href="#backup">#</a></h3>
+    <p>Settings &rarr; Backup &amp; Restore writes a <code>.cenvbak</code> file (format v2) containing every item (still as ciphertext), category, project (name, description, template, root path, categories), environment (name, default flag, paths), variable binding and item-ownership link. The organisational metadata is encrypted with your vault key inside the file, so project names, paths and variable keys are not readable without the master password. The MCP token and biometric enrollment are never included.</p>
+    <ul>
+      <li><strong>Replace</strong> needs the vault <em>unlocked</em>, the backup&rsquo;s master password and your <em>current</em> master password. The restore is atomic: a complete replacement database is built and verified next to the live one and only then swapped in; if anything fails, the current vault is left untouched. The previous database is kept as <code>vault.db.pre-restore</code> until the next successful unlock.</li>
+      <li><strong>Merge</strong> needs an unlocked vault and the backup&rsquo;s master password. Items are re-encrypted with the current key; projects and environments that already exist (matched by name) are kept and missing ones are added. It also runs as a single all-or-nothing operation.</li>
+      <li><strong>Older (v1) backups</strong> still restore items and categories. They carried no projects, so non-global items are placed in an auto-created <code>Restored YYYY-MM-DD</code> project and the restore summary says projects were not included. Items added through <em>Import</em> without a target go to an <code>Imported YYYY-MM-DD</code> project. These two projects are never reported as orphans.</li>
+    </ul>
+
     <!-- ===================== 4. CLIENT CONFIG ===================== -->
     <h2 id="client-config"><span class="num">03</span>Client configuration<a class="anchor" href="#client-config">#</a></h2>
     <p>The CLI, TUI and MCP server read these optional environment variables. The defaults work when client and app run on the same machine; overrides exist for split setups such as WSL ↔ Windows.</p>
