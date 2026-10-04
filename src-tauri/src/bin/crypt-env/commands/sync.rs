@@ -88,7 +88,7 @@ pub fn template_keys(content: &str) -> Vec<String> {
         let t = t.strip_prefix("export ").unwrap_or(t);
         if let Some((k, _)) = t.split_once('=') {
             let k = k.trim();
-            if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !keys.iter().any(|x| x == k) {
+            if crypt_env_lib::envfile::is_valid_key(k) && !keys.iter().any(|x| x == k) {
                 keys.push(k.to_string());
             }
         }
@@ -172,6 +172,12 @@ mod tests {
     fn template_keys_parses_and_dedupes() {
         let keys = template_keys("# c\nA=1\nexport B=\n\nA=2\nbad key=x\nC_D=\n");
         assert_eq!(keys, vec!["A", "B", "C_D"]);
+    }
+
+    #[test]
+    fn template_keys_accepts_dotted_keys_like_envfile() {
+        let keys = template_keys("a.b=1\n1bad=2\nOK_1=3\n");
+        assert_eq!(keys, vec!["a.b", "OK_1"]);
     }
 
     #[test]
