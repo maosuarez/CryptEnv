@@ -8,6 +8,7 @@ use clap::Args;
 use crate::client::{self, CliError};
 use crate::commands::scope;
 use crate::shell::{detect_shell, format_assignment, Shell};
+use crypt_env_lib::shellfmt::is_valid_shell_key;
 
 #[derive(Args)]
 pub struct InjectArgs {
@@ -34,7 +35,7 @@ pub fn run(args: InjectArgs) -> Result<(), CliError> {
         None => detect_shell(),
     };
     for k in &args.keys {
-        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !is_valid_shell_key(k) {
             return Err(CliError::Config(format!("'{k}' is not a valid variable name")));
         }
     }
@@ -60,10 +61,36 @@ pub fn run(args: InjectArgs) -> Result<(), CliError> {
     let mut out = Vec::with_capacity(ids.len());
     for (k, id) in args.keys.iter().zip(ids) {
         let value = client::reveal_item(id)?;
-        out.push(zeroize::Zeroizing::new(format_assignment(&shell, k, &value)));
+        let line = format_assignment(&shell, k, &value).map_err(|e| CliError::Config(e.to_string()))?;
+        out.push(zeroize::Zeroizing::new(line));
     }
+    // Every assignment formatted successfully; nothing reaches stdout otherwise.
     for line in &out {
         println!("{}", line.as_str());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_key_is_refused_before_any_session_work() {
+        let args = InjectArgs {
+            keys: vec!["A;rm -rf ~;B".into()],
+            env: None,
+            shell: Some("bash".into()),
+        };
+        match run(args) {
+            Err(CliError::Config(msg)) => assert!(msg.contains("A;rm -rf ~;B")),
+            _ => panic!("expected an invalid-key error"),
+        }
+    }
+
+    #[test]
+    fn dotted_key_is_refused() {
+        let args = InjectArgs { keys: vec!["A.B".into()], env: None, shell: Some("sh".into()) };
+        assert!(matches!(run(args), Err(CliError::Config(_))));
+    }
 }

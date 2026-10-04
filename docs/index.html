@@ -400,7 +400,7 @@ crypt-env add "SHARED_AUTH_URL=https://auth.example" --global</code></pre></div>
     <h4>crypt-env sync [--global] [--env NAME] [--example PATH] 🔒</h4>
     <p>Reads <code>.env.example</code> (current directory, then the project root) and creates each key missing from the environment with the value <code>change-me</code>. With <code>--global</code>, keys matching a global secret are linked to it instead and the environment is then written to its <code>.env</code> target(s).</p>
     <h4>crypt-env inject KEY... [--env NAME] [--shell pwsh|bash|zsh|sh] 🔒</h4>
-    <p>Prints single-quoted assignments on stdout only; the password prompt goes to the terminal. All keys are resolved before anything is printed.</p>
+    <p>Prints single-quoted assignments on stdout only; the password prompt goes to the terminal. All keys are resolved before anything is printed. Keys must match <code>^[A-Za-z_][A-Za-z0-9_]*$</code> or the command fails with nothing on stdout. Values are quoted so they never execute: PowerShell doubles all five single-quote characters (<code>'</code> and U+2018&ndash;U+201B); bash/zsh use <code>'\''</code>, or <code>$'...'</code> when the value has a line break; <code>--shell sh</code> refuses values with a newline. The GUI &ldquo;Copy as bash / PowerShell&rdquo; produces the same text.</p>
     <div class="code"><span class="label">shell</span><pre><code><span class="c"># bash / zsh</span>
 eval "$(crypt-env inject DATABASE_URL API_KEY)"
 <span class="c"># PowerShell</span>
