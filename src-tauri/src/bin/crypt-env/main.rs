@@ -6,6 +6,8 @@ mod commands;
 mod paths;
 mod prompts;
 mod shell;
+#[cfg(test)]
+mod testing;
 mod terminal;
 
 use clap::{Parser, Subcommand};

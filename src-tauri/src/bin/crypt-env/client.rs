@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// Built-in REST base URL, used when `CRYPTENV_API_URL` is unset or empty.
@@ -8,6 +9,31 @@ pub const DEFAULT_API_BASE: &str = "https://127.0.0.1:47821";
 /// Process-wide resolved REST base URL. Set once by [`init_api_base`] at
 /// command entry so every request in an invocation targets the same endpoint.
 static API_BASE_CACHE: OnceLock<String> = OnceLock::new();
+
+/// Set by the TUI while it owns the terminal (raw mode / alternate screen).
+/// While set, [`prompt_password`] refuses to read from the terminal and the
+/// caller must collect the password through the TUI's own modal instead.
+static NON_INTERACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as unable to prompt on the terminal (`true`) or restores
+/// the default (`false`).
+pub fn set_non_interactive(on: bool) {
+    NON_INTERACTIVE.store(on, Ordering::SeqCst);
+}
+
+pub fn is_non_interactive() -> bool {
+    NON_INTERACTIVE.load(Ordering::SeqCst)
+}
+
+/// The only place the client reads the master password from the terminal.
+/// Returns [`CliError::SessionRequired`] instead of prompting when the TUI
+/// owns the terminal.
+pub fn prompt_password() -> Result<String, CliError> {
+    if is_non_interactive() {
+        return Err(CliError::SessionRequired);
+    }
+    rpassword::prompt_password("Master password: ").map_err(CliError::Io)
+}
 
 // ─── Error types ──────────────────────────────────────────────────────────────
 
@@ -18,6 +44,10 @@ pub enum CliError {
     ConnectionRefused,
     NotFound(String),
     VaultLocked,
+    /// An authenticated call needs a session and the terminal cannot be used
+    /// to ask for the password (the TUI owns it). The TUI maps this to its
+    /// password modal.
+    SessionRequired,
     /// Invalid runtime configuration (malformed `CRYPTENV_API_URL`, unreadable
     /// `CRYPTENV_CERT_PATH`, `setup wsl` preconditions). Messages name only
     /// environment-variable names and file paths — never secret values.
@@ -35,6 +65,7 @@ impl std::fmt::Display for CliError {
             ),
             CliError::NotFound(name) => write!(f, "Error: '{}' not found in vault", name),
             CliError::VaultLocked => write!(f, "Error: vault is locked"),
+            CliError::SessionRequired => write!(f, "Error: a password session is required"),
             CliError::Config(msg) => write!(f, "Configuration error: {msg}"),
         }
     }
@@ -482,7 +513,7 @@ pub fn ensure_session() -> Result<(), CliError> {
         return Ok(());
     }
     let password = zeroize::Zeroizing::new(
-        rpassword::prompt_password("Master password: ").map_err(CliError::Io)?,
+        prompt_password()?,
     );
     authenticate(&password)
 }
@@ -523,7 +554,7 @@ pub fn get_auth_token() -> Result<String, CliError> {
         return Ok(token);
     }
 
-    let password = rpassword::prompt_password("Master password: ").map_err(CliError::Io)?;
+    let password = prompt_password()?;
     let token = api_unlock(&password)?;
     save_token(&token);
     Ok(token)
@@ -548,7 +579,7 @@ pub fn authenticated_get(url: &str) -> Result<reqwest::blocking::Response, CliEr
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         clear_token();
-        let new_password = rpassword::prompt_password("Master password: ").map_err(CliError::Io)?;
+        let new_password = prompt_password()?;
         let new_token = api_unlock(&new_password)?;
         save_token(&new_token);
 
@@ -593,7 +624,7 @@ pub fn authenticated_post(
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         clear_token();
-        let new_password = rpassword::prompt_password("Master password: ").map_err(CliError::Io)?;
+        let new_password = prompt_password()?;
         let new_token = api_unlock(&new_password)?;
         save_token(&new_token);
 
@@ -639,7 +670,7 @@ pub fn authenticated_put(
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         clear_token();
-        let new_password = rpassword::prompt_password("Master password: ").map_err(CliError::Io)?;
+        let new_password = prompt_password()?;
         let new_token = api_unlock(&new_password)?;
         save_token(&new_token);
 
@@ -682,7 +713,7 @@ pub fn authenticated_delete(url: &str) -> Result<reqwest::blocking::Response, Cl
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         clear_token();
-        let new_password = rpassword::prompt_password("Master password: ").map_err(CliError::Io)?;
+        let new_password = prompt_password()?;
         let new_token = api_unlock(&new_password)?;
         save_token(&new_token);
 
@@ -857,6 +888,64 @@ pub fn list_items(project: &str, environment: &str, include_global: &str) -> Res
         urlencod(include_global)
     );
     check_status(authenticated_get(&url)?, "list items")?.json().map_err(|e| CliError::Api(e.to_string()))
+}
+
+// ─── Vault seam ───────────────────────────────────────────────────────────────
+
+/// The vault operations the project commands and the TUI need, behind a trait
+/// so their consent / binding logic can be unit-tested without a running app.
+/// [`Live`] is the real implementation over the REST client above.
+pub trait VaultApi {
+    fn session_alive(&self) -> Result<bool, CliError>;
+    fn ensure_session(&self) -> Result<(), CliError>;
+    fn authenticate(&self, password: &str) -> Result<(), CliError>;
+    fn fetch_projects(&self) -> Result<Vec<Project>, CliError>;
+    fn find_project(&self, name: &str) -> Result<Option<Project>, CliError>;
+    fn save_project(&self, body: &serde_json::Value) -> Result<i64, CliError>;
+    fn save_environment(&self, body: &serde_json::Value) -> Result<i64, CliError>;
+    fn ensure_categories(&self, names: &[String]) -> Result<(), CliError>;
+    fn inject_environment(&self, env_id: i64) -> Result<InjectResult, CliError>;
+    fn list_items(&self, project: &str, environment: &str, include_global: &str) -> Result<Vec<ItemSummary>, CliError>;
+    fn reveal_item(&self, item_id: i64) -> Result<zeroize::Zeroizing<String>, CliError>;
+}
+
+/// [`VaultApi`] over the local REST API.
+pub struct Live;
+
+impl VaultApi for Live {
+    fn session_alive(&self) -> Result<bool, CliError> {
+        session_alive()
+    }
+    fn ensure_session(&self) -> Result<(), CliError> {
+        ensure_session()
+    }
+    fn authenticate(&self, password: &str) -> Result<(), CliError> {
+        authenticate(password)
+    }
+    fn fetch_projects(&self) -> Result<Vec<Project>, CliError> {
+        fetch_projects()
+    }
+    fn find_project(&self, name: &str) -> Result<Option<Project>, CliError> {
+        find_project(name)
+    }
+    fn save_project(&self, body: &serde_json::Value) -> Result<i64, CliError> {
+        save_project(body)
+    }
+    fn save_environment(&self, body: &serde_json::Value) -> Result<i64, CliError> {
+        save_environment(body)
+    }
+    fn ensure_categories(&self, names: &[String]) -> Result<(), CliError> {
+        ensure_categories(names)
+    }
+    fn inject_environment(&self, env_id: i64) -> Result<InjectResult, CliError> {
+        inject_environment(env_id, None)
+    }
+    fn list_items(&self, project: &str, environment: &str, include_global: &str) -> Result<Vec<ItemSummary>, CliError> {
+        list_items(project, environment, include_global)
+    }
+    fn reveal_item(&self, item_id: i64) -> Result<zeroize::Zeroizing<String>, CliError> {
+        reveal_item(item_id)
+    }
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -1041,5 +1130,14 @@ mod tests {
     fn harden_token_permissions_never_panics_on_a_bogus_path() {
         // set_permissions fails here; the helper must swallow it silently.
         harden_token_permissions(Path::new("/nonexistent/cryptenv/.cli_token"));
+    }
+
+    #[test]
+    fn non_interactive_flag_makes_prompt_return_session_required() {
+        set_non_interactive(true);
+        let result = prompt_password();
+        set_non_interactive(false);
+        assert!(matches!(result, Err(CliError::SessionRequired)));
+        assert!(!is_non_interactive());
     }
 }

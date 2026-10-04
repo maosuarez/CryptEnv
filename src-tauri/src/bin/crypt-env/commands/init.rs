@@ -1,12 +1,18 @@
 //! `crypt-env init [NAME] [--path <PATH>]` — registers (or links) the vault
 //! project for the current directory, records this directory as its root,
 //! and writes `.crypt-env.yaml` here.
+//!
+//! An existing project bound to another directory is never taken over
+//! (use `config --relink`); an existing project without a root adopts this
+//! directory only after the same consent flow `config` uses.
 
 use clap::Args;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::client::{self, CliError, Project};
-use crate::commands::scope::{self, manifest};
+use crate::client::{self, CliError, Project, VaultApi};
+use crate::commands::config::RoutingDiff;
+use crate::commands::scope::{self, manifest, Binding};
 use crate::paths;
 
 #[derive(Args)]
@@ -37,7 +43,24 @@ pub fn run(args: InitArgs) -> Result<(), CliError> {
         );
         return Ok(());
     }
-    let r = execute(&cwd, args.name.as_deref(), args.path.as_deref())?;
+    let api = &client::Live;
+    let mut adopt_confirmed = false;
+    if let Existing::Adopt { lines, .. } = check(api, &cwd, args.name.as_deref())? {
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Config(
+                "adopting this directory changes where secrets are written and needs an interactive confirmation".into(),
+            ));
+        }
+        api.ensure_session()?;
+        if !crate::prompts::confirm("Bind this project to the current directory?") {
+            return Err(CliError::Config("cancelled — the vault was not changed".into()));
+        }
+        adopt_confirmed = true;
+    }
+    let r = execute(api, &cwd, args.name.as_deref(), args.path.as_deref(), adopt_confirmed)?;
     eprintln!(
         "{} project '{}' (root {}), default environment → {}",
         if r.created { "Created" } else { "Linked existing" },
@@ -49,34 +72,79 @@ pub fn run(args: InitArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Core of `init`, shared with the TUI. `dir` becomes the project root.
-pub fn execute(dir: &Path, name: Option<&str>, path: Option<&Path>) -> Result<InitReport, CliError> {
-    if dir.join(manifest::FILE_NAME).is_file() {
-        return Err(CliError::Config(format!("{} already exists in {}", manifest::FILE_NAME, dir.display())));
+/// What `init` would do about a same-name vault project.
+pub enum Existing {
+    /// No such project: it is created with this directory as root.
+    New,
+    /// Already bound to this directory.
+    Linked,
+    /// Exists without a root; binding it here needs consent. `lines` is the
+    /// diff to show.
+    Adopt { project: String, lines: Vec<String> },
+}
+
+/// Read-only: classifies the same-name project. A project bound to another
+/// directory is the root-binding error.
+pub fn check(api: &dyn VaultApi, dir: &Path, name: Option<&str>) -> Result<Existing, CliError> {
+    let name = resolve_name(dir, name)?;
+    let Some(project) = api.find_project(&name)? else { return Ok(Existing::New) };
+    match scope::ensure_bound(dir, &project)? {
+        Binding::Bound => Ok(Existing::Linked),
+        _ => {
+            let diff = RoutingDiff { root: Some((None, paths::to_host(dir))), envs: vec![] };
+            Ok(Existing::Adopt { project: project.name.clone(), lines: diff.render(&project.name) })
+        }
     }
+}
+
+/// Explicit name, else the legacy `crypt-env.json` project, else the folder name.
+fn resolve_name(dir: &Path, name: Option<&str>) -> Result<String, CliError> {
     let legacy = dir.join(scope::LEGACY_CONFIG_FILE_NAME);
     let legacy_name = if legacy.is_file() { scope::parse_legacy_config(&legacy).ok().map(|c| c.project) } else { None };
-    let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) => n.to_string(),
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => Ok(n.to_string()),
         None => match legacy_name {
-            Some(n) => n,
+            Some(n) => Ok(n),
             None => dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(str::to_string)
-                .ok_or_else(|| CliError::Config("cannot derive a project name from this directory".into()))?,
+                .ok_or_else(|| CliError::Config("cannot derive a project name from this directory".into())),
         },
-    };
+    }
+}
+
+/// Core of `init`, shared with the TUI. `dir` becomes the project root.
+/// `adopt_confirmed` is the user's consent to bind an existing, rootless
+/// project to `dir` (see [`check`]).
+pub fn execute(
+    api: &dyn VaultApi,
+    dir: &Path,
+    name: Option<&str>,
+    path: Option<&Path>,
+    adopt_confirmed: bool,
+) -> Result<InitReport, CliError> {
+    if dir.join(manifest::FILE_NAME).is_file() {
+        return Err(CliError::Config(format!("{} already exists in {}", manifest::FILE_NAME, dir.display())));
+    }
+    if let Existing::Adopt { project, .. } = check(api, dir, name)? {
+        if !adopt_confirmed {
+            return Err(CliError::Config(format!(
+                "project '{project}' has no root yet; binding it to this directory needs confirmation"
+            )));
+        }
+    }
+    let name = resolve_name(dir, name)?;
     let target = default_target(dir, path);
     let root_host = paths::to_host(dir);
 
-    let (project_id, created) = match client::find_project(&name)? {
+    let (project_id, created) = match api.find_project(&name)? {
         Some(p) => {
-            client::save_project(&project_body(&p, &root_host))?;
+            api.save_project(&project_body(&p, &root_host))?;
             (p.id, false)
         }
         None => {
-            let id = client::save_project(&serde_json::json!({
+            let id = api.save_project(&serde_json::json!({
                 "id": 0,
                 "name": name,
                 "template": "generic",
@@ -88,16 +156,16 @@ pub fn execute(dir: &Path, name: Option<&str>, path: Option<&Path>) -> Result<In
     };
 
     // Ensure the default environment targets `target`.
-    let project = fetch_by_id(project_id)?;
+    let project = fetch_by_id(api, project_id)?;
     if let Some(env) = project.environments.iter().find(|e| e.is_default).or(project.environments.first()) {
         if !env.paths.iter().any(|p| p == &target) {
             let mut paths = if created { Vec::new() } else { env.paths.clone() };
             paths.push(target.clone());
-            client::save_environment(&client::environment_body(env, env.is_default, &paths))?;
+            api.save_environment(&client::environment_body(env, env.is_default, &paths))?;
         }
     }
 
-    let project = fetch_by_id(project_id)?;
+    let project = fetch_by_id(api, project_id)?;
     let m = manifest::from_project(&project, &paths::to_local);
     let manifest_path = manifest::write_file(dir, &m).map_err(CliError::Config)?;
     Ok(InitReport { project: project.name, created, manifest_path, target })
@@ -115,8 +183,8 @@ pub fn project_body(p: &Project, root_host: &str) -> serde_json::Value {
     })
 }
 
-fn fetch_by_id(id: i64) -> Result<Project, CliError> {
-    client::fetch_projects()?
+fn fetch_by_id(api: &dyn VaultApi, id: i64) -> Result<Project, CliError> {
+    api.fetch_projects()?
         .into_iter()
         .find(|p| p.id == id)
         .ok_or_else(|| CliError::Api(format!("project {id} vanished after saving")))
@@ -171,5 +239,46 @@ mod tests {
         assert_eq!(default_target(root, Some(Path::new("new-dir"))), "new-dir/.env");
         let outside = default_target(root, Some(Path::new("../elsewhere")));
         assert!(outside.ends_with(".env") && outside != "elsewhere/.env", "{outside}");
+    }
+
+    use crate::testing::{env, project, FakeVault};
+
+    fn run_init(vault: &FakeVault, dir: &Path, adopt: bool) -> Result<InitReport, CliError> {
+        execute(vault, dir, Some("backend"), None, adopt)
+    }
+
+    #[test]
+    fn existing_project_bound_elsewhere_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FakeVault::new(vec![project("backend", Some("/home/u/backend"), vec![env(1, "default", true, &[".env"])])]);
+        let err = run_init(&vault, dir.path(), true).err().unwrap().to_string();
+        assert!(err.contains("/home/u/backend") && err.contains("--relink"), "{err}");
+        assert!(vault.mutations().is_empty(), "{:?}", vault.calls.borrow());
+        assert!(!dir.path().join(manifest::FILE_NAME).exists());
+    }
+
+    #[test]
+    fn unbound_project_needs_confirmation_before_adopting() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FakeVault::new(vec![project("backend", None, vec![env(1, "default", true, &[".env"])])]);
+        assert!(matches!(check(&vault, dir.path(), Some("backend")), Ok(Existing::Adopt { .. })));
+        assert!(run_init(&vault, dir.path(), false).is_err());
+        assert!(vault.mutations().is_empty());
+        assert!(run_init(&vault, dir.path(), true).is_ok());
+        assert!(vault.mutations().contains(&"save_project".to_string()));
+    }
+
+    #[test]
+    fn bound_here_links_and_new_project_is_created_without_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = paths::to_host(dir.path());
+        let vault = FakeVault::new(vec![project("backend", Some(&host), vec![env(1, "default", true, &[".env"])])]);
+        assert!(matches!(check(&vault, dir.path(), Some("backend")), Ok(Existing::Linked)));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let empty = FakeVault::new(vec![]);
+        assert!(matches!(check(&empty, dir2.path(), Some("fresh")), Ok(Existing::New)));
+        let r = execute(&empty, dir2.path(), Some("fresh"), None, false).unwrap();
+        assert!(r.created);
     }
 }
