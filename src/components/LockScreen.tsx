@@ -20,11 +20,14 @@ export function LockScreen() {
   const [bioAvailable, setBioAvailable] = useState(false);
   const [bioLoading,   setBioLoading]   = useState(false);
   const [bioError,     setBioError]     = useState('');
+  const [bioNotice,    setBioNotice]    = useState(false);
   const ref = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     ref.current?.focus();
     invoke<boolean>('vault_is_setup').then(setIsSetup).catch(() => setIsSetup(false));
+
+    invoke<boolean>('biometric_reenroll_notice').then(setBioNotice).catch(() => {});
 
     invoke<string>('biometric_check').then((status) => {
       if (status === 'available') {
@@ -61,6 +64,11 @@ export function LockScreen() {
     } finally {
       setBioLoading(false);
     }
+  };
+
+  const dismissBioNotice = () => {
+    setBioNotice(false);
+    invoke('biometric_dismiss_notice').catch(() => {});
   };
 
   const btnLabel = isSetup === false ? t('lock.createVault') : t('lock.unlockVault');
@@ -146,6 +154,20 @@ export function LockScreen() {
               </>
             )}
           </button>
+
+          {/* One-time notice: the biometric enrollment was removed (upgrade or password change) */}
+          {bioNotice && (
+            <div className="flex items-start gap-2 text-[11px] text-tx2 border border-bd2 rounded-[3px] bg-raised px-3 py-2">
+              <span className="flex-1 leading-[1.6]">{t('lock.bioReenroll')}</span>
+              <button
+                onClick={dismissBioNotice}
+                aria-label={t('lock.bioReenrollDismiss')}
+                className="text-tx3 hover:text-tx transition-colors cursor-pointer"
+              >
+                <Icon name="close" size={12} />
+              </button>
+            </div>
+          )}
 
           {/* Windows Hello button — only shown when biometric is enrolled */}
           {bioAvailable && (

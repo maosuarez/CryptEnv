@@ -184,6 +184,8 @@
     "unlocking": "UNLOCKING…",
     "verifying": "VERIFYING…",
     "windowsHello": "UNLOCK WITH WINDOWS HELLO",
+    "bioReenroll": "Biometric unlock was reset. Enter your master password and enable it again.",
+    "bioReenrollDismiss": "Dismiss",
     "keyDerivation": "key derivation",
     "localOnly": "local only",
     "sessionLocked": "Vault locked — unlock to continue"
@@ -619,6 +621,7 @@
       "confirmChange": "CONFIRM CHANGE"
     },
     "masterPwPlaceholder": "Master password…",
+    "bioReenroll": "Biometric unlock was reset. Enable it again.",
     "pressKeys": "Press keys…",
     "minutes": "{n} min",
     "never": "Never",

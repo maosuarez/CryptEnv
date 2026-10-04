@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::{
     decrypt_item, migrate_literal_vars_to_items, Category, SharedState, UnlockPayload, VaultItem,
 };
+use crate::biometric::{self, wrap, HelloError, HelloSigner};
 use crate::crypto::{self, CryptoKey};
 
 // ─── auto_lock_timeout ────────────────────────────────────────────────────────
@@ -220,6 +221,39 @@ pub async fn unlock_with_password(
     .await
 }
 
+/// Unlocks with Windows Hello: the stored challenge is signed (Hello prompt),
+/// the vault key unwrapped and verified against the verify token. Runs as the
+/// derivation phase of the shared unlock, so the epoch re-check and the final
+/// `set_key` commit are the same as for a password unlock. A cancelled prompt
+/// or a failed unwrap is not a wrong password and does not count against the
+/// password throttle.
+pub async fn unlock_with_biometric(
+    shared: &SharedState,
+    signer: Arc<dyn HelloSigner>,
+    want_payload: bool,
+) -> Result<UnlockOutcome, UnlockError> {
+    let blob = shared
+        .lock()
+        .await
+        .db
+        .get_setting(biometric::BLOB_SETTING)
+        .await
+        .map_err(UnlockError::Other)?
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| UnlockError::Other("biometric unlock is not enrolled".to_string()))?;
+    let enrollment = wrap::Enrollment::parse(&blob).ok_or_else(|| {
+        UnlockError::Other(HelloError::Unusable.message())
+    })?;
+
+    unlock_with_kdf(shared, false, want_payload, move |meta| {
+        let (_, token) = meta.ok_or(UnlockError::NotInitialized)?;
+        let key = wrap::unlock_key(&*signer, &enrollment, &token)
+            .map_err(|e| UnlockError::Other(e.message()))?;
+        Ok(Derived { key, new_meta: None })
+    })
+    .await
+}
+
 /// [`unlock_with_password`] with the derivation injected (tests use a slow one).
 async fn unlock_with_kdf<F>(
     shared: &SharedState,
@@ -367,9 +401,26 @@ pub async fn change_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<(), String> {
+    change_password_with_signer(shared, current_password, new_password, biometric::platform_signer())
+        .await
+}
+
+/// [`change_password`] with the Hello signer injected (tests use a fake one).
+pub(super) async fn change_password_with_signer(
+    shared: &SharedState,
+    current_password: &str,
+    new_password: &str,
+    signer: Arc<dyn HelloSigner>,
+) -> Result<(), String> {
     let current = Zeroizing::new(current_password.as_bytes().to_vec());
     let new = Zeroizing::new(new_password.as_bytes().to_vec());
-    change_password_with_kdf(shared, move |meta| derive_for_rekey(&current, &new, meta)).await
+    change_password_with_kdf(shared, move |meta| derive_for_rekey(&current, &new, meta)).await?;
+    // The biometric enrollment wraps the old vault key: drop it and ask the
+    // user to re-enroll. The password change itself has already succeeded.
+    if let Err(e) = super::biometric_enrollment::invalidate(shared, signer, true).await {
+        eprintln!("could not clear biometric enrollment after password change: {e}");
+    }
+    Ok(())
 }
 
 /// [`change_password`] with the derivation injected (tests use a slow one).

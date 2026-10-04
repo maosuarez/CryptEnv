@@ -354,6 +354,7 @@ export function Settings() {
 
   const [bioAvailable, setBioAvailable] = useState(false);
   const [bioEnrolled,  setBioEnrolled]  = useState(false);
+  const [bioNotice,    setBioNotice]    = useState(false);
   const [bioPw,        setBioPw]        = useState('');
   const [showBioPw,    setShowBioPw]    = useState(false);
   const [bioWorking,   setBioWorking]   = useState(false);
@@ -406,6 +407,7 @@ export function Settings() {
       if (status === 'available') {
         setBioAvailable(true);
         invoke<boolean>('biometric_is_enrolled').then(setBioEnrolled).catch(() => {});
+        invoke<boolean>('biometric_reenroll_notice').then(setBioNotice).catch(() => {});
       }
     }).catch(() => {});
   }, []);
@@ -498,6 +500,7 @@ export function Settings() {
     try {
       await invoke('biometric_enroll', { password: bioPw });
       setBioEnrolled(true);
+      setBioNotice(false);
       setBioPw('');
       showToast(t('settings.toast.bioEnabled'));
     } catch (e: unknown) {
@@ -593,6 +596,9 @@ export function Settings() {
               </div>
             ) : (
               <div className="flex items-center gap-2">
+                {bioNotice && (
+                  <span className="text-[11px] text-tx2 max-w-[200px] leading-[1.5]">{t('settings.bioReenroll')}</span>
+                )}
                 <div className="relative">
                   <input
                     type={showBioPw ? 'text' : 'password'}
