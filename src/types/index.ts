@@ -106,6 +106,9 @@ export interface InjectResult {
   unmanagedPaths: string[];
   /** `.bak` paths created because a write target was unmanaged. */
   backups:        string[];
+  /** Keys NOT written: the referenced item could not be decrypted, or the key
+   *  is not a valid dotenv name. Names only; the other keys were written. */
+  failedKeys:     string[];
 }
 
 /** Result of `environment_inject_preview` — resolves and inspects the

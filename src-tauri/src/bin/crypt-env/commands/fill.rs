@@ -75,6 +75,9 @@ pub fn execute(api: &dyn VaultApi, ws: &scope::Workspace, env_flag: Option<&str>
         for b in &result.backups {
             lines.push(format!("  backup of a pre-existing unmanaged file: {b}"));
         }
+        if !result.failed_keys.is_empty() {
+            lines.push(format!("  not written (item could not be decrypted or invalid key name): {}", result.failed_keys.join(", ")));
+        }
         let keys: BTreeSet<String> = env.vars.iter().map(|v| v.key.clone()).collect();
         for dir in example_dirs(&result.paths) {
             examples.entry(dir).or_default().extend(keys.iter().cloned());
@@ -201,6 +204,26 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![dir.path().to_path_buf(), web.clone()]);
         assert!(web.join(".env.example").is_file());
+    }
+
+    #[test]
+    fn failed_keys_are_reported_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = FakeVault::new(vec![project(
+            "app",
+            Some(&paths::to_host(dir.path())),
+            vec![env(1, "default", true, &[".env"])],
+        )]);
+        *vault.inject_paths.borrow_mut() = vec![paths::to_host(&dir.path().join(".env"))];
+        *vault.inject_failed_keys.borrow_mut() = vec!["BAD_ONE".into(), "BAD_TWO".into()];
+
+        let report = execute(&vault, &workspace(dir.path()), None).unwrap();
+
+        assert!(
+            report.lines.iter().any(|l| l.contains("not written") && l.contains("BAD_ONE, BAD_TWO")),
+            "{:?}",
+            report.lines
+        );
     }
 
     #[cfg(unix)]

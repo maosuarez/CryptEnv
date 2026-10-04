@@ -276,6 +276,7 @@
       "injected_other": "{n} variáveis injetadas → {target}",
       "unmanaged_one": " (aviso: {n} caminho não gerenciado escrito, backup mantido)",
       "unmanaged_other": " (aviso: {n} caminhos não gerenciados escritos, backup mantido)",
+      "failedKeys": " (não escritas: {keys})",
       "keyRequired": "A chave é obrigatória",
       "pickGlobalFirst": "Escolha um segredo global primeiro",
       "environmentDuplicated": "Ambiente duplicado",

@@ -789,6 +789,38 @@ impl VaultDb {
             .collect())
     }
 
+    /// Same row shape as `list_items`, restricted to `ids` (unknown ids are
+    /// simply absent). Lets callers decrypt only what they reference.
+    pub async fn get_items_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, String, String, String, bool)>, String> {
+        let mut out = Vec::with_capacity(ids.len());
+        // Chunked to stay far below SQLite's bound-parameter limit.
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, item_type, data, created, is_global FROM items WHERE id IN ({placeholders}) ORDER BY id ASC"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            let rows = query.fetch_all(&self.pool).await.map_err(|e| e.to_string())?;
+            for r in rows {
+                let is_global: i64 = r.get(4);
+                out.push((
+                    r.get::<i64, _>(0),
+                    r.get::<String, _>(1),
+                    r.get::<String, _>(2),
+                    r.get::<String, _>(3),
+                    is_global != 0,
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// id = 0 → INSERT (returns new id). id > 0 → UPDATE (returns same id).
     /// `is_global` is written on both insert and update — callers must pass the
     /// item's current/intended value (updates never silently reset it).

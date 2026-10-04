@@ -40,6 +40,13 @@ pub const BACKUP_EXISTS_PREFIX: &str = "backup already exists, refusing to overw
 /// Leading text of the message surfaced as a `409 TARGET_SYMLINK`.
 pub const SYMLINK_PREFIX: &str = "refusing to write through a symlink:";
 
+/// Leading text of the message surfaced as a `409 NOT_REGULAR_FILE`.
+pub const NOT_REGULAR_PREFIX: &str = "refusing to use a target that is not a regular file:";
+
+/// Largest existing target `inspect` reads. A bigger file is classified
+/// `Foreign` without being read in full.
+pub const MAX_INSPECT_BYTES: u64 = 1024 * 1024;
+
 /// Classification of a resolved write target. `Foreign` deliberately
 /// carries no content — a file crypt-env doesn't own is never inspected
 /// beyond "is it ours", so its bytes can never leak into an error message.
@@ -93,6 +100,8 @@ pub enum EnvFileError {
     BackupExists(PathBuf),
     /// The target is a symlink / reparse point; nothing was written.
     Symlink(PathBuf),
+    /// The target exists but is a device, FIFO, socket or directory.
+    NotRegularFile(PathBuf),
     Io(PathBuf, io::ErrorKind),
 }
 
@@ -104,6 +113,7 @@ impl fmt::Display for EnvFileError {
             }
             EnvFileError::BackupExists(path) => write!(f, "{}", backup_exists_message(path)),
             EnvFileError::Symlink(path) => write!(f, "{}", symlink_message(path)),
+            EnvFileError::NotRegularFile(path) => write!(f, "{}", not_regular_message(path)),
             EnvFileError::Io(path, kind) => {
                 write!(f, "io error on {}: {kind:?}", path.display())
             }
@@ -137,6 +147,11 @@ pub fn symlink_message(path: &Path) -> String {
         "{SYMLINK_PREFIX} {}\n — point the environment at the real file instead of a link",
         path.display()
     )
+}
+
+/// The exact "target is not a regular file" message. Names only the path.
+pub fn not_regular_message(path: &Path) -> String {
+    format!("{NOT_REGULAR_PREFIX} {}", path.display())
 }
 
 /// The exact "a previous `.bak` already exists" message.
@@ -186,29 +201,59 @@ fn bak_path(path: &Path) -> PathBuf {
 }
 
 /// Classifies a resolved write target. Never touches its contents beyond
-/// what is needed to decide `Managed` vs `Foreign`.
+/// what is needed to decide `Managed` vs `Foreign`, and never reads more than
+/// `MAX_INSPECT_BYTES`. Devices, FIFOs, sockets and directories are refused
+/// before being opened for reading.
 pub fn inspect(path: &Path) -> Result<Target, EnvFileError> {
     // `symlink_metadata` does not follow the final component, so a link is
     // reported as such instead of being read through.
     match std::fs::symlink_metadata(path) {
         Ok(meta) if is_link(&meta) => return Ok(Target::Symlink),
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(EnvFileError::NotRegularFile(path.to_path_buf()))
+        }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Target::Absent),
         Err(e) => return Err(EnvFileError::Io(path.to_path_buf(), e.kind())),
     }
-    match std::fs::read_to_string(path) {
+
+    use std::io::Read as _;
+    let io_err = |e: io::Error| EnvFileError::Io(path.to_path_buf(), e.kind());
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Belt and braces against the path being swapped for a FIFO or a
+        // link between the check above and this open: neither blocks nor
+        // is followed.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Target::Absent),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Target::Symlink),
+        Err(e) => return Err(io_err(e)),
+    };
+    // Re-check on the opened handle: what was opened is what was checked.
+    if !file.metadata().map_err(io_err)?.file_type().is_file() {
+        return Err(EnvFileError::NotRegularFile(path.to_path_buf()));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_INSPECT_BYTES + 1).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() as u64 > MAX_INSPECT_BYTES {
+        // Too large to be a file crypt-env wrote; never read in full.
+        return Ok(Target::Foreign);
+    }
+    match String::from_utf8(bytes) {
         Ok(content) if is_managed(&content) => Ok(Target::Managed(content)),
         // Content deliberately dropped here — a `Foreign` file's bytes are
-        // never carried forward into an error or a response.
-        Ok(_) => Ok(Target::Foreign),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Target::Absent),
-        // Non-UTF-8 existing file: a binary file is by definition not one
-        // of ours. Never truncate it silently.
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(Target::Foreign),
-        // This replaces the old `unwrap_or_default()` at
-        // `project/mod.rs:328`, which turned an EACCES/EISDIR into a
-        // silent "treat as empty, create new".
-        Err(e) => Err(EnvFileError::Io(path.to_path_buf(), e.kind())),
+        // never carried forward into an error or a response. A non-UTF-8
+        // file is by definition not one of ours; never truncate it silently.
+        _ => Ok(Target::Foreign),
     }
 }
 
@@ -268,7 +313,10 @@ pub fn commit(
         format!("{marker}\n{content}")
     };
 
-    write_with_mode(path, &final_content, opts.mode)?;
+    write_atomic(path, opts.mode, |file| {
+        use std::io::Write as _;
+        file.write_all(final_content.as_bytes())
+    })?;
 
     Ok(Committed { pre_existed, backup })
 }
@@ -311,38 +359,205 @@ pub fn open_nofollow(path: &Path, mode: FileMode) -> Result<std::fs::File, EnvFi
     })
 }
 
-/// Creates (or truncates) `path` at open time with the requested mode —
-/// not write-then-`chmod`, which leaves a window where a secret file exists
-/// at umask permissions and, if the `chmod` fails, returns `Err` after the
-/// target is already truncated with no guard armed.
-fn write_with_mode(path: &Path, content: &str, mode: FileMode) -> Result<(), EnvFileError> {
-    use std::io::Write as _;
+/// Atomically replaces `path`: the body is written to an exclusively
+/// created temp file (`.cenv-*`) in the same directory, `fsync`ed, and
+/// renamed over the target. Any failure leaves the previous file intact and
+/// removes the temp file (it is dropped, and so deleted, on every error
+/// path). `write_body` is the seam tests use to simulate a mid-write failure.
+///
+/// The temp file is created 0600 on Unix, so a secret never exists at umask
+/// permissions. `Private0600` keeps 0600; `Inherit` keeps the mode of the
+/// file being replaced, or 0644 for a new file. On Windows the temp file
+/// inherits the directory ACL (same reasoning as `TempEnvFile::create_guarded`
+/// in `api/mod.rs`).
+fn write_atomic(
+    path: &Path,
+    mode: FileMode,
+    write_body: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> Result<(), EnvFileError> {
+    let io_err = |e: io::Error| EnvFileError::Io(path.to_path_buf(), e.kind());
 
-    let mut file = open_nofollow(path, mode)?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| EnvFileError::Io(path.to_path_buf(), e.kind()))?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".cenv-")
+        .tempfile_in(dir)
+        .map_err(io_err)?;
 
-    // `.mode()` only applies at creation (subject to umask); for an
-    // already-existing target it has no effect. Tighten to 0o600 if the
-    // current mode is group/other-readable — never loosen a mode the user
-    // deliberately set looser than that.
+    write_body(tmp.as_file_mut()).map_err(io_err)?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if matches!(mode, FileMode::Private0600) {
-            if let Ok(meta) = file.metadata() {
-                let current = meta.permissions().mode() & 0o777;
-                if current & 0o077 != 0 {
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                }
-            }
+        if matches!(mode, FileMode::Inherit) {
+            let bits = match std::fs::symlink_metadata(path) {
+                Ok(meta) => meta.permissions().mode() & 0o777,
+                Err(_) => 0o644,
+            };
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(bits))
+                .map_err(io_err)?;
         }
     }
-    // `#[cfg(windows)]`: no ACL API is applied here — the file inherits the
-    // containing directory's ACL, the same reasoning already documented at
-    // `api/mod.rs` for `TempEnvFile::create`.
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    tmp.as_file().sync_all().map_err(io_err)?;
+
+    // Re-check right before the rename: a target swapped for a link or a
+    // special file since `inspect` is refused, never replaced.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_link(&meta) => return Err(EnvFileError::Symlink(path.to_path_buf())),
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(EnvFileError::NotRegularFile(path.to_path_buf()))
+        }
+        _ => {}
+    }
+
+    tmp.persist(path).map_err(|e| io_err(e.error))?;
+
+    // Best effort: persist the rename itself. The content is already in
+    // place, so a failure here must not be reported as a failed write.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
 
     Ok(())
+}
+
+// ─── dotenv grammar ───────────────────────────────────────────────────────────
+
+/// A variable name crypt-env is willing to write: `^[A-Za-z_][A-Za-z0-9_.]*$`.
+pub fn is_valid_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+fn is_bare_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '+' | ',' | '=' | '-')
+}
+
+/// Serializes a value so common dotenv parsers read back exactly `value`:
+/// bare when only safe characters, single-quoted (literal) when there is no
+/// newline, carriage return or `'`, otherwise double-quoted with `\`, `"`,
+/// `$`, newline and carriage return escaped. A value can never end its own
+/// line or open a comment.
+pub fn serialize_value(value: &str) -> String {
+    if value.chars().all(is_bare_char) {
+        return value.to_string();
+    }
+    if !value.contains(['\n', '\r', '\'']) {
+        return format!("'{value}'");
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `KEY=VALUE` for one variable, or `None` when `key` is not a valid name
+/// (the caller reports it by name instead of writing it).
+pub fn serialize_line(key: &str, value: &str) -> Option<String> {
+    if !is_valid_key(key) {
+        return None;
+    }
+    Some(format!("{key}={}", serialize_value(value)))
+}
+
+/// Parses the dotenv grammar `serialize_value` writes (plus `export`
+/// prefixes and `#` comments): bare, single-quoted (literal, may span
+/// lines) and double-quoted (`\\`, `\"`, `\$`, `\n`, `\r` escapes, may span
+/// lines). Lines without a usable `KEY=` are skipped. No interpolation.
+pub fn parse_dotenv(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < content.len() {
+        let line_end = content[pos..].find('\n').map_or(content.len(), |i| pos + i);
+        let line = &content[pos..line_end];
+        let trimmed = line.trim_start();
+        let decl = trimmed.strip_prefix("export ").map_or(trimmed, str::trim_start);
+        let eq = match decl.find('=') {
+            Some(i) if !trimmed.starts_with('#') => i,
+            _ => {
+                pos = line_end + 1;
+                continue;
+            }
+        };
+        let key = decl[..eq].trim();
+        let after_eq = &decl[eq + 1..];
+        let blanks = after_eq.len() - after_eq.trim_start_matches([' ', '\t']).len();
+        // `decl` is a suffix of `line`, so the value's absolute offset is
+        // the end of the line minus what follows the blanks after `=`.
+        let value_start = line_end - (after_eq.len() - blanks);
+        let rest = &content[value_start..];
+        let (value, consumed) = match rest.chars().next() {
+            Some('\'') => parse_single_quoted(rest),
+            Some('"') => parse_double_quoted(rest),
+            _ => {
+                let raw = &content[value_start..line_end];
+                let raw = raw.find(" #").map_or(raw, |i| &raw[..i]);
+                (raw.trim().to_string(), line_end - value_start)
+            }
+        };
+        if !key.is_empty() {
+            out.push((key.to_string(), value));
+        }
+        // Skip whatever trails the value on its last line.
+        let end = value_start + consumed;
+        pos = content[end..].find('\n').map_or(content.len(), |i| end + i + 1);
+    }
+    out
+}
+
+/// `s` starts with `'`. Returns the literal text up to the closing quote and
+/// the number of bytes consumed including both quotes.
+fn parse_single_quoted(s: &str) -> (String, usize) {
+    let body = &s[1..];
+    match body.find('\'') {
+        Some(i) => (body[..i].to_string(), i + 2),
+        None => (body.to_string(), s.len()),
+    }
+}
+
+/// `s` starts with `"`. Returns the unescaped text up to the closing quote
+/// and the number of bytes consumed including both quotes.
+fn parse_double_quoted(s: &str) -> (String, usize) {
+    let mut value = String::new();
+    let mut chars = s.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return (value, i + 1),
+            '\\' => match chars.next() {
+                Some((_, 'n')) => value.push('\n'),
+                Some((_, 'r')) => value.push('\r'),
+                Some((_, e @ ('\\' | '"' | '$'))) => value.push(e),
+                Some((_, other)) => {
+                    value.push('\\');
+                    value.push(other);
+                }
+                None => value.push('\\'),
+            },
+            c => value.push(c),
+        }
+    }
+    (value, s.len())
 }
 
 #[cfg(test)]
@@ -567,5 +782,284 @@ mod tests {
         let opts = WriteOptions { overwrite: true, mode: FileMode::Inherit };
         assert!(matches!(commit(&link, "KEY=1", &marker, &opts), Err(EnvFileError::Symlink(_))));
         assert!(!dest.exists());
+    }
+}
+
+#[cfg(test)]
+mod content_safety_tests {
+    use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    fn roundtrip(value: &str) -> String {
+        let line = serialize_line("K", value).expect("valid key");
+        let parsed = parse_dotenv(&format!("{line}\n"));
+        assert_eq!(parsed.len(), 1, "one variable for {value:?}, got {parsed:?} from {line:?}");
+        assert_eq!(parsed[0].0, "K");
+        parsed[0].1.clone()
+    }
+
+    #[test]
+    fn serialize_picks_bare_single_and_double_forms() {
+        assert_eq!(serialize_value("abc/def_1.2:3@x+y,z=w-v"), "abc/def_1.2:3@x+y,z=w-v");
+        assert_eq!(serialize_value(""), "");
+        assert_eq!(serialize_value("has space"), "'has space'");
+        assert_eq!(serialize_value("a$b#c"), "'a$b#c'");
+        assert_eq!(serialize_value("it's"), "\"it's\"");
+        assert_eq!(serialize_value("a\nb"), "\"a\\nb\"");
+        assert_eq!(serialize_value("a\\b\"c$d\r"), "\"a\\\\b\\\"c\\$d\\r\"");
+    }
+
+    #[test]
+    fn injection_attempt_in_value_yields_one_variable() {
+        let value = "x\nADMIN=1";
+        let line = serialize_line("K", value).unwrap();
+        assert!(!line.contains('\n'), "serialized line must be a single physical line");
+        let parsed = parse_dotenv(&format!("{line}\n"));
+        assert_eq!(parsed, vec![("K".to_string(), value.to_string())]);
+    }
+
+    #[test]
+    fn pem_value_is_one_double_quoted_line_and_roundtrips() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg$kq\n-----END PRIVATE KEY-----\n";
+        let line = serialize_line("PEM", pem).unwrap();
+        assert!(line.starts_with("PEM=\"") && !line.contains('\n'));
+        assert_eq!(roundtrip(pem), pem);
+    }
+
+    #[test]
+    fn dollar_and_single_quote_roundtrip() {
+        assert_eq!(roundtrip("pa$$word"), "pa$$word");
+        assert_eq!(roundtrip("it's $HOME"), "it's $HOME");
+    }
+
+    #[test]
+    fn key_validation() {
+        for ok in ["A", "_a", "A_B1", "a.b"] {
+            assert!(is_valid_key(ok), "{ok}");
+        }
+        for bad in ["", "1A", "A B", "A-B", "A=B", "A\nB", "é", "A#"] {
+            assert!(!is_valid_key(bad), "{bad:?}");
+            assert!(serialize_line(bad, "v").is_none());
+        }
+    }
+
+    #[test]
+    fn parser_handles_comments_export_and_trailing_text() {
+        let src = "# c\n\nexport A=1\nB='x y' # note\nC=\"l1\\nl2\"\nD=bare # comment\nnoequals\n";
+        assert_eq!(
+            parse_dotenv(src),
+            vec![
+                ("A".into(), "1".into()),
+                ("B".into(), "x y".into()),
+                ("C".into(), "l1\nl2".into()),
+                ("D".into(), "bare".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn property_serialize_then_parse_returns_original() {
+        let alphabet: Vec<char> = "aZ09 _-./:@+,=$#'\"\\\n\r\t!&*()<>`~;|é☃".chars().collect();
+        let mut rng = StdRng::seed_from_u64(0xC0DE);
+        for _ in 0..5000 {
+            let len = rng.gen_range(0..24);
+            let value: String = (0..len).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
+            assert_eq!(roundtrip(&value), value, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn multiple_lines_parse_independently() {
+        let mut content = String::new();
+        for (k, v) in [("A", "x\ny"), ("B", "it's"), ("C", "plain"), ("D", "a b")] {
+            content.push_str(&serialize_line(k, v).unwrap());
+            content.push('\n');
+        }
+        assert_eq!(
+            parse_dotenv(&content),
+            vec![
+                ("A".into(), "x\ny".into()),
+                ("B".into(), "it's".into()),
+                ("C".into(), "plain".into()),
+                ("D".into(), "a b".into()),
+            ]
+        );
+    }
+
+    /// Runs `program`; `None` when the tool is missing or the check cannot
+    /// run, so the compatibility tests skip instead of failing.
+    fn run_tool(program: &str, args: &[&str]) -> Option<String> {
+        let out = std::process::Command::new(program).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn fixture(dir: &Path, vars: &[(&str, &str)]) -> PathBuf {
+        let file = dir.join("fixture.env");
+        let mut content = String::new();
+        for (k, v) in vars {
+            content.push_str(&serialize_line(k, v).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(&file, content).unwrap();
+        file
+    }
+
+    #[test]
+    fn compat_fixture_bash_source_reads_bare_and_single_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = fixture(dir.path(), &[("BARE", "abc/def:1"), ("SPACE", "a b $HOME #x"), ("EMPTY", "")]);
+        let script = format!("set -a; . '{}'; printf '%s|%s|%s' \"$BARE\" \"$SPACE\" \"$EMPTY\"", file.display());
+        let Some(out) = run_tool("bash", &["-c", &script]) else { return };
+        assert_eq!(out, "abc/def:1|a b $HOME #x|");
+    }
+
+    #[test]
+    fn compat_fixture_python_dotenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = "-----BEGIN-----\nab\"c\\d\n-----END-----";
+        let file = fixture(dir.path(), &[("A", "plain"), ("B", "a b"), ("C", pem), ("D", "it's")]);
+        let code = "import sys,json;from dotenv import dotenv_values;print(json.dumps(dotenv_values(sys.argv[1])))";
+        let Some(out) = run_tool("python3", &["-c", code, file.to_str().unwrap()]) else { return };
+        let got: std::collections::BTreeMap<String, String> = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(got["A"], "plain");
+        assert_eq!(got["B"], "a b");
+        assert_eq!(got["C"], pem);
+        assert_eq!(got["D"], "it's");
+    }
+
+    #[test]
+    fn compat_fixture_node_dotenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = "-----BEGIN-----\nabc\n-----END-----";
+        let file = fixture(dir.path(), &[("A", "plain"), ("B", "a b"), ("C", pem), ("D", "it's")]);
+        let code = "const fs=require('fs');const d=require('dotenv');console.log(JSON.stringify(d.parse(fs.readFileSync(process.argv[1]))))";
+        let Some(out) = run_tool("node", &["-e", code, file.to_str().unwrap()]) else { return };
+        let got: std::collections::BTreeMap<String, String> = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(got["A"], "plain");
+        assert_eq!(got["B"], "a b");
+        assert_eq!(got["C"], pem);
+        assert_eq!(got["D"], "it's");
+    }
+
+    // ── inspect gate ──
+
+    #[test]
+    fn inspect_refuses_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(inspect(dir.path()), Err(EnvFileError::NotRegularFile(_))));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_refuses_dev_zero_quickly() {
+        let start = std::time::Instant::now();
+        let r = inspect(Path::new("/dev/zero"));
+        assert!(matches!(r, Err(EnvFileError::NotRegularFile(_))), "{r:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_refuses_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(inspect(&p));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("inspect blocked on FIFO");
+        assert!(matches!(r, Err(EnvFileError::NotRegularFile(_))), "{r:?}");
+    }
+
+    #[test]
+    fn inspect_treats_file_over_1mib_as_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.env");
+        // Begins with the marker but exceeds the bound: still never read in full.
+        let mut content = format!("{MARKER_PREFIX} managed file\n").into_bytes();
+        content.resize(2 * 1024 * 1024, b'a');
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(inspect(&path).unwrap(), Target::Foreign);
+    }
+
+    // ── atomic write ──
+
+    fn cenv_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".cenv-"))
+            .collect()
+    }
+
+    #[test]
+    fn failed_write_keeps_previous_content_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "previous\n").unwrap();
+
+        let r = write_atomic(&path, FileMode::Private0600, |f| {
+            use std::io::Write as _;
+            f.write_all(b"partial secret")?;
+            Err(io::Error::other("disk full"))
+        });
+        assert!(matches!(r, Err(EnvFileError::Io(..))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous\n");
+        assert!(cenv_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn successful_commit_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let opts = WriteOptions { overwrite: false, mode: FileMode::Private0600 };
+        commit(&path, "A=1\n", &marker_line("p", "e"), &opts).unwrap();
+        assert!(cenv_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_file_is_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let opts = WriteOptions { overwrite: false, mode: FileMode::Private0600 };
+        commit(&path, "A=1\n", &marker_line("p", "e"), &opts).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inherit_mode_keeps_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.example");
+        std::fs::write(&path, format!("{MARKER_PREFIX} x\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let opts = WriteOptions { overwrite: false, mode: FileMode::Inherit };
+        commit(&path, "A=\n", &marker_line("p", "e"), &opts).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o664);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn target_swapped_for_symlink_before_rename_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let r = write_atomic(&path, FileMode::Private0600, |f| {
+            use std::io::Write as _;
+            // Simulates the race: the link appears while the body is written.
+            std::os::unix::fs::symlink(&victim, &path)?;
+            f.write_all(b"secret")
+        });
+        assert!(matches!(r, Err(EnvFileError::Symlink(_))), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(cenv_temp_files(dir.path()).is_empty());
     }
 }

@@ -132,11 +132,10 @@ pub fn parse_input(input: &str) -> Result<Vec<(String, String)>, CliError> {
             "'{input}' is not KEY=value, $VARNAME, or an existing .env file"
         )));
     }
-    let mut pairs = Vec::new();
-    for item in dotenvy::from_path_iter(input).map_err(|e| CliError::Config(e.to_string()))? {
-        pairs.push(item.map_err(|e| CliError::Config(e.to_string()))?);
-    }
-    Ok(pairs)
+    // Same grammar crypt-env writes (`envfile::serialize_value`), so a file
+    // it produced reads back exactly.
+    let content = std::fs::read_to_string(input).map_err(|e| CliError::Config(format!("{input}: {}", e.kind())))?;
+    Ok(crypt_env_lib::envfile::parse_dotenv(&content))
 }
 
 /// Keys of `pairs` already present in `existing` (case-sensitive, like the

@@ -13,6 +13,7 @@ pub struct FakeVault {
     /// Shared so a test can expire the session after handing the vault to an `App`.
     pub alive: Rc<Cell<bool>>,
     pub inject_paths: RefCell<Vec<String>>,
+    pub inject_failed_keys: RefCell<Vec<String>>,
 }
 
 impl FakeVault {
@@ -22,6 +23,7 @@ impl FakeVault {
             calls: RefCell::new(Vec::new()),
             alive: Rc::new(Cell::new(true)),
             inject_paths: RefCell::new(Vec::new()),
+            inject_failed_keys: RefCell::new(Vec::new()),
         }
     }
 
@@ -83,7 +85,7 @@ impl VaultApi for FakeVault {
     }
     fn inject_environment(&self, _env_id: i64) -> Result<InjectResult, CliError> {
         self.record("inject_environment");
-        Ok(InjectResult { paths: self.inject_paths.borrow().clone(), written: vec![], backups: vec![] })
+        Ok(InjectResult { paths: self.inject_paths.borrow().clone(), written: vec![], backups: vec![], failed_keys: self.inject_failed_keys.borrow().clone() })
     }
     fn list_items(&self, _p: &str, _e: &str, _g: &str) -> Result<Vec<ItemSummary>, CliError> {
         Ok(Vec::new())

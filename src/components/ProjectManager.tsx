@@ -2164,7 +2164,10 @@ export function ProjectManager() {
       if (result.unmanagedPaths.length > 0) {
         msg += t(result.unmanagedPaths.length === 1 ? 'projects.toast.unmanaged_one' : 'projects.toast.unmanaged_other', { n: result.unmanagedPaths.length });
       }
-      showToast(msg);
+      if (result.failedKeys.length > 0) {
+        msg += t('projects.toast.failedKeys', { keys: result.failedKeys.join(', ') });
+      }
+      showToast(msg, result.failedKeys.length > 0 ? 'error' : undefined);
     } catch (e) {
       if (String(e) !== 'Error: cancelled') reportError(e);
     } finally {

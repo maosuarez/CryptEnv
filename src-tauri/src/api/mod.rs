@@ -232,6 +232,9 @@ fn err_envfile(e: envfile::EnvFileError) -> axum::response::Response {
         envfile::EnvFileError::Symlink(_) => {
             err_json(StatusCode::CONFLICT, &e.to_string(), "TARGET_SYMLINK").into_response()
         }
+        envfile::EnvFileError::NotRegularFile(_) => {
+            err_json(StatusCode::CONFLICT, &e.to_string(), "NOT_REGULAR_FILE").into_response()
+        }
         envfile::EnvFileError::Io(..) => {
             err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot write file: {e}"), "INTERNAL_ERROR")
                 .into_response()
@@ -1760,7 +1763,7 @@ async fn handle_fill(
             if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 let key_lower = key.to_lowercase();
                 if let Some(value) = key_to_value.get(&key_lower) {
-                    new_lines.push(format!("{key}={value}"));
+                    new_lines.push(format!("{key}={}", envfile::serialize_value(value)));
                     injected += 1;
                     continue;
                 } else {
@@ -2568,6 +2571,9 @@ async fn handle_inject_environment(
         }
         Err(e) if e.starts_with(envfile::SYMLINK_PREFIX) => {
             err_json(StatusCode::CONFLICT, &e, "TARGET_SYMLINK").into_response()
+        }
+        Err(e) if e.starts_with(envfile::NOT_REGULAR_PREFIX) => {
+            err_json(StatusCode::CONFLICT, &e, "NOT_REGULAR_FILE").into_response()
         }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
     }
