@@ -5,14 +5,19 @@
 
 use std::io::BufRead;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-/// Archivos .env temporales pendientes de limpieza del ciclo anterior.
-static TEMP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Keys chosen with `crypt_env_inject_env`, passed by *name* to the backend on
+/// each `crypt_env_run_command`. Values never reach this process: the backend
+/// resolves them and puts them in the child's environment itself.
+static INJECT_KEYS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+
+/// Ids of commands currently running in the backend; cancelled when the host
+/// closes stdin so no child outlives the MCP session.
+static ACTIVE_RUNS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Built-in REST base URL, used when `CRYPTENV_API_URL` is unset or empty.
 const DEFAULT_API_BASE: &str = "https://127.0.0.1:47821";
@@ -330,7 +335,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_generate_env",
-            "description": "Writes a .env file with the real values of the specified secrets, looked up within a project+environment scope. Returns the file path — values never appear in the response. Requires scope: 'environment_id', or both 'project' and 'environment'.",
+            "description": "Asks the user to approve writing a plaintext .env file with the real values of the specified secrets, looked up within a project+environment scope. The call returns status 'pending_approval' and an approvalId: the user must approve in the crypt-env desktop app, then poll crypt_env_approval_status for the file path (values never appear in any response). The file is private to the user (0600), and is deleted after 10 minutes, when the vault locks, and at app exit. Requires scope: 'environment_id', or both 'project' and 'environment'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -344,7 +349,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_inject_env",
-            "description": "Injects a secret as an environment variable into the MCP process, looked up within a project+environment scope. Does not return the value. Requires scope: 'environment_id', or both 'project' and 'environment'.",
+            "description": "Selects a secret to be injected as an environment variable into later crypt_env_run_command calls, looked up within a project+environment scope. Only the key name is recorded: the value is resolved by the crypt-env backend and never reaches this process or the response. It does NOT change the environment of this MCP process. Requires scope: 'environment_id', or both 'project' and 'environment'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -418,18 +423,17 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_update_settings",
-            "description": "Updates settings: auto_lock_timeout (minutes) and hotkey. Changing master_password is not allowed.",
+            "description": "Updates the global hotkey. Security settings (auto-lock timeout, master password, MCP token, biometrics) can only be changed by the user in the app.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "auto_lock_timeout": { "type": "integer", "description": "Minutes until auto-lock (0 = never)" },
                     "hotkey": { "type": "string", "description": "Global shortcut, e.g. Ctrl+Alt+Z" }
                 }
             }
         },
         {
             "name": "crypt_env_fill_env",
-            "description": "Fills a .env.example template with real secret values from a project+environment scope, matching keys against that environment's linked variables. Secret values never appear in the response — use crypt_env_list_items first to discover available keys, then write a .env.example, then call this to produce the final .env the service will read. Requires scope: 'environment_id', or both 'project' and 'environment'. Write destination: 'output_path' writes exactly there; 'output_dir' (no output_path) writes to '{output_dir}/.env.<environment-name>'; neither returns the filled content inline. Writes refuse to clobber a file crypt-env did not create — see 'overwrite'.",
+            "description": "Fills a .env.example template with real secret values from a project+environment scope, matching keys against that environment's linked variables. Secret values never appear in the response — use crypt_env_list_items first to discover available keys, then write a .env.example, then call this to produce the final .env the service will read. Requires scope: 'environment_id', or both 'project' and 'environment'. Write destination (required): 'output_path' writes exactly there; 'output_dir' (no output_path) writes to '{output_dir}/.env.<environment-name>'. The destination must be inside a registered project root (otherwise the call is forbidden), and the filled content is never returned. Writes refuse to clobber a file crypt-env did not create: overwriting such a file is forbidden for MCP callers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -463,14 +467,14 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_run_command",
-            "description": "Returns a command string with {{VAR}} placeholders resolved. Does not execute it. The command is looked up within a project+environment scope. Requires scope: 'environment_id', or both 'project' and 'environment'.",
+            "description": "Runs a saved command inside the crypt-env backend and returns its exit code and redacted output. The command is looked up within a project+environment scope. {{VAR}} placeholders are filled from 'params'; every value must match [A-Za-z0-9._/:@=+,-]{0,256} (no spaces or shell metacharacters), otherwise the call fails and nothing runs. Secrets chosen with crypt_env_inject_env are placed in the child's environment by the backend; the child starts from an empty environment, so nothing else is inherited. Output is redacted (injected values and their base64/hex forms become [REDACTED:KEY]), capped at 2000 characters per stream, stdin is empty, and the whole process tree is killed after 120 seconds. A command that transforms a secret before printing it can defeat redaction. Requires scope: 'environment_id', or both 'project' and 'environment'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Command name" },
                     "params": {
                         "type": "object",
-                        "description": "Map of VAR → value to resolve placeholders",
+                        "description": "Map of VAR → value to resolve placeholders. Values must match [A-Za-z0-9._/:@=+,-]{0,256}.",
                         "additionalProperties": { "type": "string" }
                     },
                     "environment_id": { "type": "integer", "description": "Environment ID (scope). Provide this, or both 'project' and 'environment'." },
@@ -482,7 +486,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_share_listen",
-            "description": "Start a share session as sender (LAN bridge). Registers mDNS and waits for a peer to connect using the returned pairing code. Shared item ids must already be linked into the given project+environment. Requires scope: 'environment_id', or both 'project' and 'environment'.",
+            "description": "Start a share session as sender (LAN bridge). Registers mDNS and waits for a peer to connect using the returned pairing code. The fingerprint must be confirmed by the user in the crypt-env desktop app; it cannot be confirmed through MCP. Shared item ids must already be linked into the given project+environment. Requires scope: 'environment_id', or both 'project' and 'environment'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -500,7 +504,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_share_connect",
-            "description": "Connect to a sender as receiver using the pairing code. Returns a fingerprint that both sides must verify before data flows. Received items are owned by and linked into the given project+environment. Requires scope: 'environment_id', or both 'project' and 'environment'.",
+            "description": "Connect to a sender as receiver using the pairing code. Returns a fingerprint that the user must verify in the crypt-env desktop app before data flows; it cannot be confirmed through MCP. Received items are owned by and linked into the given project+environment. Requires scope: 'environment_id', or both 'project' and 'environment'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -510,17 +514,6 @@ fn tool_definitions() -> serde_json::Value {
                     "environment": { "type": "string", "description": "Environment name within the project (case-insensitive), e.g. production, local, test. Used with 'project'." }
                 },
                 "required": ["pairing_code"]
-            }
-        },
-        {
-            "name": "crypt_env_share_confirm",
-            "description": "Confirm (or reject) the fingerprint shown after ECDH. Both sides must call this. Pass confirmed=true only when the fingerprints match.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "confirmed": { "type": "boolean", "description": "true to confirm, false to cancel" }
-                },
-                "required": ["confirmed"]
             }
         },
         {
@@ -535,7 +528,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_share_export",
-            "description": "Export selected vault items as an AES-256-GCM encrypted .vault package file. IMPORTANT: Show the passphrase to the user immediately. It will not be stored.",
+            "description": "Asks the user to approve exporting selected vault items as an AES-256-GCM encrypted .vault package file. The call returns status 'pending_approval' and an approvalId; the user approves in the crypt-env desktop app, which shows them the passphrase. The passphrase is never returned to you. Poll crypt_env_approval_status for the outcome.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -644,7 +637,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_relay_send",
-            "description": "Send vault items via internet relay. Returns a code and passphrase. IMPORTANT: Show code and passphrase to user immediately. The passphrase is only shown once.",
+            "description": "Asks the user to approve sending vault items via the internet relay. The call returns status 'pending_approval' and an approvalId; the user approves in the crypt-env desktop app, which shows them the relay code and passphrase. They are never returned to you. Poll crypt_env_approval_status for the outcome.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -688,7 +681,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_add_mcp_server",
-            "description": "Register a new MCP server entry in the Claude config. Env keys are stored as empty placeholders — actual values come from the vault at runtime via crypt_env_inject_env.",
+            "description": "Asks the user to approve registering a new MCP server entry in the Claude config (the command will later run on their machine). Returns status 'pending_approval' and an approvalId; poll crypt_env_approval_status. Env keys are stored as empty placeholders.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -707,7 +700,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_update_mcp_server",
-            "description": "Update an existing MCP server entry by name. Only provided fields are changed; omitted fields are preserved.",
+            "description": "Asks the user to approve updating an existing MCP server entry by name. Only provided fields are changed. Returns status 'pending_approval' and an approvalId; poll crypt_env_approval_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -726,7 +719,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "crypt_env_delete_mcp_server",
-            "description": "Remove an MCP server entry from the Claude config by name.",
+            "description": "Asks the user to approve removing an MCP server entry from the Claude config by name. Returns status 'pending_approval' and an approvalId; poll crypt_env_approval_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -734,6 +727,17 @@ fn tool_definitions() -> serde_json::Value {
                     "scope": { "type": "string", "description": "'global' or 'project'. Default: 'global'.", "enum": ["global", "project"] }
                 },
                 "required": ["name"]
+            }
+        },
+        {
+            "name": "crypt_env_approval_status",
+            "description": "Polls a request that needs the user's approval in the crypt-env desktop app (relay_send, share_export, add/update/delete_mcp_server, generate_env). Returns status pending, approved, denied or expired, plus non-secret result metadata. Codes, passphrases and secret values are shown only to the user in the app and are never returned here. A pending request expires after 120 seconds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "approvalId returned by the pending tool call" }
+                },
+                "required": ["id"]
             }
         },
         {
@@ -916,16 +920,113 @@ fn is_safe_env_key(key: &str) -> bool {
     true
 }
 
-fn cleanup_prev_temp_files() {
-    if let Ok(mut files) = TEMP_FILES.lock() {
-        files.retain(|p| std::fs::remove_file(p).is_err());
+/// `true` for the names the pre-hardening `generate_env` left in the shared
+/// temp directory: `crypt_env_` + 16 hex digits + `.env`.
+fn is_legacy_temp_name(name: &str) -> bool {
+    match name.strip_prefix("crypt_env_").and_then(|r| r.strip_suffix(".env")) {
+        Some(hex) => hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
     }
 }
 
-fn track_temp_file(path: PathBuf) {
-    if let Ok(mut files) = TEMP_FILES.lock() {
-        files.push(path);
+/// Best-effort removal of plaintext files an older version left in the shared
+/// temp directory. Only regular files owned by the current user are touched.
+fn sweep_legacy_temp_files() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_legacy_temp_name(name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
+}
+
+/// Maps a 403 body to the right tool error: the vault being locked, or the
+/// operation being reserved for the user (`MCP_FORBIDDEN`).
+fn forbidden_or_locked(text: &str) -> serde_json::Value {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
+    let is_forbidden = parsed
+        .as_ref()
+        .and_then(|v| v.get("code"))
+        .and_then(|c| c.as_str())
+        == Some("MCP_FORBIDDEN");
+    if is_forbidden {
+        let msg = parsed
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("this operation is reserved for the user");
+        tool_err(format!("forbidden: {msg}. This must be done by the user in the crypt-env app."))
+    } else {
+        tool_err("vault_locked: unlock the vault first")
+    }
+}
+
+/// Shapes the response of a tool whose operation needs the user's approval.
+/// `202` becomes a `pending_approval` result; nothing secret is ever present.
+fn approval_response(status: u16, text: &str, what: &str) -> serde_json::Value {
+    if status == 202 {
+        let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+        return tool_ok(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "pending_approval",
+                "approvalId": v.get("approvalId"),
+                "expiresInSeconds": v.get("expiresIn"),
+                "next": "The user must approve this in the crypt-env desktop app (it expires in 120 seconds). \
+                         Poll crypt_env_approval_status with this approvalId. Any code or passphrase is shown \
+                         only to the user in the app.",
+            }))
+            .unwrap_or_default(),
+        );
+    }
+    if status == 403 {
+        return forbidden_or_locked(text);
+    }
+    if status == 429 {
+        return tool_err("too many approvals are pending; ask the user to resolve them in the app first");
+    }
+    if status >= 400 {
+        return tool_err(format!("{what} failed (HTTP {status}): {text}"));
+    }
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| text.to_string())),
+        Err(_) => tool_ok(text.to_string()),
+    }
+}
+
+/// `POST` with a custom timeout (commands may legitimately run for 120 s).
+fn vault_post_timeout(
+    path: &str,
+    token: &str,
+    body: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Response, String> {
+    mcp_http_client_timeout(timeout)
+        .post(format!("{}{path}", api_base()))
+        .header("X-Vault-Token", token)
+        .json(body)
+        .send()
+        .map_err(|e| {
+            if e.is_connect() {
+                "Error: crypt-env app is not running. Open the application and try again.".to_string()
+            } else {
+                e.to_string()
+            }
+        })
 }
 
 // ─── Tool implementations ─────────────────────────────────────────────────────
@@ -1040,9 +1141,6 @@ fn tool_get_item(args: &serde_json::Value, token: &str) -> serde_json::Value {
 }
 
 fn tool_generate_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
-    // Limpiar archivos .env del ciclo anterior antes de crear uno nuevo
-    cleanup_prev_temp_files();
-
     let keys: Vec<String> = match args.get("keys").and_then(|v| v.as_array()) {
         Some(arr) => arr
             .iter()
@@ -1051,115 +1149,28 @@ fn tool_generate_env(args: &serde_json::Value, token: &str) -> serde_json::Value
         None => return tool_err("required parameter: 'keys' (array of strings)"),
     };
 
-    let mut env_lines: Vec<String> = Vec::new();
-    let mut n_found = 0usize;
-
-    for key in &keys {
-        if !is_safe_env_key(key) {
-            env_lines.push(format!("# {key}: invalid or blocked name, skipped"));
-            continue;
+    // The backend resolves the values and writes the file itself, after the
+    // user approves; this process never sees a secret.
+    let mut body = serde_json::json!({ "keys": keys });
+    for field in ["environment_id", "project", "environment"] {
+        if let Some(v) = args.get(field) {
+            body[field] = v.clone();
         }
-
-        let mut search_url = format!("/items?search={}", urlencod(key));
-        let mut sep = '&';
-        append_scope_params(&mut search_url, &mut sep, args);
-        let items_resp = match vault_get(&search_url, token) {
-            Ok(r) => r,
-            Err(e) => return tool_err(e),
-        };
-
-        if items_resp.status().as_u16() == 403 {
-            return tool_err("vault_locked: unlock the vault first");
-        }
-        if items_resp.status().as_u16() == 422 {
-            let text = items_resp.text().unwrap_or_default();
-            return tool_err(format!("scope required: pass 'environment_id', or both 'project' and 'environment' ({text})"));
-        }
-
-        let items_text = match items_resp.text() {
-            Ok(t) => t,
-            Err(e) => return tool_err(format!("error reading items: {e}")),
-        };
-
-        let items_val: serde_json::Value = match serde_json::from_str(&items_text) {
-            Ok(v) => v,
-            Err(_) => {
-                env_lines.push(format!("# {key}: error parsing response"));
-                continue;
-            }
-        };
-
-        let key_lower = key.to_lowercase();
-        let found_id = items_val
-            .as_array()
-            .and_then(|arr| {
-                arr.iter().find(|item| {
-                    item.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|n| n.to_lowercase() == key_lower)
-                        .unwrap_or(false)
-                })
-            })
-            .and_then(|item| item.get("id").and_then(|v| v.as_i64()));
-
-        let item_id = match found_id {
-            Some(id) => id,
-            None => {
-                env_lines.push(format!("# {key}: not found in vault"));
-                continue;
-            }
-        };
-
-        let reveal_resp = match vault_post(
-            &format!("/items/{item_id}/reveal"),
-            token,
-            &serde_json::json!({"confirm": true}),
-        ) {
-            Ok(r) => r,
-            Err(e) => return tool_err(e),
-        };
-
-        let reveal_text = match reveal_resp.text() {
-            Ok(t) => t,
-            Err(e) => return tool_err(format!("error reading reveal: {e}")),
-        };
-
-        let reveal_val: serde_json::Value = match serde_json::from_str(&reveal_text) {
-            Ok(v) => v,
-            Err(_) => {
-                env_lines.push(format!("# {key}: error parsing value"));
-                continue;
-            }
-        };
-
-        let value = reveal_val
-            .get("value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        env_lines.push(format!("{key}={value}"));
-        n_found += 1;
     }
 
-    let content = env_lines.join("\n");
-    let filename = format!("crypt_env_{}.env", random_hex(8));
-    let path = std::env::temp_dir().join(&filename);
-
-    if let Err(e) = std::fs::write(&path, &content) {
-        return tool_err(format!("error writing .env file: {e}"));
+    let resp = match vault_post("/generate-env", token, &body) {
+        Ok(r) => r,
+        Err(e) => return tool_err(e),
+    };
+    let status = resp.status().as_u16();
+    let text = match resp.text() {
+        Ok(t) => t,
+        Err(e) => return tool_err(format!("error reading response: {e}")),
+    };
+    if status == 422 {
+        return tool_err(format!("scope or validation error: {text}"));
     }
-
-    track_temp_file(path.clone());
-
-    let path_str = path.to_string_lossy().to_string();
-    tool_ok(
-        serde_json::to_string_pretty(&serde_json::json!({
-            "path": path_str,
-            "count": n_found,
-            "note": "This file contains secrets in plaintext. Load it and delete it immediately."
-        }))
-        .unwrap_or_default(),
-    )
+    approval_response(status, &text, "generate_env")
 }
 
 fn tool_inject_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
@@ -1175,6 +1186,7 @@ fn tool_inject_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
         ));
     }
 
+    // Confirm the key exists in scope. The item list never carries values.
     let mut search_url = format!("/items?search={}", urlencod(&key));
     let mut sep = '&';
     append_scope_params(&mut search_url, &mut sep, args);
@@ -1202,57 +1214,35 @@ fn tool_inject_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
     };
 
     let key_lower = key.to_lowercase();
-    let found_id = items_val
-        .as_array()
-        .and_then(|arr| {
-            arr.iter().find(|item| {
-                item.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|n| n.to_lowercase() == key_lower)
-                    .unwrap_or(false)
-            })
+    let exists = items_val.as_array().is_some_and(|arr| {
+        arr.iter().any(|item| {
+            item.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.to_lowercase() == key_lower)
+                .unwrap_or(false)
         })
-        .and_then(|item| item.get("id").and_then(|v| v.as_i64()));
+    });
+    if !exists {
+        return tool_err(format!("secret '{key}' not found in vault"));
+    }
 
-    let item_id = match found_id {
-        Some(id) => id,
-        None => return tool_err(format!("secret '{key}' not found in vault")),
-    };
-
-    let reveal_resp = match vault_post(
-        &format!("/items/{item_id}/reveal"),
-        token,
-        &serde_json::json!({"confirm": true}),
-    ) {
-        Ok(r) => r,
-        Err(e) => return tool_err(e),
-    };
-
-    let reveal_text = match reveal_resp.text() {
-        Ok(t) => t,
-        Err(e) => return tool_err(format!("error reading reveal: {e}")),
-    };
-
-    let reveal_val: serde_json::Value = match serde_json::from_str(&reveal_text) {
-        Ok(v) => v,
-        Err(_) => return tool_err("error parsing revealed value"),
-    };
-
-    let value = match reveal_val.get("value").and_then(|v| v.as_str()) {
-        Some(v) => v.to_string(),
-        None => return tool_err("item has no secret value"),
-    };
-
-    // Inyectar como variable de entorno
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::set_var(&key, &value);
+    // Record the key name (and the scope it was found in) for later runs.
+    let mut entry = serde_json::json!({ "key": key });
+    for field in ["environment_id", "project", "environment"] {
+        if let Some(v) = args.get(field) {
+            entry[field] = v.clone();
+        }
+    }
+    if let Ok(mut keys) = INJECT_KEYS.lock() {
+        keys.retain(|e| e.get("key").and_then(|k| k.as_str()) != Some(key.as_str()));
+        keys.push(entry);
     }
 
     tool_ok(
         serde_json::to_string_pretty(&serde_json::json!({
-            "injected": true,
-            "name": key
+            "selected": true,
+            "name": key,
+            "note": "The value is injected by the crypt-env backend into the next crypt_env_run_command calls; it never reaches this process."
         }))
         .unwrap_or_default(),
     )
@@ -1338,17 +1328,26 @@ fn tool_add_item(args: &serde_json::Value, token: &str) -> serde_json::Value {
 }
 
 fn tool_update_settings(args: &serde_json::Value, token: &str) -> serde_json::Value {
-    let resp = match vault_put("/settings", token, args) {
+    // Security settings are reserved for the user; only the hotkey is forwarded.
+    if args.get("auto_lock_timeout").is_some() {
+        return tool_err("forbidden: auto_lock_timeout can only be changed by the user in the crypt-env app");
+    }
+    let mut body = serde_json::json!({});
+    if let Some(h) = args.get("hotkey") {
+        body["hotkey"] = h.clone();
+    }
+
+    let resp = match vault_put("/settings", token, &body) {
         Ok(r) => r,
         Err(e) => return tool_err(e),
     };
 
     let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
     if status == 403 {
-        return tool_err("vault_locked: unlock the vault first");
+        return forbidden_or_locked(&text);
     }
     if status >= 400 {
-        let text = resp.text().unwrap_or_default();
         return tool_err(format!("error updating settings (HTTP {status}): {text}"));
     }
 
@@ -1391,7 +1390,7 @@ fn tool_fill_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
     };
 
     if status == 403 {
-        return tool_err("vault_locked: unlock the vault first");
+        return forbidden_or_locked(&text);
     }
     if status == 422 {
         return tool_err(format!("scope or validation error: {text}"));
@@ -1403,10 +1402,8 @@ fn tool_fill_env(args: &serde_json::Value, token: &str) -> serde_json::Value {
         return tool_err(format!("fill failed (HTTP {status}): {text}"));
     }
 
-    // The API already wrote the file to output_path/output_dir (if given) —
-    // just surface the stats. If neither was given, `text` carries the
-    // filled content inline (still no secret leakage risk beyond what the
-    // caller already requested by omitting a write destination).
+    // The API already wrote the file to output_path/output_dir — just surface
+    // the stats. The API refuses inline content for the MCP token.
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
         Err(_) => tool_ok(text),
@@ -1487,10 +1484,11 @@ fn tool_run_command(args: &serde_json::Value, token: &str) -> serde_json::Value 
         None => return tool_err("required parameter: 'name'"),
     };
 
-    let mut list_url = "/commands".to_string();
+    let mut scope_query = String::new();
     let mut sep = '?';
-    append_scope_params(&mut list_url, &mut sep, args);
+    append_scope_params(&mut scope_query, &mut sep, args);
 
+    let list_url = format!("/commands{scope_query}");
     let list_resp = match vault_get(&list_url, token) {
         Ok(r) => r,
         Err(e) => return tool_err(e),
@@ -1532,108 +1530,126 @@ fn tool_run_command(args: &serde_json::Value, token: &str) -> serde_json::Value 
         None => return tool_err(format!("command '{cmd_name}' not found")),
     };
 
-    let detail_resp = match vault_get(&format!("/commands/{cmd_id}"), token) {
-        Ok(r) => r,
-        Err(e) => return tool_err(e),
-    };
-
-    let detail_text = match detail_resp.text() {
-        Ok(t) => t,
-        Err(e) => return tool_err(format!("error reading command detail: {e}")),
-    };
-
-    let detail_val: serde_json::Value = match serde_json::from_str(&detail_text) {
-        Ok(v) => v,
-        Err(_) => return tool_err("error parsing command detail"),
-    };
-
-    let template = match detail_val.get("command").and_then(|v| v.as_str()) {
-        Some(t) => t.to_string(),
-        None => return tool_err("command has no template"),
-    };
-
-    // NOTE: The current command system does not resolve vault secret values at
-    // this layer — secrets are managed separately. The {{VAR}} placeholders here
-    // are substituted with caller-supplied params, not vault values. However, to
-    // avoid echoing any resolved command string (which could contain sensitive
-    // caller-supplied data or reveal template structure) back to the LLM host,
-    // we execute the command directly and return only exit metadata.
-    //
-    // Secrets should be passed to the child process as environment variables
-    // (set by the vault before execution), not substituted inline into the
-    // command string, so they never appear as literal text in this process or
-    // its return value.
-
-    // Build the resolved command string for execution only — never returned.
-    let mut resolved = template.clone();
-    if let Some(params_map) = args.get("params").and_then(|v| v.as_object()) {
-        for (var, val) in params_map {
-            if let Some(val_str) = val.as_str() {
-                let placeholder = format!("{{{{{}}}}}", var);
-                resolved = resolved.replace(&placeholder, val_str);
+    // Parameters are forwarded as strings; the backend validates every value
+    // against its allowlist before anything starts.
+    let mut params = serde_json::Map::new();
+    if let Some(map) = args.get("params").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            match v.as_str() {
+                Some(s) => {
+                    params.insert(k.clone(), serde_json::json!(s));
+                }
+                None => return tool_err(format!("invalid parameter '{k}': values must be strings")),
             }
         }
     }
 
-    // Execute the resolved command via the platform shell.
-    // On Windows: cmd /C <resolved>
-    // On Unix:    sh -c <resolved>
-    // The resolved string is never included in the return value.
-    #[cfg(target_os = "windows")]
-    let child_result = std::process::Command::new("cmd")
-        .args(["/C", &resolved])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    let inject_keys: Vec<serde_json::Value> = INJECT_KEYS.lock().map(|k| k.clone()).unwrap_or_default();
+    let run_id = format!("mcp-{}", random_hex(8));
+    let body = serde_json::json!({
+        "commandId": cmd_id,
+        "params": params,
+        "injectKeys": inject_keys,
+        "runId": run_id,
+        "clientContext": client_context(),
+    });
 
-    #[cfg(not(target_os = "windows"))]
-    let child_result = std::process::Command::new("sh")
-        .args(["-c", &resolved])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    if let Ok(mut runs) = ACTIVE_RUNS.lock() {
+        runs.push(run_id.clone());
+    }
+    // The backend enforces the 120 s command limit; leave headroom for output.
+    let resp = vault_post_timeout(
+        &format!("/exec{scope_query}"),
+        token,
+        &body,
+        std::time::Duration::from_secs(150),
+    );
+    if let Ok(mut runs) = ACTIVE_RUNS.lock() {
+        runs.retain(|r| r != &run_id);
+    }
 
-    let child = match child_result {
-        Ok(c) => c,
-        Err(e) => {
-            // Do not include the resolved command in the error message.
-            return tool_err(format!("failed to start command '{cmd_name}': {e}"));
-        }
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return tool_err(e),
+    };
+    let status = resp.status().as_u16();
+    let text = match resp.text() {
+        Ok(t) => t,
+        Err(e) => return tool_err(format!("error reading response: {e}")),
     };
 
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return tool_err(format!("error waiting for command '{cmd_name}': {e}")),
+    match status {
+        200 => {}
+        403 => return forbidden_or_locked(&text),
+        422 => return tool_err(format!("invalid request: {text}")),
+        429 => return tool_err("too many commands are running; retry shortly"),
+        _ => return tool_err(format!("run failed for '{cmd_name}' (HTTP {status}): {text}")),
+    }
+
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return tool_err("error parsing run result"),
     };
-
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    // Truncate stdout/stderr to 2000 chars each to limit accidental secret leakage
-    // through command output. The resolved command itself is never returned.
-    const MAX_OUTPUT: usize = 2000;
-    let stdout_raw = String::from_utf8_lossy(&output.stdout);
-    let stderr_raw = String::from_utf8_lossy(&output.stderr);
-
-    let stdout_str = if stdout_raw.len() > MAX_OUTPUT {
-        format!("{}... (truncated)", &stdout_raw[..MAX_OUTPUT])
-    } else {
-        stdout_raw.into_owned()
-    };
-
-    let stderr_str = if stderr_raw.len() > MAX_OUTPUT {
-        format!("{}... (truncated)", &stderr_raw[..MAX_OUTPUT])
-    } else {
-        stderr_raw.into_owned()
-    };
-
     tool_ok(
         serde_json::to_string_pretty(&serde_json::json!({
-            "exit_code": exit_code,
-            "stdout": stdout_str,
-            "stderr": stderr_str
+            "exit_code": v.get("exitCode"),
+            "timed_out": v.get("timedOut"),
+            "cancelled": v.get("cancelled"),
+            "stdout": v.get("stdout"),
+            "stderr": v.get("stderr"),
+            "stdout_truncated": v.get("stdoutTruncated"),
+            "stderr_truncated": v.get("stderrTruncated"),
         }))
-        .unwrap_or_else(|_| r#"{"exit_code":-1,"stdout":"","stderr":"serialization error"}"#.to_string()),
+        .unwrap_or_default(),
     )
+}
+
+/// Where this MCP process runs, so the backend can start the command in the
+/// same place (notably a WSL distribution when the backend is on Windows).
+fn client_context() -> serde_json::Value {
+    let wsl_distro = std::env::var("WSL_DISTRO_NAME").ok().filter(|d| !d.trim().is_empty());
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "wslDistro": wsl_distro,
+        "cwd": std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+        "home": std::env::var("HOME").ok(),
+    })
+}
+
+/// Cancels every in-flight backend command (host closed stdin).
+fn cancel_active_runs(token: &str) {
+    let ids: Vec<String> = ACTIVE_RUNS.lock().map(|r| r.clone()).unwrap_or_default();
+    for id in ids {
+        let _ = vault_delete(&format!("/exec/{id}"), token);
+    }
+}
+
+/// `crypt_env_approval_status`: polls a pending approval. The body is
+/// non-secret by construction (status, summary, result metadata).
+fn tool_approval_status(args: &serde_json::Value, token: &str) -> serde_json::Value {
+    let id = match args.get("id").and_then(|v| v.as_str()) {
+        Some(i) if !i.is_empty() && i.chars().all(|c| c.is_ascii_alphanumeric()) => i,
+        _ => return tool_err("required parameter: 'id' (the approvalId)"),
+    };
+    let resp = match vault_get(&format!("/approvals/{id}"), token) {
+        Ok(r) => r,
+        Err(e) => return tool_err(e),
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    if status == 404 {
+        return tool_err("approval not found: it expired, or the vault was locked since");
+    }
+    if status == 403 {
+        return forbidden_or_locked(&text);
+    }
+    if status >= 400 {
+        return tool_err(format!("approval status failed (HTTP {status}): {text}"));
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
+        Err(_) => tool_ok(text),
+    }
 }
 
 // ─── Share tool implementations ───────────────────────────────────────────────
@@ -1697,31 +1713,6 @@ fn tool_share_connect(args: &serde_json::Value, token: &str) -> serde_json::Valu
     if status == 403 { return tool_err("vault_locked: unlock the vault first"); }
     if status == 422 { return tool_err(format!("scope or validation error: {text}")); }
     if status >= 400 { return tool_err(format!("share connect failed (HTTP {status}): {text}")); }
-
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
-        Err(_) => tool_ok(text),
-    }
-}
-
-fn tool_share_confirm(args: &serde_json::Value, token: &str) -> serde_json::Value {
-    let confirmed = match args.get("confirmed").and_then(|v| v.as_bool()) {
-        Some(c) => c,
-        None => return tool_err("required parameter: 'confirmed' (boolean)"),
-    };
-
-    let resp = match vault_post("/share/confirm", token, &serde_json::json!({ "confirmed": confirmed })) {
-        Ok(r) => r,
-        Err(e) => return tool_err(e),
-    };
-
-    let status = resp.status().as_u16();
-    let text = match resp.text() {
-        Ok(t) => t,
-        Err(e) => return tool_err(format!("error reading response: {e}")),
-    };
-
-    if status >= 400 { return tool_err(format!("confirm failed (HTTP {status}): {text}")); }
 
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
@@ -1793,15 +1784,9 @@ fn tool_share_export(args: &serde_json::Value, token: &str) -> serde_json::Value
         Err(e) => return tool_err(format!("error reading response: {e}")),
     };
 
-    if status == 403 { return tool_err("vault_locked: unlock the vault first"); }
-    if status >= 400 { return tool_err(format!("export failed (HTTP {status}): {text}")); }
-
-    // Surface the response including the passphrase — the tool description
-    // instructs the model to show it to the user immediately.
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
-        Err(_) => tool_ok(text),
-    }
+    // 202: the user approves in the app, which shows the passphrase. It is never
+    // part of any response to this process.
+    approval_response(status, &text, "export")
 }
 
 fn tool_share_import(args: &serde_json::Value, token: &str) -> serde_json::Value {
@@ -2059,7 +2044,7 @@ fn tool_inject_environment(args: &serde_json::Value, token: &str) -> serde_json:
         Err(e) => return tool_err(format!("error reading response: {e}")),
     };
 
-    if status == 403 { return tool_err("vault_locked: unlock the vault first"); }
+    if status == 403 { return forbidden_or_locked(&text); }
     if status == 404 { return tool_err(format!("environment {environment_id} not found")); }
     if status == 409 {
         return tool_err(format!("target_exists: {text}. Ask the user before retrying with overwrite=true."));
@@ -2111,7 +2096,7 @@ fn tool_generate_example_env(args: &serde_json::Value, token: &str) -> serde_jso
         Err(e) => return tool_err(format!("error reading response: {e}")),
     };
 
-    if status == 403 { return tool_err("vault_locked: unlock the vault first"); }
+    if status == 403 { return forbidden_or_locked(&text); }
     if status == 404 { return tool_err(format!("environment {environment_id} not found")); }
     if status == 409 {
         return tool_err(format!("target_exists: {text}. Ask the user before retrying with overwrite=true."));
@@ -2152,15 +2137,9 @@ fn tool_relay_send(args: &serde_json::Value, token: &str) -> serde_json::Value {
         Err(e) => return tool_err(format!("error reading response: {e}")),
     };
 
-    if status == 403 { return tool_err("vault_locked: unlock the vault first"); }
-    if status >= 400 { return tool_err(format!("relay send failed (HTTP {status}): {text}")); }
-
-    // Surface the response including code and passphrase — the tool description
-    // instructs the model to show both to the user immediately.
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => tool_ok(serde_json::to_string_pretty(&v).unwrap_or(text)),
-        Err(_) => tool_ok(text),
-    }
+    // 202: the user approves in the app, which shows the code and passphrase.
+    // They are never part of any response to this process.
+    approval_response(status, &text, "relay send")
 }
 
 fn tool_relay_receive(args: &serde_json::Value, token: &str) -> serde_json::Value {
@@ -2403,22 +2382,6 @@ fn read_json_config(path: &std::path::Path) -> Result<serde_json::Value, String>
         .map_err(|e| format!("error parsing {}: {e}", path.display()))
 }
 
-/// Writes a JSON config atomically: write to a .tmp file then rename.
-fn write_json_config_atomic(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
-    }
-    let tmp_path = path.with_extension("tmp");
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("error serializing config: {e}"))?;
-    std::fs::write(&tmp_path, &text)
-        .map_err(|e| format!("error writing temp file {}: {e}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("error renaming temp file to {}: {e}", path.display()))
-}
-
 /// Strips env values from a server entry for safe output (only returns key names).
 fn safe_server_entry(name: &str, entry: &serde_json::Value) -> serde_json::Value {
     let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -2500,205 +2463,68 @@ fn tool_list_mcp_servers(args: &serde_json::Value, _token: &str) -> serde_json::
     tool_ok(serde_json::to_string_pretty(&result).unwrap_or_default())
 }
 
-fn tool_add_mcp_server(args: &serde_json::Value, _token: &str) -> serde_json::Value {
-    let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => return tool_err("required parameter: 'name'"),
-    };
-    let command = match args.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c.to_string(),
-        None => return tool_err("required parameter: 'command'"),
-    };
-    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
-
-    let cmd_args: Vec<serde_json::Value> = args.get("args")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // Build env section with empty placeholders — never real values
-    let env_obj: serde_json::Map<String, serde_json::Value> = args.get("env")
-        .and_then(|v| v.as_object())
-        .map(|m| {
-            m.keys()
-                .map(|k| (k.clone(), serde_json::Value::String(String::new())))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let config_path = match scope {
-        "project" => match project_mcp_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-        _ => match claude_desktop_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-    };
-
-    let mut config = match read_json_config(&config_path) {
-        Ok(c) => c,
-        Err(e) => return tool_err(e),
-    };
-
-    // Ensure mcpServers key exists
-    if config.get("mcpServers").is_none() {
-        config["mcpServers"] = serde_json::json!({});
-    }
-
-    let servers = match config.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-        Some(m) => m,
-        None => return tool_err("config has invalid 'mcpServers' structure"),
-    };
-
-    if servers.contains_key(&name) {
-        return tool_err(format!("server '{name}' already exists — use crypt_env_update_mcp_server to modify it"));
-    }
-
-    let mut entry = serde_json::json!({ "command": command, "args": cmd_args });
-    if !env_obj.is_empty() {
-        entry["env"] = serde_json::Value::Object(env_obj.clone());
-    }
-    servers.insert(name.clone(), entry);
-
-    if let Err(e) = write_json_config_atomic(&config_path, &config) {
-        return tool_err(e);
-    }
-
-    let env_keys: Vec<String> = env_obj.keys().cloned().collect();
-    let note = if env_keys.is_empty() {
-        "Server registered. No env vars configured.".to_string()
-    } else {
-        format!(
-            "Server registered. Env keys stored as empty placeholders: {:?}. \
-             Run 'crypt_env_inject_env' for each key before launching the MCP server.",
-            env_keys
-        )
-    };
-
-    tool_ok(serde_json::to_string_pretty(&serde_json::json!({
-        "added": true,
-        "name": name,
-        "scope": scope,
-        "config_path": config_path.to_string_lossy(),
-        "note": note
-    })).unwrap_or_default())
-}
-
-fn tool_update_mcp_server(args: &serde_json::Value, _token: &str) -> serde_json::Value {
-    let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => return tool_err("required parameter: 'name'"),
-    };
-    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
-
-    let config_path = match scope {
-        "project" => match project_mcp_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-        _ => match claude_desktop_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-    };
-
-    let mut config = match read_json_config(&config_path) {
-        Ok(c) => c,
-        Err(e) => return tool_err(e),
-    };
-
-    // Ensure mcpServers exists
-    if config.get("mcpServers").is_none() {
-        config["mcpServers"] = serde_json::json!({});
-    }
-
-    let servers = match config.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-        Some(m) => m,
-        None => return tool_err("config has invalid 'mcpServers' structure"),
-    };
-
-    if !servers.contains_key(&name) {
-        return tool_err(format!("server '{name}' not found — use crypt_env_add_mcp_server to create it"));
-    }
-
-    let entry = servers.entry(name.clone()).or_insert_with(|| serde_json::json!({}));
-
-    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-        entry["command"] = serde_json::json!(cmd);
-    }
-    if let Some(cmd_args) = args.get("args").and_then(|v| v.as_array()) {
-        entry["args"] = serde_json::json!(cmd_args);
-    }
-    if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
-        // Merge: existing keys preserved, new keys added as empty placeholders
-        let existing_env = entry
-            .get("env")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        let mut merged = existing_env;
-        for k in env_map.keys() {
-            merged.insert(k.clone(), serde_json::Value::String(String::new()));
+/// Fields forwarded to the backend for a host-config write. The backend
+/// writes the file, after the user approves, so an agent cannot plant a
+/// command in the host config on its own.
+fn mcp_server_body(args: &serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({});
+    for field in ["name", "command", "args", "env", "scope"] {
+        if let Some(v) = args.get(field) {
+            body[field] = v.clone();
         }
-        entry["env"] = serde_json::Value::Object(merged);
     }
-
-    if let Err(e) = write_json_config_atomic(&config_path, &config) {
-        return tool_err(e);
+    if let Ok(cwd) = std::env::current_dir() {
+        body["cwd"] = serde_json::json!(cwd.to_string_lossy());
     }
-
-    tool_ok(serde_json::to_string_pretty(&serde_json::json!({
-        "updated": true,
-        "name": name,
-        "scope": scope,
-        "config_path": config_path.to_string_lossy()
-    })).unwrap_or_default())
+    body
 }
 
-fn tool_delete_mcp_server(args: &serde_json::Value, _token: &str) -> serde_json::Value {
+fn tool_add_mcp_server(args: &serde_json::Value, token: &str) -> serde_json::Value {
+    if args.get("name").and_then(|v| v.as_str()).is_none() {
+        return tool_err("required parameter: 'name'");
+    }
+    if args.get("command").and_then(|v| v.as_str()).is_none() {
+        return tool_err("required parameter: 'command'");
+    }
+    let resp = match vault_post("/mcp-servers", token, &mcp_server_body(args)) {
+        Ok(r) => r,
+        Err(e) => return tool_err(e),
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    approval_response(status, &text, "add MCP server")
+}
+
+fn tool_update_mcp_server(args: &serde_json::Value, token: &str) -> serde_json::Value {
+    if args.get("name").and_then(|v| v.as_str()).is_none() {
+        return tool_err("required parameter: 'name'");
+    }
+    let resp = match vault_put("/mcp-servers", token, &mcp_server_body(args)) {
+        Ok(r) => r,
+        Err(e) => return tool_err(e),
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    approval_response(status, &text, "update MCP server")
+}
+
+fn tool_delete_mcp_server(args: &serde_json::Value, token: &str) -> serde_json::Value {
     let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
+        Some(n) => n,
         None => return tool_err("required parameter: 'name'"),
     };
     let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("global");
-
-    let config_path = match scope {
-        "project" => match project_mcp_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-        _ => match claude_desktop_config_path() {
-            Ok(p) => p,
-            Err(e) => return tool_err(e),
-        },
-    };
-
-    let mut config = match read_json_config(&config_path) {
-        Ok(c) => c,
+    let mut url = format!("/mcp-servers?name={}&scope={}", urlencod(name), urlencod(scope));
+    if let Ok(cwd) = std::env::current_dir() {
+        url.push_str(&format!("&cwd={}", urlencod(&cwd.to_string_lossy())));
+    }
+    let resp = match vault_delete(&url, token) {
+        Ok(r) => r,
         Err(e) => return tool_err(e),
     };
-
-    let servers = match config.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-        Some(m) => m,
-        None => return tool_err(format!("server '{name}' not found (mcpServers is empty or missing)")),
-    };
-
-    if servers.remove(&name).is_none() {
-        return tool_err(format!("server '{name}' not found"));
-    }
-
-    if let Err(e) = write_json_config_atomic(&config_path, &config) {
-        return tool_err(e);
-    }
-
-    tool_ok(serde_json::to_string_pretty(&serde_json::json!({
-        "deleted": true,
-        "name": name,
-        "scope": scope,
-        "config_path": config_path.to_string_lossy()
-    })).unwrap_or_default())
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    approval_response(status, &text, "delete MCP server")
 }
 
 // ─── Environment-aware workspace injection tool implementations ───────────────
@@ -3122,7 +2948,6 @@ fn handle_tool_call(name: &str, args: &serde_json::Value, token: &str) -> serde_
         "crypt_env_run_command" => tool_run_command(args, token),
         "crypt_env_share_listen" => tool_share_listen(args, token),
         "crypt_env_share_connect" => tool_share_connect(args, token),
-        "crypt_env_share_confirm" => tool_share_confirm(args, token),
         "crypt_env_share_cancel" => tool_share_cancel(token),
         "crypt_env_share_status" => tool_share_status(token),
         "crypt_env_share_export" => tool_share_export(args, token),
@@ -3136,6 +2961,7 @@ fn handle_tool_call(name: &str, args: &serde_json::Value, token: &str) -> serde_
         "crypt_env_generate_example_env" => tool_generate_example_env(args, token),
         "crypt_env_relay_send" => tool_relay_send(args, token),
         "crypt_env_relay_receive" => tool_relay_receive(args, token),
+        "crypt_env_approval_status" => tool_approval_status(args, token),
         "crypt_env_list_mcp_servers" => tool_list_mcp_servers(args, token),
         "crypt_env_add_mcp_server" => tool_add_mcp_server(args, token),
         "crypt_env_update_mcp_server" => tool_update_mcp_server(args, token),
@@ -3179,8 +3005,15 @@ fn main() {
         }
     };
 
+    // Plaintext files an older version left in the shared temp directory.
+    sweep_legacy_temp_files();
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    let token = std::sync::Arc::new(token);
+    // Each request runs on its own thread so a long command never blocks the
+    // JSON-RPC stream (responses are matched by id, not by order).
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -3212,22 +3045,33 @@ fn main() {
         }
 
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-        let result = dispatch(&req.method, &req.params, &token);
-        let resp = match result {
-            Ok(r) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(r),
-                error: None,
-            },
-            Err(e) => RpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(e),
-            },
-        };
-        writeln_json(&stdout, &resp);
+        let token = token.clone();
+        workers.retain(|w| !w.is_finished());
+        workers.push(std::thread::spawn(move || {
+            let result = dispatch(&req.method, &req.params, &token);
+            let resp = match result {
+                Ok(r) => RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(r),
+                    error: None,
+                },
+                Err(e) => RpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
+            };
+            writeln_json(&std::io::stdout(), &resp);
+        }));
+    }
+
+    // The host closed stdin: stop any backend command still running for this
+    // session, then let in-flight requests finish.
+    cancel_active_runs(&token);
+    for w in workers {
+        let _ = w.join();
     }
 }
 
@@ -3478,6 +3322,102 @@ mod tests {
         )
         .expect("environment_id should win when both keys are present");
         assert_eq!(resolved, ResolvedEnvironment { id: 7, via_deprecated_id: false });
+    }
+
+    // ─── mcp-token-capabilities / mcp-command-execution-hardening ───────────
+
+    fn tool_names() -> Vec<String> {
+        tool_definitions()
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|t| tool_name(t).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tools_list_drops_share_confirm_and_adds_approval_status() {
+        let names = tool_names();
+        assert!(!names.iter().any(|n| n == "crypt_env_share_confirm"));
+        assert!(names.iter().any(|n| n == "crypt_env_approval_status"));
+        // The new tool is dispatched (fails on the missing id before any network call).
+        let out = handle_tool_call("crypt_env_approval_status", &serde_json::json!({}), "t");
+        assert!(result_text(&out).contains("required parameter"));
+        let out = handle_tool_call("crypt_env_share_confirm", &serde_json::json!({}), "t");
+        assert_eq!(out["isError"], true);
+    }
+
+    #[test]
+    fn update_settings_no_longer_exposes_auto_lock_timeout() {
+        let tools = tool_definitions();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| tool_name(t) == "crypt_env_update_settings")
+            .unwrap();
+        let props = tool.pointer("/inputSchema/properties").unwrap();
+        assert!(props.get("auto_lock_timeout").is_none());
+        assert!(props.get("hotkey").is_some());
+        let out = tool_update_settings(&serde_json::json!({ "auto_lock_timeout": 0 }), "t");
+        assert_eq!(out["isError"], true, "never forwarded to the backend");
+    }
+
+    fn result_text(v: &serde_json::Value) -> String {
+        v.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn pending_approval_response_has_the_documented_shape_and_no_secret_fields() {
+        let out = approval_response(202, r#"{"approvalId":"abc123","status":"pending","expiresIn":120}"#, "relay send");
+        assert_eq!(out["isError"], false);
+        let v: serde_json::Value = serde_json::from_str(&result_text(&out)).unwrap();
+        assert_eq!(v["status"], "pending_approval");
+        assert_eq!(v["approvalId"], "abc123");
+        assert_eq!(v["expiresInSeconds"], 120);
+        for forbidden in ["code", "passphrase", "value"] {
+            assert!(v.get(forbidden).is_none(), "{forbidden} must not be in a pending response");
+        }
+    }
+
+    #[test]
+    fn approval_response_maps_forbidden_busy_and_errors() {
+        let forbidden = approval_response(403, r#"{"error":"not available","code":"MCP_FORBIDDEN"}"#, "x");
+        assert_eq!(forbidden["isError"], true);
+        assert!(result_text(&forbidden).starts_with("forbidden:"));
+        let locked = approval_response(403, r#"{"error":"vault locked","code":"VAULT_LOCKED"}"#, "x");
+        assert!(result_text(&locked).starts_with("vault_locked"));
+        assert!(result_text(&approval_response(429, "{}", "x")).contains("pending"));
+        assert_eq!(approval_response(500, "boom", "x")["isError"], true);
+    }
+
+    #[test]
+    fn legacy_temp_file_filter_matches_only_old_generate_env_names() {
+        assert!(is_legacy_temp_name("crypt_env_0123456789abcdef.env"));
+        assert!(!is_legacy_temp_name("crypt_env_0123456789abcde.env"));
+        assert!(!is_legacy_temp_name("crypt_env_0123456789abcdeg.env"));
+        assert!(!is_legacy_temp_name("crypt_env_0123456789abcdef.txt"));
+        assert!(!is_legacy_temp_name("other_0123456789abcdef.env"));
+        assert!(!is_legacy_temp_name("crypt_env_0123456789abcdef.env.bak"));
+    }
+
+    #[test]
+    fn the_mcp_binary_neither_reveals_values_nor_mutates_its_environment() {
+        let source = include_str!("crypt-env-mcp.rs");
+        // Needles are assembled so this test does not match itself.
+        let reveal = format!("{}{}", "/items/{item_id}/re", "veal");
+        let set_var = format!("{}{}", "std::env::set", "_var(");
+        let (before_tests, _) = source.split_once("#[cfg(test)]\nmod tests").expect("tests module marker");
+        assert!(!before_tests.contains(&reveal), "MCP must not read values through reveal");
+        assert!(!before_tests.contains(&set_var), "MCP must not set secret env vars on itself");
+    }
+
+    #[test]
+    fn inject_env_rejects_blocked_names_without_touching_the_environment() {
+        let before = std::env::var("PATH").ok();
+        let out = tool_inject_env(&serde_json::json!({ "key": "PATH" }), "t");
+        assert_eq!(out["isError"], true);
+        assert_eq!(std::env::var("PATH").ok(), before);
     }
 
     // ─── Endpoint resolution mirror (cli-remote-endpoint-config task 5.1) ──
