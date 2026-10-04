@@ -51,6 +51,8 @@ project:
 
 **Locking the vault ends every CLI session.** Locking in the GUI (manually, by auto-lock, reset or restore) invalidates all terminals' sessions at once, and a locked vault never renews one. After you unlock again, the next gated command in each terminal asks for the master password.
 
+**Token handling.** A session file is created owner-only (`0600`, in a `0700` directory) as a temp file and renamed into place, so it is never readable by other users even briefly. The cached token is deleted only when the app rejects it (`401`); a `5xx`, `429` or network error leaves it in place and is reported, so a restarting backend does not force a password prompt. **Terminal identity:** on Windows a terminal is the console host process plus its start time (a recycled window handle never inherits a session, and a process with no console never shares one); in the WSL launcher the id also carries the session leader's start time. After upgrading, enter the password once per Windows terminal (the id format changed).
+
 Sessions are per terminal: each terminal (Unix: session id + tty; Windows: console window, i.e. per Windows Terminal tab) keeps its own token file `<token path>.<hash>` next to `CRYPTENV_TOKEN_PATH`/the default path, so opening another terminal means entering the password there too, and terminals never log each other out. Subshells such as `eval "$(crypt-env inject X)"` count as the same terminal. The binding is enforced by the client (another process running as your user could read the files, as with any cached token); token files unused for a day are deleted (only files named exactly `<token path>.<16 hex>`; anything else next to them is never touched).
 
 ### `crypt-env init [NAME] [--path PATH] [--yes]`
@@ -77,6 +79,8 @@ crypt-env add SHARED_URL=https://x --global  # reusable across projects
 crypt-env add STRIPE_KEY=sk_live --env production
 ```
 If any key already exists in the target environment (or among global items with `--global`), nothing is added: the CLI prints `Error: Key 'K' already exists in environment 'E'. Addition aborted.` and offers to show the colliding value — only after `y` **and** the master password.
+
+`add` keeps going when one key's request fails, then lists the keys that were added and the keys that failed (names only, never values) and **exits with status 2**. Status 1 remains for errors where nothing was done (bad input, collision, unreachable vault).
 
 ### `crypt-env fill [--env NAME]`
 Materializes each environment (or only `--env`) into its configured paths — written by the app, so WSL repos work from Windows — and writes/extends a `.env.example` (keys only) next to every target. A pre-existing file not created by crypt-env is backed up to `<file>.bak` first. Environments without paths are skipped with a hint. `.env.example` is written next to each `.env` that was actually written. `fill` refuses to run from a directory other than the project's bound root (see `config --relink`). A target that is a symlink is refused (`TARGET_SYMLINK`, nothing written), and a relative path that leaves the project root through a symlinked directory is rejected; configure the real file instead. A target that is not a regular file (device, FIFO, directory) is refused (`NOT_REGULAR_FILE`). Values are written quoted when needed (single quotes, or double quotes with escapes for multi-line values); keys the vault could not write (undecryptable item or invalid name) are listed by name after the `key(s)` line.
@@ -120,6 +124,8 @@ crypt-env tui
 ```
 Three panes — projects · environments (plus a *global items* entry) · variables with values masked. It opens on the project of the current directory's `.crypt-env.yaml`.
 
+While a request to the app is pending the footer shows `working…`; every request times out after 5 s, so an unreachable app shows an error instead of freezing the UI. The workspace location is resolved once and again on `r` (the manifest is not re-scanned on every redraw). The terminal is restored (raw mode off, alternate screen left) on every exit path.
+
 | Key | Action |
 |-----|--------|
 | `←`/`→`, `h`/`l`, `Tab` | Switch pane |
@@ -147,6 +153,6 @@ All are optional. The CLI, `crypt-env tui` and `crypt-env-mcp` read the first th
 | `CRYPTENV_CERT_PATH` | probe `APPDATA` → `XDG_DATA_HOME` → `HOME/.local/share`, each joined with `com.maosuarez.cryptenv/tls/cert.pem` | TLS certificate PEM, used verbatim when set (never falls back, never disables verification). |
 | `CRYPTENV_TOKEN_PATH` | `%APPDATA%\com.maosuarez.cryptenv\.cli_token` (Windows) or `~/.local/share/com.maosuarez.cryptenv/.cli_token` | Session-token file. If its permissions cannot be tightened (e.g. a `/mnt/c` path under WSL), the token is kept and the command continues. |
 | `CRYPTENV_PATH_TRANSLATION` | on inside WSL | `off` disables WSL ↔ Windows path translation (app running inside the distro). |
-| `CRYPTENV_TERMINAL_ID` | detected | Overrides the terminal identity used for per-terminal sessions. The WSL managed launcher sets it (distro + session id + tty) and forwards it to the Windows CLI via `WSLENV`. |
+| `CRYPTENV_TERMINAL_ID` | detected | Overrides the terminal identity used for per-terminal sessions. The WSL managed launcher sets it (distro + session id + tty + leader start time) and forwards it to the Windows CLI via `WSLENV`. |
 
 Use `crypt-env setup wsl` to persist `CRYPTENV_API_URL` and `CRYPTENV_CERT_PATH` into your shell startup.

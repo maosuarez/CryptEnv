@@ -7,7 +7,8 @@
 //! it, since interop gives every Windows process a fresh console); else
 //! Unix: session id + controlling tty (+ the session leader's start time on
 //! Linux, so a recycled session id doesn't inherit a session); Windows: the
-//! console window handle (unique per Windows Terminal tab).
+//! console host process id + creation time (unique per Windows Terminal tab,
+//! not reusable), or a per-process id when there is no console.
 //!
 //! The binding is enforced client-side only; see the design note.
 
@@ -61,9 +62,52 @@ fn leader_start(sid: libc::pid_t) -> Option<String> {
 
 #[cfg(windows)]
 fn native_id() -> String {
-    // SAFETY: GetConsoleWindow takes no arguments and only returns a handle.
-    let hwnd = unsafe { windows::Win32::System::Console::GetConsoleWindow() };
-    format!("win:{:x}", hwnd.0 as usize)
+    use windows::Win32::System::{Console::GetConsoleWindow, Threading::GetCurrentProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    // The console host (conhost / OpenConsole / terminal) owning the console
+    // window, with its creation time: a recycled window handle or pid is a
+    // different process start, hence a different terminal.
+    // SAFETY: GetConsoleWindow takes no arguments and only returns a handle;
+    // GetWindowThreadProcessId writes the owner pid into the local `pid`.
+    let host = unsafe {
+        let hwnd = GetConsoleWindow();
+        let mut pid = 0u32;
+        if hwnd.0.is_null() || GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 {
+            None
+        } else {
+            Some(pid)
+        }
+    };
+    if let Some(pid) = host {
+        if let Some(created) = process_creation_time(pid) {
+            return format!("win:{pid}:{created}");
+        }
+    }
+    // No console (detached) or the host could not be inspected (e.g. an
+    // elevated host): this process alone. Only costs extra prompts.
+    // SAFETY: GetCurrentProcessId takes no arguments.
+    let me = unsafe { GetCurrentProcessId() };
+    format!("win:proc:{me}:{}", process_creation_time(me).unwrap_or_default())
+}
+
+/// Creation time (FILETIME ticks) of `pid`, `None` when it cannot be opened.
+#[cfg(windows)]
+fn process_creation_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: the handle returned by OpenProcess is used only for
+    // GetProcessTimes and closed before returning; the FILETIME out-params
+    // are valid locals.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut created, mut exited, mut kernel, mut user) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
+        let _ = CloseHandle(handle);
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
 }
 
 #[cfg(not(any(unix, windows)))]

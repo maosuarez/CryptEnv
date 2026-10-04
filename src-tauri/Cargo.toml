@@ -111,6 +111,7 @@ windows = { version = "0.58", features = [
     # Job Object with kill-on-close for MCP `POST /exec` process-tree control.
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
 ] }
 
