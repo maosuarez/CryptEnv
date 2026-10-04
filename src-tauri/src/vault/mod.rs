@@ -11,6 +11,7 @@ use crate::biometric;
 use crate::crypto::{self, CryptoKey};
 use crate::db::{DbCategory, LinkMode, LinkOutcome, VaultDb};
 
+pub mod backup;
 pub mod import;
 pub mod share_commands;
 
@@ -108,6 +109,11 @@ impl VaultState {
             (Some(a), Some(b)) => bool::from(a.as_slice().ct_eq(b.as_slice())),
             _ => false,
         };
+        // A restore keeps the previous database until the next successful
+        // unlock; this is the single place every unlock path goes through.
+        if self.key.is_none() && key.is_some() {
+            self.db.discard_pre_restore();
+        }
         self.key = key;
         if !unchanged {
             self.epoch = self.epoch.wrapping_add(1);
@@ -1098,220 +1104,59 @@ pub async fn vault_get_mcp_token(
     s.db.get_setting("mcp_token").await
 }
 
-// ─── Backup types ─────────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize)]
-struct BackupItem {
-    id: i64,
-    item_type: String,
-    /// Raw AES-GCM encrypted blob from the DB (hex-encoded nonce || ciphertext).
-    data: String,
-    created: String,
-    #[serde(default)]
-    is_global: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BackupFile {
-    version: u32,
-    created_at: u64,
-    /// Hex-encoded Argon2id salt used to derive the vault key.
-    salt: String,
-    /// AES-GCM verify token that proves the master password is correct.
-    token: String,
-    items: Vec<BackupItem>,
-    categories: Vec<serde_json::Value>,
-}
-
 // ─── Backup commands ──────────────────────────────────────────────────────────
+// Format and restore logic live in `backup.rs`.
 
-/// Export all vault items and categories to a `.cenvbak` file.
-/// The backup preserves the vault's existing salt and verify token so that
-/// restoring only requires the original master password — no separate backup password.
-/// Returns the number of items written.
+/// Export the whole vault (items, categories, projects, environments,
+/// variable bindings, ownership) to a v2 `.cenvbak` file. Organisational
+/// metadata is encrypted with the vault key. The backup preserves the vault's
+/// salt and verify token so restoring only requires the original master
+/// password. Returns the number of items written.
 #[tauri::command]
 pub async fn vault_export_backup(
     path: String,
     state: State<'_, SharedState>,
 ) -> Result<usize, String> {
     let mut s = state.lock().await;
-    s.key.as_ref().ok_or("vault is locked")?;
+    let key = s.key.as_ref().ok_or("vault is locked")?.clone();
     s.touch();
 
-    // Read vault crypto material
-    let (salt, token) = s
-        .db
-        .get_meta()
-        .await?
-        .ok_or("vault_meta missing")?;
-
-    // Read all raw (already-encrypted) item rows
-    let raw_items = s.db.list_items().await?;
-    let items: Vec<BackupItem> = raw_items
-        .iter()
-        .map(|(id, item_type, data, created, is_global)| BackupItem {
-            id: *id,
-            item_type: item_type.clone(),
-            data: data.clone(),
-            created: created.clone(),
-            is_global: *is_global,
-        })
-        .collect();
-    let item_count = items.len();
-
-    // Read categories as generic JSON values
-    let db_cats = s.db.list_categories().await?;
-    let categories: Vec<serde_json::Value> = db_cats
-        .iter()
-        .map(|c| serde_json::json!({ "id": c.cid, "name": c.name, "color": c.color, "description": c.description }))
-        .collect();
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let backup = BackupFile {
-        version: 1,
-        created_at,
-        salt,
-        token,
-        items,
-        categories,
-    };
-
+    let (backup, item_count) = backup::build_backup(&s.db, &key).await?;
     let json = serde_json::to_string_pretty(&backup)
         .map_err(|e| format!("serialize backup: {e}"))?;
-
     std::fs::write(&path, json).map_err(|e| format!("write backup: {e}"))?;
-
     Ok(item_count)
 }
 
-/// Import a `.cenvbak` file by filesystem path.
-///
-/// - `merge = false`: wipes the current vault and restores the backup exactly,
-///   keeping the original crypto material so the same master password applies.
-/// - `merge = true`: re-encrypts each imported item with the *current* vault key
-///   and upserts into the live vault. Categories are merged (no duplicates by id).
-///
-/// Returns the number of items restored.
+/// Restore a `.cenvbak` file by filesystem path. See `backup::restore`:
+/// requires an unlocked vault; `merge = false` also requires
+/// `current_password`.
 #[tauri::command]
 pub async fn vault_import_backup(
     path: String,
     master_password: String,
     merge: bool,
+    current_password: Option<String>,
     state: State<'_, SharedState>,
-) -> Result<usize, String> {
+) -> Result<backup::RestoreSummary, String> {
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("read backup: {e}"))?;
-    do_restore_backup(&json, &master_password, merge, &state).await
+    let mut s = state.lock().await;
+    backup::restore(&mut s, &json, &master_password, current_password.as_deref(), merge).await
 }
 
-/// Import a `.cenvbak` by passing its JSON content directly.
+/// Restore a `.cenvbak` by passing its JSON content directly.
 /// Used by the frontend file picker where only file content (not the path) is accessible.
 #[tauri::command]
 pub async fn vault_import_backup_data(
     data: String,
     master_password: String,
     merge: bool,
+    current_password: Option<String>,
     state: State<'_, SharedState>,
-) -> Result<usize, String> {
-    do_restore_backup(&data, &master_password, merge, &state).await
-}
-
-async fn do_restore_backup(
-    json: &str,
-    master_password: &str,
-    merge: bool,
-    state: &State<'_, SharedState>,
-) -> Result<usize, String> {
-    let backup: BackupFile = serde_json::from_str(json)
-        .map_err(|e| format!("parse backup: {e}"))?;
-
-    if backup.version != 1 {
-        return Err(format!("unsupported backup version: {}", backup.version));
-    }
-
-    // Verify the master password against the backup's crypto material.
-    let backup_key = crypto::unlock_vault_crypto(
-        master_password.as_bytes(),
-        &backup.salt,
-        &backup.token,
-    )
-    .map_err(|_| "incorrect master password for this backup".to_string())?;
-
+) -> Result<backup::RestoreSummary, String> {
     let mut s = state.lock().await;
-
-    if !merge {
-        // Wipe the current vault and restore the backup's crypto material verbatim.
-        // After init_vault the in-memory key equals the backup key.
-        s.set_key(None);
-        s.db.wipe_and_reset().await?;
-        s.db.init_vault(&backup.salt, &backup.token).await?;
-        s.set_key(Some(Zeroizing::new(backup_key)));
-        s.touch();
-
-        // Insert items using their original encrypted blobs (already keyed with backup_key).
-        for item in &backup.items {
-            s.db
-                .upsert_item(0, &item.item_type, &item.data, &item.created, item.is_global)
-                .await?;
-        }
-
-        // Restore categories wholesale.
-        let db_cats: Vec<DbCategory> = backup
-            .categories
-            .iter()
-            .filter_map(|v| {
-                Some(DbCategory {
-                    cid: v.get("id")?.as_str()?.to_string(),
-                    name: v.get("name")?.as_str()?.to_string(),
-                    color: v.get("color")?.as_str()?.to_string(),
-                    description: v.get("description").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                })
-            })
-            .collect();
-        s.db.save_categories(&db_cats).await?;
-    } else {
-        // Merge: re-encrypt each item from backup_key → current vault key.
-        let current_key = s.key.as_ref().ok_or("vault is locked")?.clone();
-        s.touch();
-
-        for item in &backup.items {
-            let plaintext = crypto::decrypt(&backup_key, &item.data)
-                .map_err(|e| format!("decrypt backup item {}: {e}", item.id))?;
-            let new_data = crypto::encrypt(&current_key, &plaintext)
-                .map_err(|e| format!("re-encrypt item {}: {e}", item.id))?;
-            s.db
-                .upsert_item(0, &item.item_type, &new_data, &item.created, item.is_global)
-                .await?;
-        }
-
-        // Merge categories: keep existing, append any new ids from the backup.
-        let existing_cats = s.db.list_categories().await?;
-        let existing_ids: std::collections::HashSet<String> =
-            existing_cats.iter().map(|c| c.cid.clone()).collect();
-
-        let mut merged = existing_cats;
-        for v in &backup.categories {
-            let cid = match v.get("id").and_then(|x| x.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            if !existing_ids.contains(&cid) {
-                merged.push(DbCategory {
-                    cid,
-                    name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    color: v.get("color").and_then(|x| x.as_str()).unwrap_or("#888").to_string(),
-                    description: v.get("description").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                });
-            }
-        }
-        s.db.save_categories(&merged).await?;
-    }
-
-    Ok(backup.items.len())
+    backup::restore(&mut s, &data, &master_password, current_password.as_deref(), merge).await
 }
 
 // ─── Import from password managers ───────────────────────────────────────────
@@ -1374,6 +1219,10 @@ pub async fn vault_import_items(
         .unwrap_or(0);
     let now = epoch_to_iso8601(epoch_secs);
 
+    // All inserts happen in one transaction, and the items are owned by an
+    // `Imported <date>` project so they are not reported as orphans.
+    let mut tx = s.db.begin().await?;
+    let mut holding_id: Option<i64> = None;
     let mut inserted = 0usize;
 
     for imp in items {
@@ -1401,12 +1250,28 @@ pub async fn vault_import_items(
         };
 
         let encrypted = encrypt_item(key, &vault_item)?;
-        s.db
-            .upsert_item(0, &vault_item.item_type, &encrypted, &vault_item.created, false)
-            .await?;
+        let item_id = VaultDb::insert_item_tx(
+            &mut tx,
+            &vault_item.item_type,
+            &encrypted,
+            &vault_item.created,
+            false,
+        )
+        .await?;
+        let project_id = match holding_id {
+            Some(id) => id,
+            None => {
+                let name = format!("Imported {}", &now[..10]);
+                let id = VaultDb::ensure_holding_project_tx(&mut tx, &name).await?;
+                holding_id = Some(id);
+                id
+            }
+        };
+        VaultDb::add_item_owner_tx(&mut tx, item_id, project_id).await?;
         inserted += 1;
     }
 
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(inserted)
 }
 

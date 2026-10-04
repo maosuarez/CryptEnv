@@ -457,6 +457,12 @@ impl VaultDb {
         let _ = sqlx::query("ALTER TABLE projects ADD COLUMN root_path TEXT")
             .execute(&self.pool)
             .await;
+        // Additive: marks the auto-created `Restored <date>` / `Imported <date>`
+        // projects that own restored or imported items, so those items are not
+        // reported as orphans (backup-restore-completeness, design D4).
+        let _ = sqlx::query("ALTER TABLE projects ADD COLUMN is_holding INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await;
 
         self.dedupe_project_names_nocase().await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name_nocase ON projects(name COLLATE NOCASE)")
@@ -2158,7 +2164,12 @@ impl VaultDb {
         let rows = sqlx::query(
             "SELECT i.id FROM items i
              LEFT JOIN environment_vars ev ON ev.item_id = i.id
-             WHERE ev.id IS NULL AND i.is_global = 0",
+             WHERE ev.id IS NULL AND i.is_global = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM item_projects ip
+                   JOIN projects p ON p.id = ip.project_id
+                   WHERE ip.item_id = i.id AND p.is_holding = 1
+               )",
         )
         .fetch_all(&self.pool)
         .await
@@ -2180,7 +2191,10 @@ impl VaultDb {
             sqlx::query(
                 "DELETE FROM item_projects WHERE item_id = ?1
                  AND EXISTS (SELECT 1 FROM items WHERE id = ?1 AND is_global = 0)
-                 AND NOT EXISTS (SELECT 1 FROM environment_vars WHERE item_id = ?1)",
+                 AND NOT EXISTS (SELECT 1 FROM environment_vars WHERE item_id = ?1)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM item_projects ip JOIN projects p ON p.id = ip.project_id
+                     WHERE ip.item_id = ?1 AND p.is_holding = 1)",
             )
             .bind(id)
             .execute(&mut *tx)
@@ -2189,7 +2203,10 @@ impl VaultDb {
 
             sqlx::query(
                 "DELETE FROM items WHERE id = ?1 AND is_global = 0
-                 AND NOT EXISTS (SELECT 1 FROM environment_vars WHERE item_id = ?1)",
+                 AND NOT EXISTS (SELECT 1 FROM environment_vars WHERE item_id = ?1)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM item_projects ip JOIN projects p ON p.id = ip.project_id
+                     WHERE ip.item_id = ?1 AND p.is_holding = 1)",
             )
             .bind(id)
             .execute(&mut *tx)
@@ -2326,6 +2343,228 @@ impl VaultDb {
         tx.commit().await.map_err(|e| e.to_string())?;
 
         Ok(InsertedProject { project_id, environment_ids, item_ids })    }
+
+    // ─── Backup / restore support (backup-restore-completeness) ───────────────
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Opens a brand-new database at `path` (schema + pragmas), discarding any
+    /// stale file or `-wal`/`-shm` leftovers from an earlier aborted restore.
+    pub async fn create_at(path: &Path) -> Result<Self, String> {
+        remove_db_files(path)?;
+        let path_str = path.to_str().ok_or_else(|| "invalid database path".to_string())?;
+        Self::open(path_str).await
+    }
+
+    /// Flushes the WAL into the main file and closes every pooled connection,
+    /// so the file can be renamed (required on Windows) and carries all data.
+    pub async fn close(&self) -> Result<(), String> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("db checkpoint: {e}"))?;
+        self.pool.close().await;
+        Ok(())
+    }
+
+    /// Writes a consistent copy of this database to `dest` (must not exist).
+    pub async fn vacuum_into(&self, dest: &Path) -> Result<(), String> {
+        let dest = dest.to_str().ok_or_else(|| "invalid database path".to_string())?;
+        sqlx::query("VACUUM INTO ?1")
+            .bind(dest)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("db copy: {e}"))?;
+        Ok(())
+    }
+
+    /// `PRAGMA integrity_check`; `Err` unless SQLite reports exactly `ok`.
+    pub async fn integrity_check(&self) -> Result<(), String> {
+        let rows: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("integrity check: {e}"))?;
+        if rows.len() == 1 && rows[0] == "ok" {
+            Ok(())
+        } else {
+            Err("integrity check failed on the restored database".to_string())
+        }
+    }
+
+    pub async fn list_settings(&self) -> Result<Vec<(String, String)>, String> {
+        let rows = sqlx::query("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Best-effort removal of the previous database kept by a restore.
+    /// Called when the vault is unlocked.
+    pub fn discard_pre_restore(&self) {
+        let _ = remove_db_files(&pre_restore_path(Path::new(&self.path)));
+    }
+
+    pub async fn list_item_projects(&self) -> Result<Vec<(i64, i64)>, String> {
+        let rows = sqlx::query("SELECT item_id, project_id FROM item_projects")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Raw (project_id, category_id) pairs. `list_project_categories` returns
+    /// names; a backup needs the ids.
+    pub async fn list_project_category_links(&self) -> Result<Vec<(i64, String)>, String> {
+        let rows = sqlx::query("SELECT project_id, category_id FROM project_categories")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    pub async fn list_holding_project_ids(&self) -> Result<Vec<i64>, String> {
+        sqlx::query_scalar("SELECT id FROM projects WHERE is_holding = 1")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn insert_item_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        item_type: &str,
+        data: &str,
+        created: &str,
+        is_global: bool,
+    ) -> Result<i64, String> {
+        let res = sqlx::query(
+            "INSERT INTO items (item_type, data, created, updated, is_global) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(item_type)
+        .bind(data)
+        .bind(created)
+        .bind(now_ts())
+        .bind(if is_global { 1i64 } else { 0i64 })
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Inserts a category unless one with the same id already exists.
+    pub async fn insert_category_if_absent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        cat: &DbCategory,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO categories (cid, name, color, description) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&cat.cid)
+        .bind(&cat.name)
+        .bind(&cat.color)
+        .bind(&cat.description)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Case-insensitive project lookup, matching `idx_projects_name_nocase`.
+    pub async fn find_project_by_name_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        name: &str,
+    ) -> Result<Option<i64>, String> {
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = ?1 COLLATE NOCASE")
+            .bind(name)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn insert_project_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        name: &str,
+        description: Option<&str>,
+        template: &str,
+        root_path: Option<&str>,
+        is_holding: bool,
+    ) -> Result<i64, String> {
+        let now = now_ts();
+        let res = sqlx::query(
+            "INSERT INTO projects (name, description, template, created, updated, root_path, is_holding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(template)
+        .bind(&now)
+        .bind(&now)
+        .bind(root_path)
+        .bind(if is_holding { 1i64 } else { 0i64 })
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_conflict(e, PROJECT_NAME_CONFLICT))?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Returns the id of the project named `name`, creating it (template
+    /// `generic`, no root, flagged as a holding project) when missing. Used to
+    /// give restored legacy items and imported items an owner.
+    pub async fn ensure_holding_project_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        name: &str,
+    ) -> Result<i64, String> {
+        if let Some(id) = Self::find_project_by_name_tx(tx, name).await? {
+            return Ok(id);
+        }
+        Self::insert_project_tx(tx, name, None, "generic", None, true).await
+    }
+
+    pub async fn add_project_category_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: i64,
+        category_id: &str,
+    ) -> Result<(), String> {
+        sqlx::query("INSERT OR IGNORE INTO project_categories (project_id, category_id) VALUES (?1, ?2)")
+            .bind(project_id)
+            .bind(category_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Id of the environment named `name` in `project_id` (case-insensitive).
+    pub async fn find_environment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: i64,
+        name: &str,
+    ) -> Result<Option<i64>, String> {
+        sqlx::query_scalar(
+            "SELECT id FROM environments WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE",
+        )
+        .bind(project_id)
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    pub async fn project_has_default_environment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: i64,
+    ) -> Result<bool, String> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM environments WHERE project_id = ?1 AND is_default = 1",
+        )
+        .bind(project_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
 
     pub async fn wipe_and_reset(&mut self) -> Result<(), String> {
         self.pool.close().await;
@@ -2744,4 +2983,31 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(db.get_environment_paths(env).await.unwrap(), vec!["/a".to_string()]);
     }
+}
+
+/// Path of the previous database retained by a restore (`vault.db.pre-restore`).
+pub fn pre_restore_path(db_path: &Path) -> std::path::PathBuf {
+    sibling_with_suffix(db_path, ".pre-restore")
+}
+
+/// `<db_path><suffix>` in the same directory (same filesystem, so renames
+/// between the two are atomic).
+pub fn sibling_with_suffix(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Removes a SQLite database file together with its `-wal` and `-shm`
+/// companions. Missing files are not an error.
+pub fn remove_db_files(path: &Path) -> Result<(), String> {
+    for suffix in ["", "-wal", "-shm"] {
+        let p = sibling_with_suffix(path, suffix);
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", p.display())),
+        }
+    }
+    Ok(())
 }
