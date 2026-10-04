@@ -521,7 +521,7 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <li><strong>TLS:</strong> a self-signed certificate is generated on first launch at <code>&lt;app data&gt;/com.maosuarez.cryptenv/tls/cert.pem</code>. Pass <code>--cacert</code> with that file (or <code>-k</code> for quick tests).</li>
       <li><strong>Token:</strong> send <code>X-Vault-Token</code> with either a session token from <code>POST /unlock</code> (expires) or the static MCP token from Settings.</li>
       <li>The static MCP token is a separate principal: every route is allowed, denied (<code>403 MCP_FORBIDDEN</code>) or approval-gated for it (see <a href="#mcp-safeguards">MCP safeguards</a>). Unclassified routes are denied.</li>
-      <li>Tokens are compared in constant time. <code>/unlock</code> is rate-limited to 5 attempts per 60 s (<code>429 RATE_LIMITED</code> with <code>Retry-After</code>).</li>
+      <li>Tokens are compared in constant time. Only <em>wrong</em> master passwords on <code>/unlock</code> are throttled: after a failure the next attempt must wait 1 s, doubling per consecutive failure up to 60 s (<code>429 RATE_LIMITED</code> with <code>Retry-After</code>); a correct password resets it. The desktop unlock shares the same counter. Malformed requests are rejected with <code>4xx</code> and never count, so another local process cannot lock you out.</li>
     </ul>
 
     <h3 id="api-endpoints">Endpoints<a class="anchor" href="#api-endpoints">#</a></h3>
@@ -531,8 +531,8 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td colspan="3"><strong>System</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/health</code></td><td>No auth. <code>version</code>, <code>status</code>, <code>vault_locked</code>, <code>mcp_token_configured</code></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request. Locking the vault invalidates all sessions: requests get <code>403</code> while locked and <code>401</code> with a pre-lock token after the next unlock</td></tr>
-      <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code></td></tr>
-      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings (the MCP token may only set <code>hotkey</code>)</td></tr>
+      <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code>. A stored out-of-range timeout is reported clamped</td></tr>
+      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings (the MCP token may only set <code>hotkey</code>). <code>auto_lock_timeout</code> must be <code>0</code> (never auto-lock) or <code>1</code>&ndash;<code>1440</code> minutes, otherwise <code>422 VALIDATION_ERROR</code> and nothing is stored</td></tr>
       <tr><td colspan="3"><strong>Items</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/items</code></td><td>Scoped. Redacted list; <code>type</code>, <code>category</code>, <code>search</code>, <code>include_global</code>. Rows carry <code>isGlobal</code> and <code>linked</code></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/items</code></td><td>Scoped. Create + link under <code>key</code> (defaults to <code>name</code>). <code>?on_conflict=update|replace|error</code></td></tr>
@@ -686,7 +686,9 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <tr><td><code>project '…' is bound to … not this directory</code></td><td>The project belongs to another checkout. Work there, or run <code>crypt-env config --relink</code> here to move it (asks for confirmation).</td></tr>
       <tr><td><code>refusing to write through a symlink</code></td><td>The configured <code>.env</code> is a symlink. Point the environment at the real file.</td></tr>
       <tr><td><code>path '…' is relative but the project has no root directory</code></td><td>Set the project root in the GUI project form, or run <code>crypt-env config</code> from the project root.</td></tr>
-      <tr><td><code>authentication failed (demasiados intentos…)</code></td><td>Five unlock attempts per minute — wait a minute and retry.</td></tr>
+      <tr><td><code>authentication failed (demasiados intentos…)</code></td><td>Too many wrong passwords in a row: wait the number of seconds in <code>Retry-After</code> (1 s after the first failure, doubling up to 60 s) and retry.</td></tr>
+      <tr><td>App starts into <em>Vault database cannot be opened</em></td><td>The vault file is unreadable or corrupt. <strong>Move aside and start fresh</strong> renames <code>vault.db</code> (and its <code>-wal</code>/<code>-shm</code>) to <code>vault.db.corrupt-&lt;timestamp&gt;</code> and restarts with an empty vault; nothing is deleted, so you can restore the file or a <code>.cenvbak</code> backup afterwards. <strong>Quit</strong> leaves everything as it is.</td></tr>
+      <tr><td>Notice <em>Global hotkey unavailable</em></td><td>Another application owns the shortcut (default <code>Ctrl+Alt+Z</code>). CryptEnv runs without a global hotkey; choose another in <strong>Settings → Hotkey</strong>.</td></tr>
       <tr><td>Prompted on every command from WSL</td><td>Re-run <strong>Settings → WSL Integration → Configure</strong> so the managed <code>crypt-env</code> launcher forwards <code>CRYPTENV_TERMINAL_ID</code>.</td></tr>
       <tr><td><code>SHARED_ITEM_CONFLICT</code></td><td>The key points to an item used elsewhere. Update it globally, or use <code>on_conflict=replace</code>.</td></tr>
       <tr><td>MCP: <em>MCP token not found</em></td><td>Generate one in Settings → Integrations and restart your MCP client.</td></tr>

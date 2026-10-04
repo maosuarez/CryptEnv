@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
 
 pub mod approvals;
 mod auth;
@@ -31,14 +30,10 @@ use crate::share::{ShareState, ShareSessionState};
 use crate::share::relay;
 use crate::share::package::PlainItem;
 use crate::tls;
+use crate::vault::unlock::{self, UnlockError};
 use crate::vault::{SharedState, VaultItem};
 
 // ─── Estado compartido de la API ──────────────────────────────────────────────
-
-struct RateLimitState {
-    attempts: u32,
-    window_start: Instant,
-}
 
 /// Live CLI sessions issued by `POST /unlock` (cli-tui-parity design D4).
 /// Each session slides: every successful use pushes its expiry a full `ttl`
@@ -64,8 +59,12 @@ const MAX_SESSIONS: usize = 64;
 /// Session lifetime for an `auto_lock_timeout` setting in minutes. `0` means
 /// "never auto-lock" in the GUI; a password session must still lapse, so it
 /// falls back to the 5-minute default.
+///
+/// Saturating and capped at the maximum auto-lock timeout, so a hostile or
+/// stale setting can never overflow the arithmetic here or in `Instant + ttl`.
 fn session_ttl(minutes: u64) -> Duration {
-    Duration::from_secs(if minutes == 0 { 5 } else { minutes } * 60)
+    let minutes = if minutes == 0 { 5 } else { minutes };
+    Duration::from_secs(minutes.min(unlock::AUTO_LOCK_MAX_MINUTES).saturating_mul(60))
 }
 
 impl SessionStore {
@@ -76,7 +75,9 @@ impl SessionStore {
                 self.entries.swap_remove(i);
             }
         }
-        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now, epoch });
+        // An unrepresentable expiry yields a session that is already expired.
+        let expires = now.checked_add(ttl).unwrap_or(now);
+        self.entries.push(Session { token, expires, ttl, last_used: now, epoch });
     }
 
     /// `true` when `provided` is a live session of the current lock `epoch`;
@@ -93,7 +94,7 @@ impl SessionStore {
         match hit {
             Some(i) => {
                 let e = &mut self.entries[i];
-                e.expires = now + e.ttl;
+                e.expires = now.checked_add(e.ttl).unwrap_or(now);
                 e.last_used = now;
                 true
             }
@@ -105,7 +106,6 @@ impl SessionStore {
 pub struct ApiState {
     vault: SharedState,
     sessions: Mutex<SessionStore>,
-    unlock_rate: Mutex<RateLimitState>,
     /// Pending human approvals for MCP requests (memory only, lock-epoch bound).
     approvals: Mutex<approvals::ApprovalStore>,
     /// Told about each new approval so the desktop app can show it.
@@ -137,10 +137,6 @@ impl ApiState {
         ApiState {
             vault,
             sessions: Mutex::new(SessionStore::default()),
-            unlock_rate: Mutex::new(RateLimitState {
-                attempts: 0,
-                window_start: Instant::now(),
-            }),
             approvals: Mutex::new(approvals::ApprovalStore::default()),
             notifier: std::sync::OnceLock::new(),
             exec_slots: Arc::new(tokio::sync::Semaphore::new(exec_routes::MAX_CONCURRENT_RUNS)),
@@ -608,17 +604,19 @@ async fn handle_unlock(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<UnlockBody>,
 ) -> impl IntoResponse {
-    // Rate limiting: máx 5 intentos de unlock por ventana de 60 segundos
+    // Only failed password attempts are throttled (exponential backoff shared
+    // with the GUI unlock); the key derivation runs off the vault lock.
+    let outcome = match unlock::unlock_with_password(
+        &state.vault,
+        body.master_password.as_bytes(),
+        false,
+        false,
+    )
+    .await
     {
-        let mut rate = state.unlock_rate.lock().await;
-        let now = Instant::now();
-        if now.duration_since(rate.window_start) >= Duration::from_secs(60) {
-            rate.window_start = now;
-            rate.attempts = 0;
-        }
-        if rate.attempts >= 5 {
-            let elapsed = now.duration_since(rate.window_start).as_secs();
-            let retry_after = 60u64.saturating_sub(elapsed);
+        Ok(o) => o,
+        Err(UnlockError::Throttled(wait)) => {
+            let retry_after = wait.as_secs().saturating_add(1);
             let mut resp = err_json(
                 StatusCode::TOO_MANY_REQUESTS,
                 "demasiados intentos, reintenta más tarde",
@@ -630,15 +628,7 @@ async fn handle_unlock(
             }
             return resp;
         }
-        rate.attempts += 1;
-    }
-
-    let mut vault = state.vault.lock().await;
-
-    // Verificar que la bóveda está inicializada
-    let (salt, token) = match vault.db.get_meta().await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
+        Err(UnlockError::NotInitialized) => {
             return err_json(
                 StatusCode::BAD_REQUEST,
                 "bóveda no inicializada",
@@ -646,15 +636,7 @@ async fn handle_unlock(
             )
             .into_response()
         }
-        Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
-                .into_response()
-        }
-    };
-
-    let key = match crypto::unlock_vault_crypto(body.master_password.as_bytes(), &salt, &token) {
-        Ok(k) => k,
-        Err(_) => {
+        Err(UnlockError::IncorrectPassword) => {
             return err_json(
                 StatusCode::BAD_REQUEST,
                 "contraseña incorrecta",
@@ -662,22 +644,22 @@ async fn handle_unlock(
             )
             .into_response()
         }
+        Err(e @ UnlockError::Aborted) => {
+            return err_json(StatusCode::CONFLICT, &e.message(), "CONFLICT").into_response()
+        }
+        Err(UnlockError::Other(e)) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                .into_response()
+        }
     };
+    let epoch = outcome.epoch;
 
-    vault.set_key(Some(Zeroizing::new(key)));
-
-    if let Err(e) = crate::vault::migrate_literal_vars_to_items(&vault.db, &key).await {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
-    }
-
-    // Leer timeout de la DB (minutos, default 5)
-    let minutes = match vault.db.get_setting("auto_lock_timeout").await {
-        Ok(Some(v)) => v.parse::<u64>().unwrap_or(5),
-        _ => 5,
+    // Leer timeout de la DB (minutos, default 5; valores fuera de rango se acotan)
+    let minutes = {
+        let vault = state.vault.lock().await;
+        let stored = vault.db.get_setting("auto_lock_timeout").await.ok().flatten();
+        unlock::effective_auto_lock(stored.as_deref())
     };
-
-    let epoch = vault.epoch;
-    drop(vault);
 
     // Generar token de sesión: 16 bytes = 32 chars hex
     let mut token_bytes = [0u8; 16];
@@ -1306,16 +1288,14 @@ async fn handle_get_settings(
     AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
     let vault = state.vault.lock().await;
-    let timeout = vault.db.get_setting("auto_lock_timeout").await
-        .unwrap_or_default()
-        .unwrap_or_else(|| "5".into());
+    let timeout = vault.db.get_setting("auto_lock_timeout").await.unwrap_or_default();
     let hotkey = vault.db.get_setting("hotkey").await
         .unwrap_or_default()
         .unwrap_or_else(|| "Ctrl+Alt+Z".into());
     drop(vault);
 
     (StatusCode::OK, Json(serde_json::json!({
-        "auto_lock_timeout": timeout.parse::<i64>().unwrap_or(5),
+        "auto_lock_timeout": unlock::effective_auto_lock(timeout.as_deref()),
         "hotkey": hotkey,
     }))).into_response()
 }
@@ -1336,8 +1316,13 @@ async fn handle_put_settings(
     if principal == Principal::Mcp && body.auto_lock_timeout.is_some() {
         return auth::mcp_forbidden("changing auto_lock_timeout");
     }
+    // Validated before anything is stored: a rejected request changes nothing.
+    let auto_lock = match body.auto_lock_timeout.map(unlock::validate_auto_lock).transpose() {
+        Ok(v) => v,
+        Err(reason) => return err_validation("auto_lock_timeout", &reason),
+    };
     let vault = state.vault.lock().await;
-    if let Some(t) = body.auto_lock_timeout {
+    if let Some(t) = auto_lock {
         if let Err(e) = vault.db.set_setting("auto_lock_timeout", &t.to_string()).await {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
         }

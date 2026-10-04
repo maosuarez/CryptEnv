@@ -816,6 +816,18 @@
     "installing": "INSTALANDO…",
     "install": "INSTALAR"
   },
+  "recovery": {
+    "title": "NÃO É POSSÍVEL ABRIR O BANCO DE DADOS DO COFRE",
+    "body": "O CryptEnv não conseguiu abrir seu banco de dados. Seus dados não foram apagados. Você pode mover o arquivo danificado para o lado (ele é renomeado, nunca apagado) e começar com um cofre vazio, ou sair e restaurar o arquivo você mesmo.",
+    "details": "Erro: {error}",
+    "moveAside": "MOVER E COMEÇAR DO ZERO",
+    "quit": "SAIR",
+    "failed": "Não foi possível mover o banco de dados: {error}"
+  },
+  "hotkeyNotice": {
+    "unavailable": "Atalho global indisponível: outro app está usando. Escolha outro em Configurações.",
+    "dismiss": "FECHAR"
+  },
   "approval": {
     "title": "SOLICITAÇÃO DE APROVAÇÃO MCP",
     "source": "Um agente MCP está pedindo para:",

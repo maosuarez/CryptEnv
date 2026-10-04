@@ -1170,8 +1170,31 @@ pub struct ExportedProject {
 
 #[tauri::command]
 pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> Result<(), String> {
-    // Lock only for the DB read: the save dialog and the file write below
-    // must not run under the vault lock.
+    export_project_with(project_id, &state, |default_name| {
+        tokio::task::spawn_blocking(move || {
+            rfd::FileDialog::new()
+                .set_title("Save project template")
+                .set_file_name(&default_name)
+                .add_filter("CryptEnv Project", &["cryptenv-proj"])
+                .save_file()
+        })
+    })
+    .await
+}
+
+/// Body of `project_export`, with the save dialog injected so a test can
+/// assert the vault lock is free while the dialog is open. The lock covers
+/// only the DB read: the dialog and the file write run after the guard is
+/// dropped, otherwise auto-lock (and every other interface) would wait for
+/// the user to dismiss the dialog.
+async fn export_project_with<P>(
+    project_id: i64,
+    state: &SharedState,
+    pick_file: impl FnOnce(String) -> P,
+) -> Result<(), String>
+where
+    P: std::future::Future<Output = Result<Option<std::path::PathBuf>, tokio::task::JoinError>>,
+{
     let project = {
         let s = state.lock().await;
         list_projects(&s.db)
@@ -1209,16 +1232,10 @@ pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> R
     let safe_name = project.name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
     let default_name = format!("{}.cryptenv-proj", safe_name);
 
-    let path = tokio::task::spawn_blocking(move || {
-        rfd::FileDialog::new()
-            .set_title("Save project template")
-            .set_file_name(&default_name)
-            .add_filter("CryptEnv Project", &["cryptenv-proj"])
-            .save_file()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "cancelled".to_string())?;
+    let path = pick_file(default_name)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "cancelled".to_string())?;
 
     tokio::task::spawn_blocking(move || std::fs::write(&path, &json))
         .await
@@ -2078,5 +2095,24 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let err = inject_to(&v, envs[0], &fifo).await.unwrap_err();
         assert!(err.starts_with(envfile::NOT_REGULAR_PREFIX), "{err}");
+    }
+
+    #[tokio::test]
+    async fn export_dialog_runs_without_the_vault_lock() {
+        use crate::test_support::*;
+        let v = unlocked_vault().await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.cryptenv-proj");
+        let state = v.state.clone();
+        let target_for_dialog = target.clone();
+        export_project_with(v.project_id, &v.state, move |_name| async move {
+            // The "dialog" is open here: the vault lock must be free.
+            let free = state.try_lock().is_ok();
+            assert!(free, "vault lock held while the save dialog is open");
+            Ok(Some(target_for_dialog))
+        })
+        .await
+        .unwrap();
+        assert!(target.exists());
     }
 }

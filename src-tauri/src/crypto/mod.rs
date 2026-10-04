@@ -7,6 +7,10 @@ pub type CryptoKey = [u8; 32];
 
 const VERIFY_MAGIC: &[u8] = b"vault_ok_v1";
 
+/// Error text of `unlock_vault_crypto` for a wrong password, so callers can
+/// tell it apart from a corrupt vault without matching on a literal.
+pub const INCORRECT_PASSWORD: &str = "incorrect password";
+
 fn argon2_inst() -> Argon2<'static> {
     Argon2::new(
         Algorithm::Argon2id,
@@ -69,7 +73,7 @@ pub fn unlock_vault_crypto(
         .try_into()
         .map_err(|_| "invalid salt length".to_string())?;
     let key = derive_key(password, &salt)?;
-    decrypt(&key, verify_token).map_err(|_| "incorrect password".to_string())?;
+    decrypt(&key, verify_token).map_err(|_| INCORRECT_PASSWORD.to_string())?;
     Ok(key)
 }
 

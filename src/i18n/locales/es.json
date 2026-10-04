@@ -816,6 +816,18 @@
     "installing": "INSTALANDO…",
     "install": "INSTALAR"
   },
+  "recovery": {
+    "title": "NO SE PUEDE ABRIR LA BASE DE DATOS DE LA BÓVEDA",
+    "body": "CryptEnv no pudo abrir su base de datos. Tus datos no se han borrado. Puedes apartar el archivo dañado (se renombra, nunca se borra) y empezar con una bóveda vacía, o salir y restaurar el archivo tú mismo.",
+    "details": "Error: {error}",
+    "moveAside": "APARTAR Y EMPEZAR DE CERO",
+    "quit": "SALIR",
+    "failed": "No se pudo apartar la base de datos: {error}"
+  },
+  "hotkeyNotice": {
+    "unavailable": "Atajo global no disponible: otra aplicación lo está usando. Elige otro en Configuración.",
+    "dismiss": "CERRAR"
+  },
   "approval": {
     "title": "SOLICITUD DE APROBACIÓN MCP",
     "source": "Un agente MCP solicita:",
