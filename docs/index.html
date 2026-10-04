@@ -535,8 +535,8 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><span class="m get">GET</span> <span class="m post">POST</span></td><td><code>/categories</code></td><td>List / create (<code>name</code>, <code>color</code>, <code>description?</code>)</td></tr>
       <tr><td><span class="m put">PUT</span> <span class="m del">DELETE</span></td><td><code>/categories/:id</code></td><td>Update / delete</td></tr>
       <tr><td colspan="3"><strong>Sharing</strong></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/listen</code></td><td>Scoped. Start LAN send; returns <code>pairing_code</code></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/connect</code></td><td>Scoped. Join as receiver; returns fingerprint</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/listen</code></td><td>Scoped. Start LAN send; returns <code>pairing_code</code>. 409 <code>SESSION_ACTIVE</code> if a share session is already active (cancel it first)</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/connect</code></td><td>Scoped. Join as receiver; returns the 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>). 409 <code>SESSION_ACTIVE</code> if a session is already active</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/confirm</code></td><td>Accept or reject the fingerprint (both sides)</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/share/status</code></td><td>State, fingerprint, <code>received_names</code>, <code>skipped_keys</code></td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/share/session</code></td><td>Cancel the session</td></tr>
@@ -593,6 +593,7 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <div class="card"><h4>Encryption at rest</h4><p>Each item is encrypted with AES-256-GCM using a key derived from your master password with Argon2id. Deletes are zeroed on disk (<code>secure_delete</code>).</p></div>
       <div class="card"><h4>Volatile keys</h4><p>The master password and derived key live in memory only while unlocked and are zeroized on lock. Auto-lock after a configurable timeout.</p></div>
       <div class="card"><h4>Local-only API</h4><p>Loopback binding, TLS, token auth with constant-time comparison, rate-limited unlock.</p></div>
+      <div class="card"><h4>LAN sharing</h4><p>The 6-digit pairing code feeds a SPAKE2 key exchange, so only a peer that knows it can derive the session key; mDNS advertises only a random session id and a protocol version, never anything derived from the code. Both sides prove the key (key confirmation) before any item moves, then compare a 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>) and confirm in the desktop app. Sockets time out after 30 s (handshake 60 s), 3 wrong-code attempts abort the session, only one session runs at a time, and locking the vault or closing the dialog cancels it. <strong>Both devices must run the same version</strong>: v1.0.6 peers are rejected with an &ldquo;update the other device&rdquo; message.</p></div>
       <div class="card"><h4>No plaintext leaks</h4><p>Values never appear in logs, errors or list responses. Reveal requires an explicit confirm; the MCP server writes or injects instead of returning.</p></div>
     </div>
     <p>Report vulnerabilities privately as described in <a href="https://github.com/maosuarez/CryptEnv/blob/main/SECURITY.md">SECURITY.md</a>.</p>

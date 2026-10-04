@@ -111,8 +111,9 @@ pub fn run() {
                 std::sync::Arc::new(tokio::sync::Mutex::new(VaultState::new(db)));
             app.manage(state.clone());
 
+            // The share slot lives inside the vault state so locking cancels it.
             let share_state: SharedShareState =
-                std::sync::Arc::new(share::ShareState::new());
+                tauri::async_runtime::block_on(async { state.lock().await.share.clone() });
             app.manage(share_state);
 
             app.manage(PendingUpdate(std::sync::Mutex::new(None)));

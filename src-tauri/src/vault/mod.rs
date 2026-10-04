@@ -78,6 +78,9 @@ pub struct VaultState {
     pub key: Option<Zeroizing<[u8; 32]>>,
     /// Monotonic timestamp of the last vault operation. None when the vault is locked.
     pub last_activity: Option<std::time::Instant>,
+    /// LAN share session slot, shared by the Tauri commands and the REST API.
+    /// Lives here so locking the vault can cancel any session (and drop its key copy).
+    pub share: Arc<crate::share::ShareState>,
 }
 
 impl VaultState {
@@ -86,6 +89,7 @@ impl VaultState {
             db,
             key: None,
             last_activity: None,
+            share: Arc::new(crate::share::ShareState::new()),
         }
     }
 
@@ -240,9 +244,15 @@ pub async fn vault_unlock(
 
 /// Internal lock used by both the Tauri command and the background auto-lock task.
 pub async fn lock_vault(shared: &SharedState) {
-    let mut s = shared.lock().await;
-    s.key = None;
-    s.last_activity = None;
+    let share = {
+        let mut s = shared.lock().await;
+        s.key = None;
+        s.last_activity = None;
+        s.share.clone()
+    };
+    // A share session holds its own copy of the vault key and may have a
+    // listener open; locking ends it.
+    crate::share::cancel_all(&share).await;
 }
 
 #[tauri::command]

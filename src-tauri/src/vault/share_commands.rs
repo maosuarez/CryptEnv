@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tauri::State;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::share::{self, package::PlainItem, relay, ShareState, ShareSessionState};
 use crate::vault::SharedState;
@@ -57,10 +58,10 @@ pub async fn share_start_send(
     share_state: State<'_, SharedShareState>,
     vault_state: State<'_, SharedState>,
 ) -> Result<StartSendResponse, String> {
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        **k
+        Zeroizing::new(**k)
     };
 
     let pairing_code = share::start_listen_session(
@@ -83,10 +84,10 @@ pub async fn share_start_receive(
     share_state: State<'_, SharedShareState>,
     vault_state: State<'_, SharedState>,
 ) -> Result<StartReceiveResponse, String> {
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        **k
+        Zeroizing::new(**k)
     };
 
     let fingerprint = share::connect_to_peer(
