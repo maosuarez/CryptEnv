@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod project;
 pub mod recovery;
 pub mod share;
+pub mod shellfmt;
 pub mod tls;
 pub mod vault;
 pub mod wsl;
@@ -235,6 +236,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            shellfmt::shell_format_assignment,
             vault_is_setup,
             vault_unlock,
             vault_lock,

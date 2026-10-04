@@ -89,7 +89,7 @@ Reads `.env.example` (current directory, then the project root, or `--example`) 
 eval "$(crypt-env inject DATABASE_URL API_KEY)"                # bash / zsh
 crypt-env inject DATABASE_URL --shell pwsh | Invoke-Expression  # PowerShell
 ```
-The password prompt goes to the terminal; only the single-quoted assignments go to stdout. Every key is resolved before anything is printed, so a missing key never produces a half-applied `eval`. Keys are looked up in the environment, then among global items.
+The password prompt goes to the terminal; only the single-quoted assignments go to stdout. Every key is resolved before anything is printed, so a missing key never produces a half-applied `eval`. Keys are looked up in the environment, then among global items. Keys must match `^[A-Za-z_][A-Za-z0-9_]*$` or the command fails with nothing on stdout. Values are quoted so they never execute: PowerShell doubles all five single-quote characters (`'` and U+2018-U+201B); bash/zsh use `'\''`, or `$'...'` when the value has a line break; `--shell sh` refuses values with a newline. The GUI "Copy as bash / PowerShell" produces the same text.
 
 ### `crypt-env search [PATTERN] [--global]`
 ```bash

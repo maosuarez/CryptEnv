@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { copySecret } from '../../lib/clipboard';
 import { Icon } from '../ui/Icon';
 import { CopyBtn } from '../ui/CopyBtn';
@@ -85,14 +86,16 @@ export function SecretRow({ item, cats, selected, onToggle, onShare, onSelect }:
   const { t }        = useTranslation();
 
   const copyAs = async (fmt: 'env' | 'bash' | 'ps1') => {
-    const text =
-      fmt === 'env'  ? `${item.name}=${item.value}` :
-      fmt === 'bash' ? `export ${item.name}=${item.value}` :
-                      `$env:${item.name} = "${item.value}"`;
     try {
+      const text = await invoke<string>('shell_format_assignment', {
+        shell: fmt,
+        key: item.name,
+        value: item.value,
+      });
       await copySecret(text, t('rows.copiedAs', { fmt: fmt === 'ps1' ? 'PowerShell' : fmt }));
-    } catch {
-      showToast(t('rows.clipboardError'));
+    } catch (e) {
+      // Formatter refusals (invalid key, unsupported value) name only the key.
+      showToast(typeof e === 'string' ? e : t('rows.clipboardError'));
     }
   };
 
