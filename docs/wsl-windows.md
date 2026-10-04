@@ -22,7 +22,7 @@ The GUI route also installs a managed `crypt-env` command that runs the Windows 
 │  CryptEnv GUI (Tauri)                                              │
 │    • SQLite vault + AES-256-GCM  (%APPDATA%\com.maosuarez.cryptenv)│
 │    • REST API  ──bind──▶  127.0.0.1:47821  (TLS, pinned self-cert) │
-│    • cert.pem + key.pem  (%APPDATA%\...\tls\)                      │
+│    • cert.pem + key (tls\gen-*\)                        │
 └───────────────────────────────┬──────────────────────────────────-┘
                                 │  loopback only — never 0.0.0.0
                                 │  (WSL reaches it as 127.0.0.1 via
@@ -211,4 +211,5 @@ test -f ~/.config/cryptenv/env.sh; and bass source ~/.config/cryptenv/env.sh
 | `Configuration error: CRYPTENV_API_URL must be an absolute http/https URL` | typo in the exported value | fix `~/.config/cryptenv/env.sh` or re-run `setup wsl` |
 | stderr `warning: CRYPTENV_API_URL host '…' is not a loopback address` | pointing at a non-loopback host | revert to `127.0.0.1` and fix networking instead |
 | TLS handshake failure after months of working | cert rotated; `CRYPTENV_CERT_PATH` points at a stale copy | point it at the live `/mnt/c/...cert.pem` and re-run `setup wsl` |
+| Settings shows "REST API unavailable" / TLS handshake fails right after a regeneration | the certificate was regenerated (mismatched or expiring pair, or **Regenerate certificate** clicked); WSL copies of the old cert are stale | re-run `setup wsl`; the `cert.pem` path itself is unchanged |
 | `cannot read TLS certificate at CRYPTENV_CERT_PATH (…)` | wrong path, or `/mnt/c` not mounted | verify the path resolves from WSL (`ls` it) |

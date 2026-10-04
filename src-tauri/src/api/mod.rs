@@ -17,6 +17,7 @@ mod auth;
 mod confine;
 mod exec_routes;
 mod mcp_servers;
+pub mod status;
 use self::auth::{AuthedPrincipal, McpPolicy, Principal};
 
 use crate::crypto;
@@ -170,6 +171,9 @@ impl ApiState {
 struct ErrorBody {
     error: String,
     code: String,
+    /// Correlation id of an internal error; the detail is in the local log only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -242,7 +246,37 @@ async fn cors_guard(
 // ─── Helpers de respuesta y auth ──────────────────────────────────────────────
 
 fn err_json(status: StatusCode, msg: &str, code: &str) -> impl IntoResponse {
-    (status, Json(ErrorBody { error: msg.to_string(), code: code.to_string() }))
+    (status, Json(ErrorBody { error: msg.to_string(), code: code.to_string(), id: None }))
+}
+
+/// Short random id that ties an internal-error response to its log line.
+fn new_correlation_id() -> String {
+    let mut b = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Logs `detail` locally under a fresh correlation id and returns that id.
+/// `detail` must never contain a secret value.
+fn log_internal_error(detail: &dyn std::fmt::Display) -> String {
+    let id = new_correlation_id();
+    eprintln!("[api] error id={id} {detail}");
+    id
+}
+
+/// Generic 500 response: the detail goes to the local log only, the caller gets
+/// a stable code and a correlation id (never SQL, schema text or file paths).
+fn internal_error(detail: &dyn std::fmt::Display) -> axum::response::Response {
+    let id = log_internal_error(detail);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "internal error".to_string(),
+            code: "INTERNAL_ERROR".to_string(),
+            id: Some(id),
+        }),
+    )
+        .into_response()
 }
 
 /// Builds the `envfile` marker line for a resolved environment: looks up
@@ -275,7 +309,7 @@ fn err_envfile(e: envfile::EnvFileError) -> axum::response::Response {
             err_json(StatusCode::CONFLICT, &e.to_string(), "NOT_REGULAR_FILE").into_response()
         }
         envfile::EnvFileError::Io(..) => {
-            err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot write file: {e}"), "INTERNAL_ERROR")
+            internal_error(&e)
                 .into_response()
         }
     }
@@ -648,8 +682,7 @@ async fn handle_unlock(
             return err_json(StatusCode::CONFLICT, &e.message(), "CONFLICT").into_response()
         }
         Err(UnlockError::Other(e)) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
-                .into_response()
+            return internal_error(&e).into_response()
         }
     };
     let epoch = outcome.epoch;
@@ -898,7 +931,7 @@ async fn handle_create_item(
             )
             .into_response(),
         },
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -929,7 +962,7 @@ async fn handle_update_item(
             return err_json(StatusCode::NOT_FOUND, "item no encontrado", "NOT_FOUND").into_response()
         }
         Err(crate::vault::UpdateItemError::Other(e)) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
@@ -963,7 +996,7 @@ async fn handle_delete_item(
     match vault.db.delete_item(id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response()
+            internal_error(&e).into_response()
         }
     }
 }
@@ -992,7 +1025,7 @@ async fn handle_list_orphans(
             let redacted: Vec<VaultItem> = items.into_iter().map(redact_item).collect();
             (StatusCode::OK, Json(redacted)).into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -1011,7 +1044,7 @@ async fn handle_list_categories(
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
-            err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response()
+            internal_error(&e).into_response()
         }
     }
 }
@@ -1052,7 +1085,7 @@ async fn handle_create_category(
             Json(CategoryResponse { id: cid, name: body.name, color: body.color, description: body.description }),
         )
             .into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -1074,7 +1107,7 @@ async fn handle_update_category(
     let cats = match vault.db.list_categories().await {
         Ok(c) => c,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
@@ -1113,7 +1146,7 @@ async fn handle_update_category(
         Ok(false) => {
             err_json(StatusCode::NOT_FOUND, "category not found", "NOT_FOUND").into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -1128,7 +1161,7 @@ async fn handle_delete_category(
         Ok(false) => {
             err_json(StatusCode::NOT_FOUND, "category not found", "NOT_FOUND").into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -1324,12 +1357,12 @@ async fn handle_put_settings(
     let vault = state.vault.lock().await;
     if let Some(t) = auto_lock {
         if let Err(e) = vault.db.set_setting("auto_lock_timeout", &t.to_string()).await {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
+            return internal_error(&e).into_response();
         }
     }
     if let Some(h) = body.hotkey {
         if let Err(e) = vault.db.set_setting("hotkey", &h).await {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
+            return internal_error(&e).into_response();
         }
     }
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
@@ -1556,11 +1589,7 @@ async fn handle_fill(
         match fsguard::resolve_within(dir, &crate::project::environment_filename(&env.name)) {
             Ok(p) => Some(p),
             Err(fsguard::ContainmentError::BaseUnusable(msg)) => {
-                return err_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("cannot use output directory: {msg}"),
-                    "INTERNAL_ERROR",
-                )
+                return internal_error(&msg)
                 .into_response();
             }
             Err(e) => {
@@ -1687,11 +1716,7 @@ async fn handle_fill(
         if body.output_path.is_some() {
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("cannot create directory: {e}"),
-                        "INTERNAL_ERROR",
-                    )
+                    return internal_error(&e)
                     .into_response();
                 }
             }
@@ -1813,11 +1838,7 @@ async fn handle_share_listen(
             .into_response()
         }
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     };
@@ -1894,11 +1915,7 @@ async fn handle_share_connect(
             .into_response()
         }
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     };
@@ -2109,7 +2126,7 @@ async fn handle_share_import(
             )
                 .into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
+        Err(e) => internal_error(&e)
             .into_response(),
     }
 }
@@ -2123,7 +2140,7 @@ async fn handle_list_projects(
     let vault = state.vault.lock().await;
     match project::list_projects(&vault.db).await {
         Ok(projects) => (StatusCode::OK, Json(projects)).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -2185,7 +2202,7 @@ async fn handle_delete_project(
     let projects = match project::list_projects(&vault.db).await {
         Ok(p) => p,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response()
+            return internal_error(&e).into_response()
         }
     };
     if projects.iter().find(|p| p.id == id).is_none() {
@@ -2194,7 +2211,7 @@ async fn handle_delete_project(
 
     match project::delete_project(&vault.db, id).await {
         Ok(impact) => (StatusCode::OK, Json(impact)).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -2206,7 +2223,7 @@ async fn handle_preview_delete_project(
     let vault = state.vault.lock().await;
     match project::project_delete_preview(&vault.db, id).await {
         Ok(impact) => (StatusCode::OK, Json(impact)).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -2232,7 +2249,7 @@ async fn handle_save_environment(
                 return err_validation("projectId", "must reference an existing project");
             }
         }
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => return internal_error(&e).into_response(),
     }
 
     match project::save_environment(&vault.db, body).await {
@@ -2278,7 +2295,7 @@ async fn handle_delete_environment(
     let vault = state.vault.lock().await;
     match project::delete_environment(&vault.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -2370,7 +2387,7 @@ async fn handle_inject_environment(
         Err(e) if e.starts_with(envfile::NOT_REGULAR_PREFIX) => {
             err_json(StatusCode::CONFLICT, &e, "NOT_REGULAR_FILE").into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -2456,11 +2473,7 @@ async fn handle_environment_example(
         match fsguard::resolve_within(dir, &crate::project::environment_example_filename(&env.name)) {
             Ok(p) => Some(p),
             Err(fsguard::ContainmentError::BaseUnusable(msg)) => {
-                return err_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("cannot use output directory: {msg}"),
-                    "INTERNAL_ERROR",
-                )
+                return internal_error(&msg)
                 .into_response();
             }
             Err(e) => {
@@ -2492,11 +2505,7 @@ async fn handle_environment_example(
         if body.output_path.is_some() {
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("cannot create directory: {e}"),
-                        "INTERNAL_ERROR",
-                    )
+                    return internal_error(&e)
                     .into_response();
                 }
             }
@@ -2546,21 +2555,35 @@ pub(crate) struct CoreError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Correlation id, set only for internal errors.
+    pub id: Option<String>,
 }
 
 impl CoreError {
     pub(crate) fn new(status: StatusCode, code: &'static str, message: String) -> CoreError {
-        CoreError { status, code, message }
+        CoreError { status, code, message, id: None }
     }
 
-    fn internal(message: impl Into<String>) -> CoreError {
-        CoreError::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message.into())
+    /// Internal failure: the detail is logged locally; the caller only gets a
+    /// generic message and a correlation id.
+    fn internal(detail: impl std::fmt::Display) -> CoreError {
+        let id = log_internal_error(&detail);
+        CoreError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "INTERNAL_ERROR",
+            message: "internal error".to_string(),
+            id: Some(id),
+        }
     }
 }
 
 impl IntoResponse for CoreError {
     fn into_response(self) -> axum::response::Response {
-        err_json(self.status, &self.message, self.code).into_response()
+        (
+            self.status,
+            Json(ErrorBody { error: self.message, code: self.code.to_string(), id: self.id }),
+        )
+            .into_response()
     }
 }
 
@@ -2790,11 +2813,7 @@ async fn handle_relay_receive(
     let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     };
@@ -2821,7 +2840,7 @@ async fn handle_relay_receive(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -2837,7 +2856,7 @@ async fn handle_relay_receive(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -2865,11 +2884,7 @@ async fn handle_relay_receive(
             .into_response()
         }
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("task error: {e}"),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     };
@@ -2901,7 +2916,7 @@ async fn handle_relay_receive(
     {
         Ok(o) => o,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
@@ -2975,7 +2990,7 @@ async fn handle_project_relay_send(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -2990,7 +3005,7 @@ async fn handle_project_relay_send(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -3004,7 +3019,7 @@ async fn handle_project_relay_send(
                 return err_json(StatusCode::PAYLOAD_TOO_LARGE, &e, "PAYLOAD_TOO_LARGE").into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -3022,14 +3037,14 @@ async fn handle_project_relay_send(
     let relay_key = match relay::derive_relay_key_async(&code, &passphrase).await {
         Ok(k) => k,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
     let payload = match relay::encrypt_project(&bundle, &relay_key) {
         Ok(p) => p,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
@@ -3050,11 +3065,7 @@ async fn handle_project_relay_send(
             .into_response()
         }
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("task error: {e}"),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     }
@@ -3108,7 +3119,7 @@ async fn handle_project_relay_receive(
     let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
+            return internal_error(&e)
                 .into_response()
         }
     };
@@ -3133,7 +3144,7 @@ async fn handle_project_relay_receive(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -3148,7 +3159,7 @@ async fn handle_project_relay_receive(
                 .into_response()
             }
             Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
+                return internal_error(&e)
                     .into_response()
             }
         };
@@ -3173,11 +3184,7 @@ async fn handle_project_relay_receive(
             .into_response()
         }
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("task error: {e}"),
-                "INTERNAL_ERROR",
-            )
+            return internal_error(&e)
             .into_response()
         }
     };
@@ -3214,7 +3221,7 @@ async fn handle_project_relay_receive(
         Err(e) if e.starts_with("conflict:") => {
             err_json(StatusCode::CONFLICT, &e, "CONFLICT").into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
+        Err(e) => internal_error(&e).into_response(),
     }
 }
 
@@ -3354,16 +3361,24 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
 
 /// Serves `api_state` on the fixed localhost TLS endpoint.
 pub async fn start_server(api_state: Arc<ApiState>, app_data_dir: PathBuf) {
+    use self::status::{set_handle, set_status, ApiStatus};
+
     let app = build_router(api_state);
 
     const ADDR: &str = "127.0.0.1:47821";
 
+    set_status(ApiStatus::Starting);
+
     // Ensure a valid self-signed TLS certificate is present (generated on first
-    // launch, regenerated if within 30 days of expiry).
+    // launch, regenerated if mismatched, corrupt or within 30 days of expiry).
     let tls_config = match tls::ensure_tls_config(&app_data_dir).await {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("[api] Failed to initialise TLS certificate: {e}");
+            set_status(ApiStatus::Failed {
+                code: "tls_error",
+                reason: "TLS certificate could not be initialised".to_string(),
+            });
             return;
         }
     };
@@ -3372,17 +3387,42 @@ pub async fn start_server(api_state: Arc<ApiState>, app_data_dir: PathBuf) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("[api] Invalid bind address {ADDR}: {e}");
+            set_status(ApiStatus::Failed {
+                code: "bind_error",
+                reason: "invalid bind address".to_string(),
+            });
             return;
         }
     };
 
     eprintln!("[api] Listening on https://{ADDR} (TLS)");
 
-    if let Err(e) = axum_server::bind_rustls(addr, tls_config)
+    // The handle lets the GUI stop this server when regenerating the certificate.
+    // `listening()` resolves to `None` when the bind itself fails.
+    let handle = axum_server::Handle::new();
+    set_handle(handle.clone());
+    let listening = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        if listening.listening().await.is_some() {
+            set_status(ApiStatus::Running);
+        }
+    });
+
+    match axum_server::bind_rustls(addr, tls_config)
+        .handle(handle)
         .serve(app.into_make_service())
         .await
     {
-        eprintln!("[api] REST server error: {e}");
+        Ok(()) => set_status(ApiStatus::Stopped),
+        Err(e) => {
+            eprintln!("[api] REST server error: {e}");
+            let (code, reason) = if e.kind() == std::io::ErrorKind::AddrInUse {
+                ("port_in_use", "port in use")
+            } else {
+                ("server_error", "server stopped unexpectedly")
+            };
+            set_status(ApiStatus::Failed { code, reason: reason.to_string() });
+        }
     }
 }
 

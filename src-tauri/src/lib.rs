@@ -32,6 +32,7 @@ use vault::{
     vault_pause_hotkey, vault_touch, SharedState, VaultState,
 };
 use api::approvals::{approval_list, approval_resolve};
+use api::status::{api_status, tls_regenerate};
 use vault::share_commands::{
     share_cancel, share_confirm_fingerprint, share_export_file, share_import_file,
     share_poll_status, relay_schema_version, share_relay_receive, share_relay_send, share_start_receive,
@@ -308,6 +309,8 @@ pub fn run() {
             app_get_system_info,
             approval_list,
             approval_resolve,
+            api_status,
+            tls_regenerate,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

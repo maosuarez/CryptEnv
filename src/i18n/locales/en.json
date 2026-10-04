@@ -891,5 +891,20 @@
       "skipped": "Skipped the crypt-env command ({reason})",
       "unknownReason": "unknown reason"
     }
+  },
+  "apiStatus": {
+    "title": "REST API UNAVAILABLE",
+    "reason": {
+      "port_in_use": "Port 47821 is already in use by another program. Close it and restart CryptEnv.",
+      "tls_error": "The TLS certificate could not be initialised.",
+      "bind_error": "The server could not bind to its address.",
+      "server_error": "The server stopped unexpectedly.",
+      "stopped": "The server is stopped."
+    },
+    "impact": "The CLI, TUI and MCP server cannot reach the vault until the API is running.",
+    "regenerate": "REGENERATE CERTIFICATE",
+    "regenerating": "REGENERATING…",
+    "regenerated": "Certificate regenerated. If you use WSL, re-run `crypt-env setup wsl` so it trusts the new certificate.",
+    "regenerateFailed": "Could not regenerate the certificate: {error}"
   }
 }

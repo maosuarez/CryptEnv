@@ -514,11 +514,11 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
 
     <!-- ===================== 8. API ===================== -->
     <h2 id="api"><span class="num">07</span>REST API<a class="anchor" href="#api">#</a></h2>
-    <p>The app serves HTTPS on <code>https://127.0.0.1:47821</code>, bound to loopback only. The CLI, TUI and MCP server are built on it; you can call it from your own scripts too. Errors come back as <code>{"error": "...", "code": "..."}</code>.</p>
+    <p>The app serves HTTPS on <code>https://127.0.0.1:47821</code>, bound to loopback only. The CLI, TUI and MCP server are built on it; you can call it from your own scripts too. Errors come back as <code>{"error": "...", "code": "..."}</code>. Internal failures return <code>500</code> with <code>{"error": "internal error", "code": "INTERNAL_ERROR", "id": "a1b2c3d4"}</code>: no SQL, schema or file paths are exposed, and the detail is written to the app's local log under the same <code>id</code>.</p>
 
     <h3 id="api-auth">Auth &amp; TLS<a class="anchor" href="#api-auth">#</a></h3>
     <ul>
-      <li><strong>TLS:</strong> a self-signed certificate is generated on first launch at <code>&lt;app data&gt;/com.maosuarez.cryptenv/tls/cert.pem</code>. Pass <code>--cacert</code> with that file (or <code>-k</code> for quick tests).</li>
+      <li><strong>TLS:</strong> a self-signed certificate is generated on first launch at <code>&lt;app data&gt;/com.maosuarez.cryptenv/tls/cert.pem</code>. Pass <code>--cacert</code> with that file (or <code>-k</code> for quick tests). At every start the app checks that the certificate and key match and that the certificate is not about to expire, and regenerates them if not; the published <code>cert.pem</code> path stays the same.</li>
       <li><strong>Token:</strong> send <code>X-Vault-Token</code> with either a session token from <code>POST /unlock</code> (expires) or the static MCP token from Settings.</li>
       <li>The static MCP token is a separate principal: every route is allowed, denied (<code>403 MCP_FORBIDDEN</code>) or approval-gated for it (see <a href="#mcp-safeguards">MCP safeguards</a>). Unclassified routes are denied.</li>
       <li>Tokens are compared in constant time. Only <em>wrong</em> master passwords on <code>/unlock</code> are throttled: after a failure the next attempt must wait 1 s, doubling per consecutive failure up to 60 s (<code>429 RATE_LIMITED</code> with <code>Retry-After</code>); a correct password resets it. The desktop unlock shares the same counter. Malformed requests are rejected with <code>4xx</code> and never count, so another local process cannot lock you out.</li>
@@ -693,6 +693,8 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <tr><td><code>SHARED_ITEM_CONFLICT</code></td><td>The key points to an item used elsewhere. Update it globally, or use <code>on_conflict=replace</code>.</td></tr>
       <tr><td>MCP: <em>MCP token not found</em></td><td>Generate one in Settings → Integrations and restart your MCP client.</td></tr>
       <tr><td>TLS errors from WSL</td><td>Point <code>CRYPTENV_CERT_PATH</code> at the Windows cert (<code>crypt-env setup wsl</code>).</td></tr>
+      <tr><td>Settings shows <em>REST API unavailable</em></td><td>The local server did not start; the banner gives the reason (for example, port 47821 in use by another program). For a TLS problem click <strong>Regenerate certificate</strong>: it creates a new certificate and restarts the server. Afterwards re-run <code>crypt-env setup wsl</code> if you use WSL, so the client trusts the new certificate.</td></tr>
+      <tr><td><code>500 INTERNAL_ERROR</code> with an <code>id</code></td><td>Look up that <code>id</code> in the app's log (stderr) for the detail.</td></tr>
     </table></div>
 
     <footer class="site">
