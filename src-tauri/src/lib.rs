@@ -11,6 +11,7 @@ pub mod fsguard;
 pub mod hotkey;
 pub mod mcp;
 pub mod project;
+pub mod recovery;
 pub mod share;
 pub mod tls;
 pub mod vault;
@@ -93,17 +94,32 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            app.manage(hotkey::HotkeyState::default());
+
             let app_dir = app
                 .path()
                 .app_data_dir()
-                .expect("failed to resolve app data dir");
-            std::fs::create_dir_all(&app_dir).expect("failed to create app data dir");
+                .map_err(|e| format!("failed to resolve app data dir: {e}"))?;
+            std::fs::create_dir_all(&app_dir)
+                .map_err(|e| format!("failed to create app data dir: {e}"))?;
 
             let db_path = app_dir.join("vault.db");
-            let db_path_str = db_path.to_str().expect("invalid db path");
+            let db_path_str = db_path.to_str().ok_or("invalid db path")?;
 
-            let db = tauri::async_runtime::block_on(db::VaultDb::open(db_path_str))
-                .expect("failed to open vault database");
+            // Retry deleting old database files a previous wipe could not remove.
+            db::sweep_pending_wipes(&db_path);
+
+            // An unopenable database must not stop the app: start into the
+            // recovery screen, which offers moving the file aside or quitting.
+            let db = match tauri::async_runtime::block_on(db::VaultDb::open(db_path_str)) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("vault database could not be opened: {e}");
+                    app.manage(recovery::AppMode::Recovery { error: e });
+                    return Ok(());
+                }
+            };
+            app.manage(recovery::AppMode::Normal);
 
             let saved_hotkey = tauri::async_runtime::block_on(db.get_setting("hotkey"))
                 .ok()
@@ -174,21 +190,22 @@ pub fn run() {
                             None => continue,
                         };
 
-                        let timeout_mins: u64 = s
-                            .db
-                            .get_setting("auto_lock_timeout")
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(5);
+                        // Out-of-range stored values are clamped, never trusted.
+                        let timeout_mins = vault::unlock::effective_auto_lock(
+                            s.db.get_setting("auto_lock_timeout")
+                                .await
+                                .ok()
+                                .flatten()
+                                .as_deref(),
+                        );
 
                         // 0 means "never auto-lock".
                         if timeout_mins == 0 {
                             continue;
                         }
 
-                        last.elapsed() >= std::time::Duration::from_secs(timeout_mins * 60)
+                        last.elapsed()
+                            >= std::time::Duration::from_secs(timeout_mins.saturating_mul(60))
                     };
 
                     if should_lock {
@@ -202,13 +219,14 @@ pub fn run() {
 
             // Register the persisted hotkey; fall back to the platform default
             // when unset or when the stored combination can't be registered.
-            app.manage(hotkey::HotkeyState::default());
-            let registered = saved_hotkey
-                .as_deref()
-                .map(|hk| hotkey::register_app_hotkey(app.handle(), hk))
-                .unwrap_or_else(|| Err("unset".into()));
-            if registered.is_err() {
-                hotkey::register_app_hotkey(app.handle(), hotkey::default_hotkey())?;
+            // If even that fails (another app owns it) the app still starts,
+            // without a global shortcut, and the GUI shows a notice.
+            let registered = hotkey::register_startup_hotkey(saved_hotkey.as_deref(), |hk| {
+                hotkey::register_app_hotkey(app.handle(), hk)
+            });
+            if let Err(e) = registered {
+                eprintln!("global hotkey unavailable: {e}");
+                app.state::<hotkey::HotkeyState>().set_unavailable(true);
             }
 
             Ok(())
@@ -232,6 +250,10 @@ pub fn run() {
             vault_get_settings,
             vault_save_settings,
             vault_pause_hotkey,
+            hotkey::hotkey_status,
+            recovery::app_mode,
+            recovery::recovery_move_aside,
+            recovery::recovery_quit,
             vault_change_password,
             vault_wipe,
             vault_generate_mcp_token,

@@ -17,7 +17,7 @@ CryptEnv runs a local HTTPS server on `127.0.0.1:47821` (localhost strictly). Th
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Server status and vault lock state (unauthenticated) |
-| `POST` | `/unlock` | Unlock vault with master password (rate-limited: 5 attempts / 60s) |
+| `POST` | `/unlock` | Unlock vault with master password (failed attempts throttled: 1 s doubling to 60 s, `429` + `Retry-After`) |
 | `GET` | `/items` | List items (redacted) scoped by `environment_id` or `project` + `environment` |
 | `POST` | `/items` | Create and link a vault item into an environment |
 | `GET` | `/items/:id` | Get item metadata |

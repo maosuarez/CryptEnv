@@ -14,6 +14,7 @@ use crate::db::{DbCategory, LinkMode, LinkOutcome, VaultDb};
 pub mod backup;
 pub mod import;
 pub mod share_commands;
+pub mod unlock;
 
 // ─── Serializable types (shared with frontend) ────────────────────────────────
 
@@ -90,6 +91,9 @@ pub struct VaultState {
     /// Private plaintext files produced for MCP `generate_env`. Lives here so
     /// locking the vault can delete them without knowing about the API layer.
     pub generated: Arc<crate::exec::tempfiles::GeneratedFiles>,
+    /// Failed-unlock penalty shared by the REST `/unlock` and the GUI unlock.
+    /// Lives here because both reach the vault through `SharedState`.
+    pub throttle: Arc<unlock::UnlockThrottle>,
 }
 
 impl VaultState {
@@ -101,6 +105,7 @@ impl VaultState {
             epoch: 0,
             share: Arc::new(crate::share::ShareState::new()),
             generated: Arc::new(crate::exec::tempfiles::GeneratedFiles::new()),
+            throttle: Arc::new(unlock::UnlockThrottle::default()),
         }
     }
 
@@ -219,69 +224,21 @@ pub async fn vault_is_setup(state: State<'_, SharedState>) -> Result<bool, Strin
     s.db.is_initialized().await
 }
 
-/// Shared unlock logic: derives key from password bytes, loads items + categories.
-/// The caller is responsible for verifying the password is correct before calling this
-/// (either via `unlock_vault_crypto` or by knowing it came from a trusted DPAPI blob).
-async fn do_unlock(
-    password_bytes: &[u8],
-    s: &mut VaultState,
-) -> Result<UnlockPayload, String> {
-    let key = {
-        let db = &s.db;
-        if db.is_initialized().await? {
-            let (salt, token) = db
-                .get_meta()
-                .await?
-                .ok_or_else(|| "vault_meta row missing".to_string())?;
-            crypto::unlock_vault_crypto(password_bytes, &salt, &token)?
-        } else {
-            let (salt, token, k) = crypto::init_vault_crypto(password_bytes)?;
-            db.init_vault(&salt, &token).await?;
-            k
-        }
-    };
-
-    // The key is published to `VaultState` only after every fallible step has
-    // succeeded: REST/MCP treat `key.is_some()` as "unlocked", so a failure
-    // below must leave the vault locked.
-    migrate_literal_vars_to_items(&s.db, &key).await?;
-
-    let raw = s.db.list_items().await?;
-    let items: Vec<VaultItem> = raw
-        .into_iter()
-        .filter_map(|(id, _, data, _, is_global)| decrypt_item(&key, id, &data, is_global).ok())
-        .collect();
-
-    let cats = s
-        .db
-        .list_categories()
-        .await?
-        .into_iter()
-        .map(|c| Category {
-            id: c.cid,
-            name: c.name,
-            color: c.color,
-            description: c.description,
-        })
-        .collect();
-
-    // Set key as the final step after all fallible operations succeed
-    s.set_key(Some(Zeroizing::new(key)));
-    s.touch();
-
-    Ok(UnlockPayload {
-        items,
-        categories: cats,
-    })
-}
-
 #[tauri::command]
 pub async fn vault_unlock(
     password: String,
     state: State<'_, SharedState>,
 ) -> Result<UnlockPayload, String> {
-    let mut s = state.lock().await;
-    do_unlock(password.as_bytes(), &mut s).await
+    unlock_for_gui(&state, password.as_bytes()).await
+}
+
+/// GUI unlock (also first-run vault creation). The key derivation runs off
+/// the vault lock, see `unlock`.
+async fn unlock_for_gui(state: &SharedState, password: &[u8]) -> Result<UnlockPayload, String> {
+    let outcome = unlock::unlock_with_password(state, password, true, true)
+        .await
+        .map_err(|e| e.message())?;
+    outcome.payload.ok_or_else(|| "unlock payload missing".to_string())
 }
 
 /// Internal lock used by both the Tauri command and the background auto-lock task.
@@ -930,18 +887,14 @@ pub async fn vault_get_settings(
     state: State<'_, SharedState>,
 ) -> Result<serde_json::Value, String> {
     let s = state.lock().await;
-    let timeout = s
-        .db
-        .get_setting("auto_lock_timeout")
-        .await?
-        .unwrap_or_else(|| "5".into());
+    let timeout = s.db.get_setting("auto_lock_timeout").await?;
     let hotkey = s
         .db
         .get_setting("hotkey")
         .await?
         .unwrap_or_else(|| crate::hotkey::default_hotkey().into());
     Ok(serde_json::json!({
-        "autoLockTimeout": timeout.parse::<i64>().unwrap_or(5),
+        "autoLockTimeout": unlock::effective_auto_lock(timeout.as_deref()),
         "hotkey": hotkey
     }))
 }
@@ -986,45 +939,18 @@ pub async fn vault_change_password(
     new_password: String,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    let mut s = state.lock().await;
-    s.key.as_ref().ok_or("vault is locked")?;
-
-    // Verify current password against stored meta
-    let (salt, token) = s
-        .db
-        .get_meta()
-        .await?
-        .ok_or("vault_meta missing")?;
-    let old_key = crypto::unlock_vault_crypto(current_password.as_bytes(), &salt, &token)?;
-
-    // Generate new crypto material
-    let (new_salt, new_token, new_key) = crypto::init_vault_crypto(new_password.as_bytes())?;
-
-    // Re-encrypt every item blob
-    let raw = s.db.list_items().await?;
-    let mut re_encrypted: Vec<(i64, String)> = Vec::with_capacity(raw.len());
-    for (id, _, data, _, _) in &raw {
-        let plaintext = crypto::decrypt(&old_key, data)?;
-        let new_data = crypto::encrypt(&new_key, &plaintext)?;
-        re_encrypted.push((*id, new_data));
-    }
-
-    // Atomic DB update: new salt/token + all re-encrypted items
-    s.db.rekey(&new_salt, &new_token, re_encrypted).await?;
-
-    // Update in-memory key
-    s.set_key(Some(Zeroizing::new(new_key)));
-    s.touch();
-
-    Ok(())
+    unlock::change_password(&state, &current_password, &new_password).await
 }
 
 #[tauri::command]
 pub async fn vault_wipe(state: State<'_, SharedState>) -> Result<(), String> {
     let mut s = state.lock().await;
+    // Wipe first: if the old files cannot be moved aside the reset fails and
+    // the current vault (and session) stays as it was.
+    s.db.wipe_and_reset().await?;
     s.set_key(None);
     s.last_activity = None;
-    s.db.wipe_and_reset().await
+    Ok(())
 }
 
 #[tauri::command]
@@ -1038,6 +964,8 @@ pub async fn vault_save_settings(
     state: State<'_, SharedState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    let auto_lock_timeout = unlock::validate_auto_lock(auto_lock_timeout)?;
+
     // Apply the shortcut first so an invalid or OS-conflicting combination is
     // reported to the user and never persisted.
     let hotkey = crate::hotkey::normalize_hotkey(&hotkey);
@@ -1154,8 +1082,7 @@ pub async fn vault_import_backup(
 ) -> Result<backup::RestoreSummary, String> {
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("read backup: {e}"))?;
-    let mut s = state.lock().await;
-    backup::restore(&mut s, &json, &master_password, current_password.as_deref(), merge).await
+    backup::restore_shared(&state, &json, &master_password, current_password.as_deref(), merge).await
 }
 
 /// Restore a `.cenvbak` by passing its JSON content directly.
@@ -1168,8 +1095,7 @@ pub async fn vault_import_backup_data(
     current_password: Option<String>,
     state: State<'_, SharedState>,
 ) -> Result<backup::RestoreSummary, String> {
-    let mut s = state.lock().await;
-    backup::restore(&mut s, &data, &master_password, current_password.as_deref(), merge).await
+    backup::restore_shared(&state, &data, &master_password, current_password.as_deref(), merge).await
 }
 
 // ─── Import from password managers ───────────────────────────────────────────
@@ -1422,15 +1348,7 @@ pub async fn biometric_enroll(
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
     // 1. Verify the supplied password against the stored vault meta.
-    {
-        let s = state.lock().await;
-        let (salt, token) = s
-            .db
-            .get_meta()
-            .await?
-            .ok_or_else(|| "vault not initialized".to_string())?;
-        crypto::unlock_vault_crypto(password.as_bytes(), &salt, &token)?;
-    }
+    unlock::verify_password(&state, password.as_bytes()).await?;
 
     // 2. Request Windows Hello consent before storing anything.
     let verified = biometric::request_verification("Enroll CryptEnv biometric unlock").await?;
@@ -1495,8 +1413,7 @@ pub async fn biometric_unlock(state: State<'_, SharedState>) -> Result<UnlockPay
     // 4. Unlock using the recovered password, same path as vault_unlock.
     #[cfg(target_os = "windows")]
     {
-        let mut s = state.lock().await;
-        do_unlock(&password_bytes, &mut s).await
+        unlock_for_gui(&state, &password_bytes).await
     }
 }
 
@@ -1909,9 +1826,9 @@ mod tests {
         }
 
         {
-            let mut s = v.state.lock().await;
-            let res = do_unlock(v.master_password.as_bytes(), &mut s).await;
+            let res = unlock_for_gui(&v.state, v.master_password.as_bytes()).await;
             assert!(res.is_err());
+            let s = v.state.lock().await;
             assert!(s.key.is_none(), "key must stay None when unlock fails");
         }
 

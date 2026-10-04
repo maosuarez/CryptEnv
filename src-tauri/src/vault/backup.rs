@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use super::{epoch_to_iso8601, SystemTime, UNIX_EPOCH, VaultState};
+use super::{epoch_to_iso8601, SharedState, SystemTime, UNIX_EPOCH, VaultState};
 use crate::crypto::{self, CryptoKey};
 use crate::db::{
     pre_restore_path, remove_db_files, sibling_with_suffix, DbCategory, DbEnvironmentVar, VaultDb,
@@ -523,7 +523,62 @@ async fn reopen_original(s: &mut VaultState, live: &Path, cause: String) -> Stri
     }
 }
 
-/// Restores `json` into the vault held by `s`.
+/// Restores `json` into the vault behind `shared`. The password derivations
+/// (the current master password for a replace, the backup's) run off the
+/// vault lock; the restore itself re-checks the lock epoch and key before it
+/// swaps anything. See `restore` for the rules.
+pub(super) async fn restore_shared(
+    shared: &SharedState,
+    json: &str,
+    backup_password: &str,
+    current_password: Option<&str>,
+    merge: bool,
+) -> Result<RestoreSummary, String> {
+    // Phase 1: snapshot under the lock.
+    let (current_key, current_meta, epoch) = {
+        let s = shared.lock().await;
+        let key = s.key.as_ref().ok_or("vault is locked")?.clone();
+        let meta = if merge { None } else { Some(s.db.get_meta().await?.ok_or("vault_meta missing")?) };
+        (key, meta, s.epoch)
+    };
+    if !merge && current_password.filter(|p| !p.is_empty()).is_none() {
+        return Err("the current master password is required to replace the vault".to_string());
+    }
+    let backup = parse_backup(json)?;
+
+    // Phase 2: both derivations, off the runtime and off the lock.
+    let current_pw = current_password.map(|p| Zeroizing::new(p.as_bytes().to_vec()));
+    let backup_pw = Zeroizing::new(backup_password.as_bytes().to_vec());
+    let (salt, token) = (backup.salt.clone(), backup.token.clone());
+    let expected = current_key.clone();
+    let backup_key = tokio::task::spawn_blocking(move || {
+        if let (Some(pw), Some((salt, token))) = (current_pw, current_meta) {
+            let derived = Zeroizing::new(
+                crypto::unlock_vault_crypto(&pw, &salt, &token)
+                    .map_err(|_| "incorrect current master password".to_string())?,
+            );
+            if !bool::from(derived.as_slice().ct_eq(expected.as_slice())) {
+                return Err("incorrect current master password".to_string());
+            }
+        }
+        crypto::unlock_vault_crypto(&backup_pw, &salt, &token)
+            .map(Zeroizing::new)
+            .map_err(|_| "incorrect master password for this backup".to_string())
+    })
+    .await
+    .map_err(|_| "key derivation task failed".to_string())??;
+
+    // Phase 3: the swap needs the lock for its whole duration.
+    let mut s = shared.lock().await;
+    if s.epoch != epoch {
+        return Err("the vault changed while the passwords were being verified, try again".to_string());
+    }
+    restore_verified(&mut s, &backup, backup_key, current_key, merge).await
+}
+
+/// Restores `json` into the vault held by `s`, deriving under the caller's
+/// lock. Kept for the unit tests of the restore rules; production goes
+/// through `restore_shared`.
 ///
 /// - Both modes require an unlocked vault and the backup's master password.
 /// - `merge = false` additionally requires `current_password` (the vault's own
@@ -531,6 +586,7 @@ async fn reopen_original(s: &mut VaultState, live: &Path, cause: String) -> Stri
 ///   the backup's.
 /// - `merge = true` adds the backup's content, re-encrypted with the current
 ///   vault key.
+#[cfg(test)]
 pub(super) async fn restore(
     s: &mut VaultState,
     json: &str,
@@ -559,7 +615,19 @@ pub(super) async fn restore(
         crypto::unlock_vault_crypto(backup_password.as_bytes(), &backup.salt, &backup.token)
             .map_err(|_| "incorrect master password for this backup".to_string())?,
     );
-    let meta = load_meta(&backup, &backup_key)?;
+    restore_verified(s, &backup, backup_key, current_key, merge).await
+}
+
+/// The restore proper, once the passwords have been verified and both keys
+/// are known. Runs under the vault lock.
+async fn restore_verified(
+    s: &mut VaultState,
+    backup: &BackupFile,
+    backup_key: Zeroizing<[u8; 32]>,
+    current_key: Zeroizing<[u8; 32]>,
+    merge: bool,
+) -> Result<RestoreSummary, String> {
+    let meta = load_meta(backup, &backup_key)?;
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let date = epoch_to_iso8601(now)[..10].to_string();
@@ -570,7 +638,7 @@ pub(super) async fn restore(
     let pre_restore = pre_restore_path(&live);
 
     let plan = Plan {
-        backup: &backup,
+        backup,
         meta: &meta,
         backup_key: &backup_key,
         current_key: &current_key,

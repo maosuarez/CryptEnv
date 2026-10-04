@@ -4,7 +4,7 @@
 
 Endpoint: `https://127.0.0.1:47821`
 
-Authentication: Header `X-Vault-Token` containing either a session token (from POST /unlock, has TTL) or a static MCP token (stored in database, no expiry). Token verification uses constant-time comparison. Rate limiting enforced on /unlock: 5 attempts per 60-second window.
+Authentication: Header `X-Vault-Token` containing either a session token (from POST /unlock, has TTL) or a static MCP token (stored in database, no expiry). Token verification uses constant-time comparison. Throttling on /unlock counts only failed password attempts: after a failure the next attempt must wait 1 s, doubling per consecutive failure up to 60 s (`429 RATE_LIMITED` + `Retry-After`); success resets it. The GUI unlock shares the counter (`VaultState.throttle`). Malformed bodies get `4xx` before the throttle is consulted.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
@@ -23,7 +23,7 @@ Authentication: Header `X-Vault-Token` containing either a session token (from P
 | GET | /commands | token | List items of type "command" with extracted `{{VAR}}` placeholders, **scoped** (same query params as GET /items). **Discovery endpoint** — same `include_global` contract as GET /items (default `true`); each command carries `isGlobal` and `linked` |
 | GET | /commands/:id | token | Get single command with placeholders. Unscoped |
 | GET | /settings | token | Get auto_lock_timeout (minutes) and hotkey. Unscoped — settings are global |
-| PUT | /settings | token | Update auto_lock_timeout and/or hotkey |
+| PUT | /settings | token | Update auto_lock_timeout and/or hotkey. `auto_lock_timeout` must be `0` (never) or `1`-`1440` minutes, else `422 VALIDATION_ERROR` and nothing is stored; a stored out-of-range value is clamped on read (`vault::unlock::effective_auto_lock`) |
 | POST | /fill | token | Fill a .env template with real values, **scoped** (same query params as GET /items). Matches template keys against the resolved environment's `environment_vars.key` (not a vault-wide name search). A template key not found in scope has its **original line preserved unchanged** (not blanked) and is reported as a warning. `output_path` given: writes there via the RAII `TempEnvFile` guard, returns stats only — no secret in response. No `output_path` but `output_dir` given: the environment-name-derived filename is resolved via `fsguard::resolve_within` (issue #7) before any decryption happens — `422 PATH_NOT_CONTAINED` if it can't stay inside `output_dir`, `path` in the response is the resolved (post-canonicalization) path. Neither: returns filled content inline. Body accepts `overwrite` (default `false`) — see **Write-target gating** below |
 | POST | /environments/:id/example | token | Generate a placeholder-only env file/content for the environment (`environment_id` in URL path, same convention as `/environments/:id/inject`) — `KEY=` for every linked var key, values always empty, explicitly safe to commit. Never decrypts or reads item values. Body `{output_path?, output_dir?, overwrite?}`: `output_path` writes there; `output_dir` writes to the environment-name-derived filename, contained within `output_dir` via `fsguard::resolve_within` (issue #7, same as `/fill`) — `422 PATH_NOT_CONTAINED` on escape; neither returns `{content, keys}` inline. 404 if the environment doesn't resolve. Same `overwrite` gating as `/fill` — see below |
 | POST | /share/listen | token | Start LAN share session as sender, **scoped** (same query params as GET /items). Every id in `items` must already be linked into the resolved environment or the call 422s. Registers mDNS (session id + protocol version only), returns `pairing_code`. 409 `SESSION_ACTIVE` while another share session is active |
@@ -349,6 +349,15 @@ The REST API classifies each request as a **session** principal (CLI/GUI passwor
 Residual risks: a stored command that transforms a secret before printing it defeats redaction; a secret split exactly across the 64 KiB capture limit is trimmed, not redacted (the last `longest-pattern - 1` bytes of a truncated capture are dropped).
 
 ---
+
+## Vault availability (`vault-lock-and-runtime-availability`)
+
+- **No vault lock across dialogs or key derivation.** `project_export` reads the project under the lock and shows the save dialog after the guard is dropped, so auto-lock and REST keep running while it is open. Argon2 derivations (unlock, change-password, the passwords of a backup restore, biometric enrolment) run in `spawn_blocking` without the lock (`src-tauri/src/vault/unlock.rs`): phase 1 snapshots `(salt, token)` and the lock epoch, phase 2 derives, phase 3 re-checks the epoch and key material and only then commits through `VaultState::set_key`. A lock, reset, restore or re-key in between aborts the commit (`409 CONFLICT` on `/unlock`).
+- **Unlock throttle** (`UnlockThrottle`, `VaultState.throttle`): shared by `POST /unlock` and the GUI unlock; password attempts are serialized, only wrong passwords count, an attempt dropped mid-derivation counts as a failure, backoff is `min(2^(n-1), 60)` seconds, success resets.
+- **`auto_lock_timeout`**: `0` or `1..=1440` minutes (`validate_auto_lock`, used by `PUT /settings` and `vault_save_settings`). Stored values are clamped on read (`effective_auto_lock`: negative or unparsable → 5, above 1440 → 1440); `session_ttl` and the auto-lock loop use saturating arithmetic.
+- **Hotkey**: a failed startup registration (persisted combination and default) is logged and sets `HotkeyState.unavailable`; the `hotkey_status` command lets the GUI show the notice. A later successful registration from Settings clears it.
+- **Wipe** (`vault_wipe` / `VaultDb::wipe_and_reset`): checkpoint + close, rename `vault.db` and its `-wal`/`-shm` to `vault.db.wipe-<ns>`, open and initialize a fresh database with the shared connection options, then zero, `fsync` and delete the renamed files. If the rename fails the original is reopened and the error returned (the session is kept); files that could not be deleted are retried by `db::sweep_pending_wipes` at every startup.
+- **Startup recovery** (`recovery.rs`): when `VaultDb::open` fails, `lib.rs` manages `AppMode::Recovery { error }` instead of `VaultState` and skips the API server, auto-lock loop and hotkey. The frontend asks `app_mode` first and renders `RecoveryScreen`; `recovery_move_aside` renames the database (and WAL/SHM) to `vault.db.corrupt-<unix seconds>` via `db::move_db_aside` (never a delete) and calls `app.restart()`; `recovery_quit` exits.
 
 ## Tauri commands — WSL Integration (Windows only)
 

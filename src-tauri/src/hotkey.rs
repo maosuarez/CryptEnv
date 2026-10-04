@@ -34,6 +34,9 @@ pub fn default_hotkey() -> &'static str {
 #[derive(Default)]
 pub struct HotkeyState {
     paused: AtomicBool,
+    /// Startup registration failed (another app owns the combination): the
+    /// app runs without a global shortcut and the GUI says so.
+    unavailable: AtomicBool,
     current: Mutex<Option<String>>,
 }
 
@@ -44,6 +47,14 @@ impl HotkeyState {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn set_unavailable(&self, unavailable: bool) {
+        self.unavailable.store(unavailable, Ordering::SeqCst);
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.unavailable.load(Ordering::SeqCst)
     }
 
     pub fn current(&self) -> Option<String> {
@@ -123,8 +134,37 @@ pub fn register_app_hotkey(app: &tauri::AppHandle, hotkey: &str) -> Result<(), S
             toggle_main_window(app);
         })
         .map_err(|e| format!("failed to register hotkey '{hotkey}': {e}"))?;
-    app.state::<HotkeyState>().set_current(&normalize_hotkey(hotkey));
+    let state = app.state::<HotkeyState>();
+    state.set_current(&normalize_hotkey(hotkey));
+    state.set_unavailable(false);
     Ok(())
+}
+
+/// Registers the persisted hotkey, falling back to the platform default when
+/// it is unset or cannot be registered. Returns the first error of the
+/// fallback when neither works; the caller treats that as non-fatal.
+pub fn register_startup_hotkey(
+    saved: Option<&str>,
+    mut register: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(hk) = saved {
+        if register(hk).is_ok() {
+            return Ok(());
+        }
+    }
+    register(default_hotkey())
+}
+
+/// Whether the global shortcut could be registered at startup, for the GUI
+/// notice. Available while locked: it carries no secret material.
+#[derive(serde::Serialize)]
+pub struct HotkeyStatus {
+    pub unavailable: bool,
+}
+
+#[tauri::command]
+pub fn hotkey_status(state: tauri::State<'_, HotkeyState>) -> HotkeyStatus {
+    HotkeyStatus { unavailable: state.is_unavailable() }
 }
 
 /// Swaps the registered shortcut for `hotkey`. No-op when it is already the
@@ -174,6 +214,24 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_hotkey("Ctrl+").is_err());
         assert!(parse_hotkey("Ctrl+NotAKey").is_err());
+    }
+
+    #[test]
+    fn startup_falls_back_to_the_default_when_the_saved_hotkey_fails() {
+        let mut tried = Vec::new();
+        let r = register_startup_hotkey(Some("Ctrl+Alt+K"), |hk| {
+            tried.push(hk.to_string());
+            if hk == "Ctrl+Alt+K" { Err("taken".into()) } else { Ok(()) }
+        });
+        assert!(r.is_ok());
+        assert_eq!(tried, vec!["Ctrl+Alt+K".to_string(), default_hotkey().to_string()]);
+    }
+
+    #[test]
+    fn startup_reports_an_error_instead_of_panicking_when_nothing_registers() {
+        // The caller (lib.rs setup) logs this and starts without a shortcut.
+        let r = register_startup_hotkey(None, |_| Err("taken".into()));
+        assert_eq!(r, Err("taken".to_string()));
     }
 
     #[test]

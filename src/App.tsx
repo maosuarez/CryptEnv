@@ -14,6 +14,8 @@ import { Toast } from './components/ui/Toast';
 import { PlaceholderModal } from './components/ui/PlaceholderModal';
 import { SetupWizard } from './components/SetupWizard';
 import { UpdateNotice } from './components/ui/UpdateNotice';
+import { HotkeyNotice } from './components/ui/HotkeyNotice';
+import { RecoveryScreen } from './components/RecoveryScreen';
 import { ApprovalModal } from './components/ApprovalModal';
 import { useVaultStore } from './store';
 import { useUpdateStore } from './store/updateStore';
@@ -29,7 +31,23 @@ const SCREENS: Record<Screen, React.ReactElement> = {
   projects:   <ProjectManager />,
 };
 
+/** Startup gate: if the vault database could not be opened the backend runs
+ *  in recovery mode and only the recovery screen is usable. */
 export default function App() {
+  const [mode, setMode] = useState<{ mode: string; error: string | null } | null>(null);
+
+  useEffect(() => {
+    invoke<{ mode: string; error: string | null }>('app_mode')
+      .then(setMode)
+      .catch(() => setMode({ mode: 'normal', error: null }));
+  }, []);
+
+  if (mode === null) return <div className="w-full h-full bg-bg" />;
+  if (mode.mode === 'recovery') return <RecoveryScreen error={mode.error ?? ''} />;
+  return <MainApp />;
+}
+
+function MainApp() {
   useAutoLock();
   const screen         = useVaultStore((s) => s.screen);
   const menu           = useVaultStore((s) => s.menu);
@@ -84,6 +102,7 @@ export default function App() {
 
       {/* Global overlays */}
       <UpdateNotice />
+      <HotkeyNotice />
       <ApprovalModal />
       {menu && <ContextMenu {...menu} onClose={closeMenu} />}
       {toast && <Toast msg={toast.type === 'error' ? toast.msg : `✓ ${toast.msg}`} type={toast.type} />}

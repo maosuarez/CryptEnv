@@ -816,6 +816,18 @@
     "installing": "INSTALLING…",
     "install": "INSTALL"
   },
+  "recovery": {
+    "title": "VAULT DATABASE CANNOT BE OPENED",
+    "body": "CryptEnv could not open its database. Your data has not been deleted. You can move the damaged file aside (it is renamed, never deleted) and start with an empty vault, or quit and restore the file yourself.",
+    "details": "Error: {error}",
+    "moveAside": "MOVE ASIDE AND START FRESH",
+    "quit": "QUIT",
+    "failed": "Could not move the database aside: {error}"
+  },
+  "hotkeyNotice": {
+    "unavailable": "Global hotkey unavailable: another app is using it. Choose another in Settings.",
+    "dismiss": "DISMISS"
+  },
   "approval": {
     "title": "MCP APPROVAL REQUEST",
     "source": "An MCP agent is asking to:",

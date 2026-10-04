@@ -255,11 +255,7 @@ impl VaultDb {
     }
 
     pub async fn open(path: &str) -> Result<Self, String> {
-        let opts = connect_options(Path::new(path));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(opts)
+        let pool = connect_pool(Path::new(path))
             .await
             .map_err(|e| format!("db open: {e}"))?;
 
@@ -2598,25 +2594,167 @@ impl VaultDb {
         Ok(n > 0)
     }
 
+    /// Replaces the database with an empty one. The current files are renamed
+    /// aside first and only overwritten and deleted once the fresh database
+    /// is open, so a rename that fails (a scanner holding the file on
+    /// Windows) leaves the current database open and usable. Anything that
+    /// could not be deleted is retried by [`sweep_pending_wipes`] at startup.
     pub async fn wipe_and_reset(&mut self) -> Result<(), String> {
-        self.pool.close().await;
-        // Sobreescribir contenido con ceros antes de eliminar (mitigación forense básica)
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
-                use std::io::Write;
-                let zeros = vec![0u8; meta.len() as usize];
-                let _ = f.write_all(&zeros);
-            }
+        let target = wipe_target_path(Path::new(&self.path));
+        self.wipe_and_reset_to(&target).await
+    }
+
+    async fn wipe_and_reset_to(&mut self, target: &Path) -> Result<(), String> {
+        let live = std::path::PathBuf::from(&self.path);
+
+        // Checkpoint so the main file carries everything and the WAL is empty,
+        // then close so the files can be renamed (required on Windows). If the
+        // checkpoint fails the pool is still open.
+        self.close().await?;
+
+        if let Err(e) = rename_db_files(&live, target) {
+            return match connect_pool(&live).await {
+                Ok(pool) => {
+                    self.pool = pool;
+                    Err(e)
+                }
+                Err(e2) => Err(format!("{e}; reopening the vault also failed ({e2}); restart the app")),
+            };
         }
-        std::fs::remove_file(&self.path).map_err(|e| format!("wipe db: {e}"))?;
-        let opts = connect_options(Path::new(&self.path));
-        self.pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(opts)
-            .await
-            .map_err(|e| format!("db reopen: {e}"))?;
+
+        if let Err(e) = self.open_fresh(&live).await {
+            // Put the old database back so the vault stays usable.
+            self.pool.close().await;
+            let _ = remove_db_files(&live);
+            let _ = rename_db_files(target, &live);
+            return match connect_pool(&live).await {
+                Ok(pool) => {
+                    self.pool = pool;
+                    Err(e)
+                }
+                Err(e2) => Err(format!("{e}; reopening the vault also failed ({e2}); restart the app")),
+            };
+        }
+
+        let target = target.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || scrub_db_files(&target)).await;
+        Ok(())
+    }
+
+    async fn open_fresh(&mut self, live: &Path) -> Result<(), String> {
+        self.pool = connect_pool(live).await.map_err(|e| format!("db reopen: {e}"))?;
         self.init_schema().await
     }
+}
+
+/// Pool for the vault file with the shared per-connection options.
+async fn connect_pool(path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options(path))
+        .await
+}
+
+/// Where `wipe_and_reset` parks the old files: `<db>.wipe-<nanos>`.
+fn wipe_target_path(db_path: &Path) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    sibling_with_suffix(db_path, &format!(".wipe-{stamp}"))
+}
+
+const WIPE_MARKER: &str = ".wipe-";
+
+/// Renames a SQLite database and its `-wal`/`-shm` companions from `from` to
+/// `to` (missing companions are skipped). Refuses to overwrite and undoes the
+/// files already moved if one rename fails.
+fn rename_db_files(from: &Path, to: &Path) -> Result<(), String> {
+    let mut moved: Vec<&str> = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let src = sibling_with_suffix(from, suffix);
+        if !src.exists() {
+            continue;
+        }
+        let dst = sibling_with_suffix(to, suffix);
+        let result = if dst.exists() {
+            Err(format!("{} already exists", dst.display()))
+        } else {
+            std::fs::rename(&src, &dst).map_err(|e| e.to_string())
+        };
+        if let Err(e) = result {
+            for done in moved.iter().rev() {
+                let _ = std::fs::rename(sibling_with_suffix(to, done), sibling_with_suffix(from, done));
+            }
+            return Err(format!("move {} aside: {e}", src.display()));
+        }
+        moved.push(suffix);
+    }
+    Ok(())
+}
+
+/// Overwrites `path` with zeros, flushes, and deletes it. The overwrite is
+/// best effort (the delete is attempted regardless); a failed delete is the
+/// error.
+fn scrub_file(path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let zeros = [0u8; 64 * 1024];
+            let mut left = meta.len();
+            while left > 0 {
+                let n = left.min(zeros.len() as u64) as usize;
+                if f.write_all(&zeros[..n]).is_err() {
+                    break;
+                }
+                left -= n as u64;
+            }
+            let _ = f.sync_all();
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    }
+}
+
+/// Scrubs a database file and its `-wal`/`-shm` companions. Failures are
+/// left for [`sweep_pending_wipes`].
+fn scrub_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = scrub_file(&sibling_with_suffix(path, suffix));
+    }
+}
+
+/// Retries the deletion of files a previous `wipe_and_reset` could not
+/// remove (`<db>.wipe-*`). Called at startup; best effort.
+pub fn sweep_pending_wipes(db_path: &Path) {
+    let (Some(dir), Some(name)) = (db_path.parent(), db_path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}{WIPE_MARKER}", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = scrub_file(&entry.path());
+        }
+    }
+}
+
+/// Startup recovery: renames an unopenable database (and its WAL/SHM files)
+/// to `<db>.corrupt-<stamp>`, never deleting it. Returns the new main path.
+pub fn move_db_aside(db_path: &Path, stamp: &str) -> Result<std::path::PathBuf, String> {
+    let mut target = sibling_with_suffix(db_path, &format!(".corrupt-{stamp}"));
+    let mut n = 1u32;
+    while target.exists() {
+        target = sibling_with_suffix(db_path, &format!(".corrupt-{stamp}-{n}"));
+        n += 1;
+    }
+    rename_db_files(db_path, &target)?;
+    Ok(target)
 }
 
 /// Duplicate-key validation shared by the environment write paths. Runs
@@ -3002,6 +3140,80 @@ mod tests {
         let vars = db.get_environment_vars(env).await.unwrap();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].key, "KEEP");
+    }
+
+    fn wipe_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(WIPE_MARKER))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wipe_replaces_the_database_and_leaves_no_wipe_files() {
+        let (dir, mut db) = open_test_db().await;
+        db.set_setting("k", "v").await.unwrap();
+        db.wipe_and_reset().await.unwrap();
+        assert_eq!(db.get_setting("k").await.unwrap(), None);
+        db.set_setting("after", "ok").await.unwrap();
+        sweep_pending_wipes(Path::new(db.path()));
+        assert!(wipe_leftovers(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_rename_keeps_the_database_usable() {
+        let (dir, mut db) = open_test_db().await;
+        db.set_setting("k", "v").await.unwrap();
+        // The rename target is occupied, so the old files cannot be moved aside.
+        let blocked = dir.path().join("occupied.wipe-1");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(db.wipe_and_reset_to(&blocked).await.is_err());
+
+        assert_eq!(db.get_setting("k").await.unwrap().as_deref(), Some("v"));
+        db.set_setting("k2", "v2").await.unwrap();
+        // The next launch can open the same file.
+        let again = VaultDb::open(db.path()).await.unwrap();
+        assert_eq!(again.get_setting("k2").await.unwrap().as_deref(), Some("v2"));
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_leftover_wipe_files_only() {
+        let (dir, db) = open_test_db().await;
+        let live = Path::new(db.path());
+        let leftover = sibling_with_suffix(live, ".wipe-42");
+        let leftover_wal = sibling_with_suffix(live, ".wipe-42-wal");
+        std::fs::write(&leftover, vec![7u8; 100_000]).unwrap();
+        std::fs::write(&leftover_wal, b"wal").unwrap();
+        let unrelated = dir.path().join("vault.db.pre-restore");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        sweep_pending_wipes(live);
+
+        assert!(wipe_leftovers(dir.path()).is_empty());
+        assert!(unrelated.exists());
+        assert!(live.exists());
+    }
+
+    #[test]
+    fn move_aside_renames_with_timestamp_and_never_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("vault.db");
+        std::fs::write(&live, b"corrupt").unwrap();
+        std::fs::write(dir.path().join("vault.db-wal"), b"wal").unwrap();
+
+        let moved = move_db_aside(&live, "1700000000").unwrap();
+        assert_eq!(moved, dir.path().join("vault.db.corrupt-1700000000"));
+        assert_eq!(std::fs::read(&moved).unwrap(), b"corrupt");
+        assert!(dir.path().join("vault.db.corrupt-1700000000-wal").exists());
+        assert!(!live.exists());
+
+        // A second move in the same second does not overwrite the first.
+        std::fs::write(&live, b"corrupt2").unwrap();
+        let moved2 = move_db_aside(&live, "1700000000").unwrap();
+        assert_ne!(moved, moved2);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"corrupt");
     }
 
     #[tokio::test]
