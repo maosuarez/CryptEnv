@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tauri::State;
+use zeroize::Zeroizing;
 
 use crate::db::{DbEnvironmentVar, ProjectDeleteImpact, VaultDb};
 use crate::envfile;
@@ -118,6 +119,20 @@ pub struct InjectResult {
     /// `envfile::commit`. Empty unless a pre-existing unmanaged file was
     /// just overwritten.
     pub backups: Vec<String>,
+    /// Keys that were NOT written: the referenced vault item could not be
+    /// decrypted, or the key is not a valid dotenv variable name. Names
+    /// only — never values. The other keys are written regardless.
+    #[serde(rename = "failedKeys")]
+    pub failed_keys: Vec<String>,
+}
+
+/// Decrypts one stored item and returns its injectable value, zeroizing the
+/// intermediate plaintext. The error carries no item content.
+fn decrypt_item_value(vault_key: &[u8; 32], data: &str) -> Result<Zeroizing<String>, String> {
+    let json = Zeroizing::new(crate::crypto::decrypt(vault_key, data)?);
+    let item: crate::vault::VaultItem =
+        serde_json::from_slice(&json).map_err(|_| "parse item".to_string())?;
+    Ok(Zeroizing::new(item.value.or(item.password).or(item.content).unwrap_or_default()))
 }
 
 /// Result of `environment_inject_preview` — resolves and inspects paths
@@ -128,6 +143,8 @@ pub struct InjectResult {
 pub struct InjectPreview {
     pub paths: Vec<String>,
     pub foreign: Vec<String>,
+    /// Targets that are symlinks; injecting into them is refused.
+    pub symlinks: Vec<String>,
 }
 
 /// Where a write-target path came from, for gating purposes (§4.4 of the
@@ -380,12 +397,16 @@ pub fn validate_root_path(root: &str) -> Result<String, String> {
     Ok(if trimmed.is_empty() || trimmed.ends_with(':') { root.to_string() } else { trimmed.to_string() })
 }
 
+fn is_absolute_config_path(path: &str) -> bool {
+    Path::new(path).is_absolute() || path.starts_with("\\\\")
+}
+
 /// Resolves one configured environment path to the path actually written.
 /// Absolute paths are returned unchanged (legacy behavior). Relative paths
 /// (`.env`, `apps/api/.env`, `./x`, either separator) are joined onto the
 /// project `root`; they may not climb out of it (`..`) and require a root.
 pub fn resolve_env_path(root: Option<&str>, path: &str) -> Result<String, String> {
-    if Path::new(path).is_absolute() || path.starts_with("\\\\") {
+    if is_absolute_config_path(path) {
         return Ok(path.to_string());
     }
     let root = root.ok_or_else(|| {
@@ -462,20 +483,27 @@ pub async fn save_environment(db: &VaultDb, input: EnvironmentInput) -> Result<i
     validate_environment_name(&input.name)?;
     ensure_no_case_collision(db, input.project_id, input.id, &input.name).await?;
 
+    // Validate before opening the transaction so rejected input never writes.
+    crate::db::validate_unique_keys(input.vars.iter().map(|v| v.key.as_str()))?;
+    crate::db::validate_unique_paths(&input.paths)?;
 
-    let env_id = db
-        .upsert_environment(input.id, input.project_id, &input.name, input.is_default)
-        .await?;
+    // Rename, paths, ownership grants and vars commit together or not at all.
+    // Dropping `tx` on an early `?` return rolls everything back.
+    let mut tx = db.begin().await?;
 
-    db.set_environment_paths(env_id, &input.paths).await?;
+    let env_id =
+        VaultDb::upsert_environment_tx(&mut tx, input.id, input.project_id, &input.name, input.is_default)
+            .await?;
+
+    VaultDb::set_environment_paths_tx(&mut tx, env_id, &input.paths).await?;
 
     for v in &input.vars {
-        let owners = db.list_owning_projects(v.item_id).await?;
+        let owners = VaultDb::list_owning_projects_tx(&mut tx, v.item_id).await?;
         if owners.contains(&input.project_id) {
             continue;
         }
-        if db.is_item_global(v.item_id).await?.unwrap_or(false) {
-            db.add_item_owner(v.item_id, input.project_id).await?;
+        if VaultDb::is_item_global_tx(&mut tx, v.item_id).await?.unwrap_or(false) {
+            VaultDb::add_item_owner_tx(&mut tx, v.item_id, input.project_id).await?;
         } else {
             return Err(format!(
                 "item {} is not global and not already owned by this project",
@@ -490,7 +518,8 @@ pub async fn save_environment(db: &VaultDb, input: EnvironmentInput) -> Result<i
         .map(|v| DbEnvironmentVar { id: 0, environment_id: env_id, key: v.key, item_id: Some(v.item_id), literal: None })
         .collect();
 
-    db.set_environment_vars(env_id, &db_vars).await?;
+    VaultDb::set_environment_vars_tx(&mut tx, env_id, &db_vars).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(env_id)
 }
 
@@ -639,7 +668,17 @@ async fn resolve_and_inspect(
     let root = if configured.is_empty() { None } else { db.get_project_root(env.project_id).await? };
     let mut resolved: Vec<(String, PathOrigin)> = Vec::with_capacity(configured.len());
     for p in configured {
-        let r = resolve_env_path(root.as_deref(), p)?;
+        let mut r = resolve_env_path(root.as_deref(), p)?;
+        // A relative path must stay inside the root even through symlinked
+        // directories. Absolute paths are the owner's explicit choice and
+        // keep their location (the final component is still no-follow).
+        if !is_absolute_config_path(p) {
+            if let Some(root) = root.as_deref() {
+                let contained = crate::fsguard::contain_relative(Path::new(root), p)
+                    .map_err(|e| format!("path '{p}' must stay inside the project root ({e})"))?;
+                r = contained.to_string_lossy().into_owned();
+            }
+        }
         if !resolved.iter().any(|(existing, _)| existing == &r) {
             resolved.push((r, PathOrigin::Configured));
         }
@@ -666,7 +705,11 @@ async fn resolve_and_inspect(
 
     let mut inspected: HashMap<String, envfile::Target> = HashMap::new();
     for (path, _) in &resolved {
-        let target = envfile::inspect(Path::new(path)).map_err(|e| format!("inspect {path}: {e}"))?;
+        let target = envfile::inspect(Path::new(path)).map_err(|e| match e {
+            // Bare message so the HTTP handler maps it to 409 NOT_REGULAR_FILE.
+            envfile::EnvFileError::NotRegularFile(_) => e.to_string(),
+            e => format!("inspect {path}: {e}"),
+        })?;
         inspected.insert(path.clone(), target);
     }
 
@@ -691,7 +734,13 @@ pub async fn inject_environment_preview(
         .map(|(p, _)| p.clone())
         .collect();
 
-    Ok(InjectPreview { paths, foreign })
+    let symlinks: Vec<String> = resolved
+        .iter()
+        .filter(|(p, _)| matches!(inspected.get(p), Some(envfile::Target::Symlink)))
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    Ok(InjectPreview { paths, foreign, symlinks })
 }
 
 /// Decrypt referenced vault items and write KEY=VALUE pairs into every path
@@ -731,6 +780,14 @@ pub async fn inject_environment(
     }
 
     // Phase 2 — gate, strictly before any decryption or write.
+    // A symlink target is refused outright (never overridable by
+    // `overwrite`), so nothing is written for any path of this environment.
+    if let Some((path, _)) = resolved
+        .iter()
+        .find(|(p, _)| matches!(cached.get(p), Some(envfile::Target::Symlink)))
+    {
+        return Err(envfile::symlink_message(Path::new(path)));
+    }
     let mut refused: Vec<PathBuf> = Vec::new();
     let mut unmanaged: Vec<String> = Vec::new();
     for (path, origin) in &resolved {
@@ -750,30 +807,50 @@ pub async fn inject_environment(
     let vars = db.get_environment_vars(environment_id).await?;
 
     if vars.is_empty() {
-        return Ok(InjectResult { paths, written: vec![], unmanaged_paths: unmanaged, backups: vec![] });
+        return Ok(InjectResult { paths, written: vec![], unmanaged_paths: unmanaged, backups: vec![], failed_keys: vec![] });
     }
 
-    // Phase 3 — decrypt, only reachable past the gate above.
-    let raw_items = db.list_items().await?;
-    let mut item_values: HashMap<i64, String> = HashMap::new();
+    // Phase 3 — decrypt, only reachable past the gate above. Only the items
+    // this environment references are decrypted, and values are held in
+    // zeroizing containers. An item that can't be decrypted fails its own
+    // key (reported by name), never the whole inject.
+    let referenced: Vec<i64> = vars.iter().filter_map(|v| v.item_id).collect();
+    let raw_items = db.get_items_by_ids(&referenced).await?;
+    let mut item_values: HashMap<i64, Zeroizing<String>> = HashMap::new();
+    let mut undecryptable: HashSet<i64> = HashSet::new();
     for (item_id, _, data, _, _) in &raw_items {
-        let json = crate::crypto::decrypt(vault_key, data)?;
-        let item: crate::vault::VaultItem =
-            serde_json::from_slice(&json).map_err(|e| format!("parse item: {e}"))?;
-        let value = item.value.or(item.password).or(item.content).unwrap_or_default();
-        item_values.insert(*item_id, value);
+        match decrypt_item_value(vault_key, data) {
+            Ok(value) => {
+                item_values.insert(*item_id, value);
+            }
+            Err(_) => {
+                undecryptable.insert(*item_id);
+            }
+        }
     }
 
     // Build key → value map for this environment
-    let mut inject_map: HashMap<String, String> = HashMap::new();
+    let mut inject_map: HashMap<String, Zeroizing<String>> = HashMap::new();
+    let mut failed: HashSet<String> = HashSet::new();
     for v in &vars {
-        let value = if let Some(iid) = v.item_id {
-            item_values.get(&iid).cloned().unwrap_or_default()
-        } else {
-            v.literal.clone().unwrap_or_default()
+        // A key crypt-env cannot write as a valid dotenv name is reported,
+        // not written.
+        if !envfile::is_valid_key(&v.key) {
+            failed.insert(v.key.clone());
+            continue;
+        }
+        let value = match v.item_id {
+            Some(iid) if undecryptable.contains(&iid) => {
+                failed.insert(v.key.clone());
+                continue;
+            }
+            Some(iid) => item_values.get(&iid).cloned().unwrap_or_default(),
+            None => Zeroizing::new(v.literal.clone().unwrap_or_default()),
         };
         inject_map.insert(v.key.clone(), value);
     }
+    let mut failed_keys: Vec<String> = failed.into_iter().collect();
+    failed_keys.sort();
 
     // Marker names the project + environment (informational only, never
     // parsed back — see `envfile::marker_line`).
@@ -808,20 +885,27 @@ pub async fn inject_environment(
             };
             let existing_key = trimmed[..eq_pos].trim().to_string();
             if let Some(new_val) = inject_map.get(&existing_key) {
-                *line = format!("{}={}", existing_key, new_val);
-                updated_keys.insert(existing_key.clone());
-                written.insert(existing_key);
+                // Keys in `inject_map` are validated, so this always yields a line.
+                if let Some(serialized) = envfile::serialize_line(&existing_key, new_val) {
+                    *line = serialized;
+                    updated_keys.insert(existing_key.clone());
+                    written.insert(existing_key);
+                }
             }
         }
 
-        for (k, v) in &inject_map {
-            if !updated_keys.contains(k) {
-                lines.push(format!("{}={}", k, v));
+        // Sorted so the written file is stable across injects.
+        let mut pending: Vec<&String> = inject_map.keys().filter(|k| !updated_keys.contains(*k)).collect();
+        pending.sort();
+        for k in pending {
+            if let Some(serialized) = inject_map.get(k).and_then(|v| envfile::serialize_line(k, v)) {
+                lines.push(serialized);
                 written.insert(k.clone());
             }
         }
 
-        let content = lines.join("\n") + "\n";
+        // Holds secret values; wiped when it goes out of scope.
+        let content = Zeroizing::new(lines.join("\n") + "\n");
 
         // Configured paths are pre-consented by the vault owner (§4.4) and
         // are written through even if Foreign — never hard-gated. Caller-
@@ -837,7 +921,10 @@ pub async fn inject_environment(
                 }
                 done.push(path.clone());
             }
-            Err(e @ envfile::EnvFileError::BackupExists(_)) | Err(e @ envfile::EnvFileError::TargetExists(_)) => {
+            Err(e @ envfile::EnvFileError::BackupExists(_))
+            | Err(e @ envfile::EnvFileError::TargetExists(_))
+            | Err(e @ envfile::EnvFileError::Symlink(_))
+            | Err(e @ envfile::EnvFileError::NotRegularFile(_)) => {
                 // Keep the bare message so `err.starts_with(BACKUP_EXISTS_PREFIX
                 // | TARGET_EXISTS_PREFIX)` still matches in the HTTP handler
                 // and this maps to 409, not the generic 500 below.
@@ -859,7 +946,7 @@ pub async fn inject_environment(
     let mut written_keys: Vec<String> = written.into_iter().collect();
     written_keys.sort();
 
-    Ok(InjectResult { paths, written: written_keys, unmanaged_paths: unmanaged, backups })
+    Ok(InjectResult { paths, written: written_keys, unmanaged_paths: unmanaged, backups, failed_keys })
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
@@ -1003,22 +1090,36 @@ pub async fn project_check_root(root: String) -> Result<RootCheck, String> {
 /// (same serializer as `crypt-env init`/`config`). Refuses to replace an
 /// existing file unless `overwrite`; that refusal is the stable error
 /// `"manifest exists"` so the GUI can offer overwrite / link.
+///
+/// Split in two so callers can drop the vault lock between the steps:
+/// [`load_manifest_source`] reads vault state, [`write_manifest_at`] is pure
+/// filesystem I/O (a `\\wsl.localhost` root can stall it for a long time).
 pub async fn write_project_manifest(db: &VaultDb, project_id: i64, overwrite: bool) -> Result<String, String> {
+    let (project, root) = load_manifest_source(db, project_id).await?;
+    write_manifest_at(&root, &project, overwrite)
+}
+
+/// Vault-state half of [`write_project_manifest`]: the project and its root.
+pub async fn load_manifest_source(db: &VaultDb, project_id: i64) -> Result<(Project, PathBuf), String> {
     let project = list_projects(db)
         .await?
         .into_iter()
         .find(|p| p.id == project_id)
         .ok_or("project not found")?;
     let root = project.root_path.clone().ok_or("project has no root directory")?;
-    let dir = PathBuf::from(&root);
+    Ok((project, PathBuf::from(root)))
+}
+
+/// Filesystem half of [`write_project_manifest`]. Touches no vault state.
+pub fn write_manifest_at(dir: &Path, project: &Project, overwrite: bool) -> Result<String, String> {
     if !dir.is_dir() {
         return Err("root directory does not exist".into());
     }
     if dir.join(manifest::FILE_NAME).exists() && !overwrite {
         return Err("manifest exists".into());
     }
-    let m = manifest::from_project(&project, &|p| p.to_string());
-    let path = manifest::write_file(&dir, &m)?;
+    let m = manifest::from_project(project, &|p| p.to_string());
+    let path = manifest::write_file(dir, &m)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1028,8 +1129,15 @@ pub async fn project_write_yaml(
     project_id: i64,
     overwrite: bool,
 ) -> Result<String, String> {
-    let s = state.lock().await;
-    write_project_manifest(&s.db, project_id, overwrite).await
+    // The vault lock covers only the DB read; the guard is dropped before any
+    // filesystem call, which runs on a blocking thread.
+    let (project, root) = {
+        let s = state.lock().await;
+        load_manifest_source(&s.db, project_id).await?
+    };
+    tokio::task::spawn_blocking(move || write_manifest_at(&root, &project, overwrite))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ─── Export / Import ──────────────────────────────────────────────────────────
@@ -1062,12 +1170,16 @@ pub struct ExportedProject {
 
 #[tauri::command]
 pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> Result<(), String> {
-    let s = state.lock().await;
-    let project = list_projects(&s.db)
-        .await?
-        .into_iter()
-        .find(|p| p.id == project_id)
-        .ok_or("project not found")?;
+    // Lock only for the DB read: the save dialog and the file write below
+    // must not run under the vault lock.
+    let project = {
+        let s = state.lock().await;
+        list_projects(&s.db)
+            .await?
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .ok_or("project not found")?
+    };
 
     let exported = ExportedProject {
         version: 1,
@@ -1108,7 +1220,10 @@ pub async fn project_export(project_id: i64, state: State<'_, SharedState>) -> R
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "cancelled".to_string())?;
 
-    std::fs::write(&path, &json).map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &json))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1721,5 +1836,247 @@ mod tests {
             let env = resolve_environment(&db, None, Some("demo"), Some(name)).await.unwrap();
             assert_eq!(env.id, env_id);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_rejects_relative_path_through_symlinked_directory() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let project_id = db.get_environment(env_id).await.unwrap().unwrap().project_id;
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("config")).unwrap();
+        db.set_project_root(project_id, root.to_str()).await.unwrap();
+        db.set_environment_paths(env_id, &["config/.env".to_string()]).await.unwrap();
+
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
+        assert!(err.contains("must stay inside the project root"), "got: {err}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside the root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_refuses_symlink_target_and_writes_nothing() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = dir.path().join(".env");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let plain = dir.path().join("plain.env");
+        db.set_environment_paths(
+            env_id,
+            &[plain.to_str().unwrap().to_string(), link.to_str().unwrap().to_string()],
+        )
+        .await
+        .unwrap();
+
+        let preview = inject_environment_preview(&db, env_id, None).await.unwrap();
+        assert_eq!(preview.symlinks, vec![link.to_str().unwrap().to_string()]);
+
+        for overwrite in [false, true] {
+            let err = inject_environment(&db, &key, env_id, None, None, overwrite, None).await.unwrap_err();
+            assert!(err.starts_with(envfile::SYMLINK_PREFIX), "got: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!plain.exists(), "no path is written when any target is a symlink");
+    }
+
+    // ─── vault-db-transactional-integrity ─────────────────────────────
+
+    #[tokio::test]
+    async fn save_environment_rejects_duplicate_keys_without_writing() {
+        let (_dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let item = plain_secret("A", "va");
+        let enc = crate::vault::encrypt_item(&key, &item).unwrap();
+        let item_id = db.upsert_item(0, "secret", &enc, &item.created, false).await.unwrap();
+        db.add_item_owner(item_id, project_id).await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: "production".to_string(), is_default: true,
+            paths: vec![], vars: vec![EnvironmentVar { id: 0, key: "A".to_string(), item_id }],
+        }).await.unwrap();
+
+        let err = save_environment(&db, EnvironmentInput {
+            id: env_id, project_id, name: "renamed".to_string(), is_default: true,
+            paths: vec![],
+            vars: vec![
+                EnvironmentVar { id: 0, key: "DUP".to_string(), item_id },
+                EnvironmentVar { id: 0, key: "DUP".to_string(), item_id },
+            ],
+        }).await.unwrap_err();
+        assert!(err.contains("DUP"));
+
+        let env = db.get_environment(env_id).await.unwrap().unwrap();
+        assert_eq!(env.name, "production");
+        let vars = db.get_environment_vars(env_id).await.unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "A");
+    }
+
+    #[tokio::test]
+    async fn save_environment_is_atomic_when_var_insert_fails() {
+        let (_dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let project_id = db.upsert_project(0, "demo", None, "generic").await.unwrap();
+        let item = plain_secret("SHARED", "v");
+        let enc = crate::vault::encrypt_item(&key, &item).unwrap();
+        let global_id = db.upsert_item(0, "secret", &enc, &item.created, true).await.unwrap();
+        let env_id = save_environment(&db, EnvironmentInput {
+            id: 0, project_id, name: "production".to_string(), is_default: true,
+            paths: vec!["/a".to_string()], vars: vec![],
+        }).await.unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON environment_vars
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let res = save_environment(&db, EnvironmentInput {
+            id: env_id, project_id, name: "staging".to_string(), is_default: true,
+            paths: vec!["/b".to_string()],
+            vars: vec![EnvironmentVar { id: 0, key: "SHARED".to_string(), item_id: global_id }],
+        }).await;
+        assert!(res.is_err());
+
+        let env = db.get_environment(env_id).await.unwrap().unwrap();
+        assert_eq!(env.name, "production", "rename must be rolled back");
+        assert_eq!(db.get_environment_paths(env_id).await.unwrap(), vec!["/a".to_string()]);
+        assert!(db.list_owning_projects(global_id).await.unwrap().is_empty(), "ownership grant must be rolled back");
+    }
+
+    // ── inject: serialization and targeted decrypt ──
+
+    /// Inserts an item whose stored ciphertext cannot be decrypted.
+    async fn seed_corrupt_item(v: &crate::test_support::TestVault) -> i64 {
+        let state = v.state.lock().await;
+        state
+            .db
+            .upsert_item(0, "secret", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "2024-01-01", false)
+            .await
+            .unwrap()
+    }
+
+    async fn inject_to(v: &crate::test_support::TestVault, env_id: i64, path: &Path) -> Result<InjectResult, String> {
+        let state = v.state.lock().await;
+        let key = state.key.clone().unwrap();
+        state.db.set_environment_paths(env_id, &[path.to_string_lossy().into_owned()]).await.unwrap();
+        inject_environment(&state.db, &key, env_id, None, None, false, None).await
+    }
+
+    #[tokio::test]
+    async fn inject_writes_serialized_values_and_blocks_value_injection() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let pem = "-----BEGIN KEY-----\nabc$def\n-----END KEY-----\n";
+        for (k, val) in [("PLAIN", "abc"), ("SPACED", "a b"), ("PEM", pem), ("EVIL", "x\nADMIN=1")] {
+            let id = seed_item(&v, k, val, false).await;
+            link_var(&v, envs[0], k, id).await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        let result = inject_to(&v, envs[0], &target).await.unwrap();
+        assert!(result.failed_keys.is_empty());
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        let parsed: HashMap<String, String> = envfile::parse_dotenv(&content).into_iter().collect();
+        assert_eq!(parsed.len(), 4, "no extra variable may appear: {parsed:?}");
+        assert_eq!(parsed["PLAIN"], "abc");
+        assert_eq!(parsed["SPACED"], "a b");
+        assert_eq!(parsed["PEM"], pem);
+        assert_eq!(parsed["EVIL"], "x\nADMIN=1");
+        assert!(!parsed.contains_key("ADMIN"));
+    }
+
+    #[tokio::test]
+    async fn inject_updates_existing_managed_line_with_serializer() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let id = seed_item(&v, "K", "new value", false).await;
+        link_var(&v, envs[0], "K", id).await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        std::fs::write(&target, "# crypt-env: managed file (project: p, environment: dev)\nK=old\nOTHER=keep\n").unwrap();
+        inject_to(&v, envs[0], &target).await.unwrap();
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("K='new value'\n"), "{content}");
+        assert!(content.contains("OTHER=keep\n"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_corrupt_item_does_not_fail_inject() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let good = seed_item(&v, "GOOD", "v1", false).await;
+        link_var(&v, envs[0], "GOOD", good).await;
+        seed_corrupt_item(&v).await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        let result = inject_to(&v, envs[0], &target).await.unwrap();
+        assert!(result.failed_keys.is_empty());
+        assert_eq!(result.written, vec!["GOOD".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn referenced_corrupt_item_is_listed_and_other_keys_written() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let good = seed_item(&v, "GOOD", "v1", false).await;
+        link_var(&v, envs[0], "GOOD", good).await;
+        let bad = seed_corrupt_item(&v).await;
+        link_var(&v, envs[0], "BAD", bad).await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        let result = inject_to(&v, envs[0], &target).await.unwrap();
+        assert_eq!(result.failed_keys, vec!["BAD".to_string()]);
+        assert_eq!(result.written, vec!["GOOD".to_string()]);
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("GOOD=v1"));
+        assert!(!content.contains("BAD"));
+    }
+
+    #[tokio::test]
+    async fn invalid_key_is_reported_not_written() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let id = seed_item(&v, "X", "v", false).await;
+        link_var(&v, envs[0], "BAD KEY\nINJ=1", id).await;
+        link_var(&v, envs[0], "OK", id).await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".env");
+        let result = inject_to(&v, envs[0], &target).await.unwrap();
+        assert_eq!(result.failed_keys, vec!["BAD KEY\nINJ=1".to_string()]);
+        assert_eq!(result.written, vec!["OK".to_string()]);
+        assert!(!std::fs::read_to_string(&target).unwrap().contains("INJ"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn inject_into_fifo_target_fails_with_not_regular_prefix() {
+        use crate::test_support::*;
+        let v = unlocked_vault_empty().await;
+        let (_p, envs) = seed_project(&v, "p", &["dev"]).await;
+        let id = seed_item(&v, "K", "v", false).await;
+        link_var(&v, envs[0], "K", id).await;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = inject_to(&v, envs[0], &fifo).await.unwrap_err();
+        assert!(err.starts_with(envfile::NOT_REGULAR_PREFIX), "{err}");
     }
 }

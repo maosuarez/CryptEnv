@@ -352,3 +352,21 @@ fn project_name_allows_human_labels_rejects_hostile_ones() {
         assert!(project::validate_project_name(name).is_err(), "{name:?} should be rejected");
     }
 }
+
+/// A dangling symlink inside the base that points outside it is invisible to
+/// `Path::exists()` (it follows the link and finds nothing), so the old step-6
+/// check let it through and a later write would have created the target.
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_to_outside_base_is_rejected() {
+    let root = tempdir().unwrap();
+    let base_dir = root.path().join("base");
+    fs::create_dir_all(&base_dir).unwrap();
+    let outside = root.path().join("outside-not-yet-created.txt");
+    std::os::unix::fs::symlink(&outside, base_dir.join(".env.production")).unwrap();
+
+    let result = fsguard::resolve_within(base_dir.to_str().unwrap(), ".env.production");
+
+    assert_eq!(result.unwrap_err(), fsguard::ContainmentError::Escapes);
+    assert!(!outside.exists(), "the link's destination must not be created");
+}

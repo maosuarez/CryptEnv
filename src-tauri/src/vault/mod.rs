@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::biometric;
 use crate::crypto::{self, CryptoKey};
 use crate::db::{DbCategory, LinkMode, LinkOutcome, VaultDb};
 
+pub mod backup;
 pub mod import;
 pub mod share_commands;
 
@@ -78,6 +80,16 @@ pub struct VaultState {
     pub key: Option<Zeroizing<[u8; 32]>>,
     /// Monotonic timestamp of the last vault operation. None when the vault is locked.
     pub last_activity: Option<std::time::Instant>,
+    /// Lock epoch: bumped by `set_key` whenever the key changes (unlock, lock,
+    /// reset, restore, re-key). REST sessions record the epoch they were issued
+    /// in and are rejected once it moves on. In-memory only, not secret.
+    pub epoch: u64,
+    /// LAN share session slot, shared by the Tauri commands and the REST API.
+    /// Lives here so locking the vault can cancel any session (and drop its key copy).
+    pub share: Arc<crate::share::ShareState>,
+    /// Private plaintext files produced for MCP `generate_env`. Lives here so
+    /// locking the vault can delete them without knowing about the API layer.
+    pub generated: Arc<crate::exec::tempfiles::GeneratedFiles>,
 }
 
 impl VaultState {
@@ -86,6 +98,36 @@ impl VaultState {
             db,
             key: None,
             last_activity: None,
+            epoch: 0,
+            share: Arc::new(crate::share::ShareState::new()),
+            generated: Arc::new(crate::exec::tempfiles::GeneratedFiles::new()),
+        }
+    }
+
+    /// The only place `key` is assigned. Bumps `epoch` unless the key is
+    /// unchanged (re-unlocking an already unlocked vault must not end the
+    /// other terminals' sessions).
+    pub fn set_key(&mut self, key: Option<Zeroizing<[u8; 32]>>) {
+        let unchanged = match (&self.key, &key) {
+            (None, None) => true,
+            (Some(a), Some(b)) => bool::from(a.as_slice().ct_eq(b.as_slice())),
+            _ => false,
+        };
+        // A restore keeps the previous database until the next successful
+        // unlock; this is the single place every unlock path goes through.
+        if self.key.is_none() && key.is_some() {
+            self.db.discard_pre_restore();
+        }
+        // A different key replacing a live one (re-key, replace restore) makes
+        // any share session's key copy stale or foreign: end it. Lock/unlock
+        // transitions are handled by `lock_vault`.
+        let swapped = self.key.is_some() && key.is_some() && !unchanged;
+        self.key = key;
+        if !unchanged {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        if swapped {
+            crate::share::cancel_all_blocking(&self.share);
         }
     }
 
@@ -140,6 +182,9 @@ pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &CryptoKey)
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     );
 
+    // Encrypt everything first, then write in a single transaction so a
+    // failure midway never leaves half-migrated vars or a set flag.
+    let mut entries = Vec::new();
     for (env_var_id, key_name, literal, project_id) in db.list_unmigrated_literal_vars().await? {
         let item = VaultItem {
             id: 0,
@@ -160,13 +205,10 @@ pub(crate) async fn migrate_literal_vars_to_items(db: &VaultDb, key: &CryptoKey)
             is_global: Some(false),
         };
         let encrypted = encrypt_item(key, &item)?;
-        let new_id = db.upsert_item(0, "secret", &encrypted, &item.created, false).await?;
-        db.add_item_owner(new_id, project_id).await?;
-        db.set_environment_var_item(env_var_id, new_id).await?;
+        entries.push((env_var_id, project_id, encrypted, item.created));
     }
 
-    db.set_setting("migrated_literals_v1", "true").await?;
-    Ok(())
+    db.apply_literal_migration(&entries).await
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
@@ -199,9 +241,9 @@ async fn do_unlock(
         }
     };
 
-    s.key = Some(Zeroizing::new(key));
-    s.touch();
-
+    // The key is published to `VaultState` only after every fallible step has
+    // succeeded: REST/MCP treat `key.is_some()` as "unlocked", so a failure
+    // below must leave the vault locked.
     migrate_literal_vars_to_items(&s.db, &key).await?;
 
     let raw = s.db.list_items().await?;
@@ -223,6 +265,10 @@ async fn do_unlock(
         })
         .collect();
 
+    // Set key as the final step after all fallible operations succeed
+    s.set_key(Some(Zeroizing::new(key)));
+    s.touch();
+
     Ok(UnlockPayload {
         items,
         categories: cats,
@@ -240,11 +286,17 @@ pub async fn vault_unlock(
 
 /// Internal lock used by both the Tauri command and the background auto-lock task.
 pub async fn lock_vault(shared: &SharedState) {
-    {
+    let share = {
         let mut s = shared.lock().await;
-        s.key = None;
+        s.set_key(None);  // Bumps epoch via harden-cli's set_key method
         s.last_activity = None;
-    }
+        // Plaintext files generated for MCP must not outlive the unlocked session.
+        s.generated.purge_all();
+        s.share.clone()
+    };
+    // A share session holds its own copy of the vault key and may have a
+    // listener open; locking ends it.
+    crate::share::cancel_all(&share).await;
     // A secret still on the clipboard must not outlive the session.
     let _ = tokio::task::spawn_blocking(crate::clipboard::clear_if_ours).await;
 }
@@ -277,6 +329,62 @@ pub async fn vault_get_items(state: State<'_, SharedState>) -> Result<Vec<VaultI
         .into_iter()
         .filter_map(|(id, _, data, _, is_global)| decrypt_item(&key, id, &data, is_global).ok())
         .collect())
+}
+
+/// Why `update_item_merged` failed. `NotFound` lets the HTTP layer answer 404
+/// without inspecting error strings.
+pub enum UpdateItemError {
+    NotFound,
+    Other(String),
+}
+
+impl From<String> for UpdateItemError {
+    fn from(e: String) -> Self {
+        UpdateItemError::Other(e)
+    }
+}
+
+/// Read-decrypt-merge-encrypt-write of one item inside a single transaction.
+/// Callers MUST hold the vault lock for the whole call, so a concurrent update
+/// from another interface merges into the latest stored state instead of a
+/// stale copy. Merge rules: body fields override; `None` keeps the existing
+/// value (secret fields never leave this process).
+pub async fn update_item_merged(
+    db: &VaultDb,
+    key: &CryptoKey,
+    id: i64,
+    body: VaultItem,
+) -> Result<VaultItem, UpdateItemError> {
+    let mut tx = db.begin().await?;
+    let (data, stored_global) = VaultDb::get_item_tx(&mut tx, id)
+        .await?
+        .ok_or(UpdateItemError::NotFound)?;
+    let existing = decrypt_item(key, id, &data, stored_global)?;
+
+    let merged = VaultItem {
+        id,
+        item_type: if body.item_type.is_empty() { existing.item_type } else { body.item_type },
+        name:        body.name.or(existing.name),
+        value:       body.value.or(existing.value),
+        url:         body.url.or(existing.url),
+        username:    body.username.or(existing.username),
+        password:    body.password.or(existing.password),
+        title:       body.title.or(existing.title),
+        description: body.description.or(existing.description),
+        command:     body.command.or(existing.command),
+        shell:       body.shell.or(existing.shell),
+        notes:       body.notes.or(existing.notes),
+        content:     body.content.or(existing.content),
+        // None = not sent → keep existing. Some([]) = explicitly clear. Some([...]) = replace.
+        categories: body.categories.or(existing.categories),
+        created: existing.created,
+        is_global: body.is_global.or(existing.is_global),
+    };
+
+    let encrypted = encrypt_item(key, &merged)?;
+    VaultDb::update_item_tx(&mut tx, id, &encrypted, merged.is_global.unwrap_or(false)).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(merged)
 }
 
 #[tauri::command]
@@ -643,20 +751,21 @@ pub async fn set_item_global(
         .ok_or("item not found")?;
     let original = decrypt_item(key, id, &data, true)?;
 
+    // Encrypt every copy up front; the DB then inserts, links, repoints and
+    // deletes the original in one transaction.
     let mut forked = Vec::with_capacity(owners.len());
+    let mut encrypted_copies = Vec::with_capacity(owners.len());
     for project_id in &owners {
         let mut copy = original.clone();
         copy.id = 0;
         copy.is_global = Some(false);
-        let encrypted = encrypt_item(key, &copy)?;
-        let new_id = db.upsert_item(0, &item_type, &encrypted, &created, false).await?;
-        db.add_item_owner(new_id, *project_id).await?;
-        db.repoint_env_var_item(*project_id, id, new_id).await?;
-        copy.id = new_id;
+        encrypted_copies.push((*project_id, encrypt_item(key, &copy)?));
         forked.push(copy);
     }
-
-    db.delete_item(id).await?;
+    let new_ids = db.fork_item_per_owner(id, &item_type, &created, &encrypted_copies).await?;
+    for (copy, new_id) in forked.iter_mut().zip(new_ids) {
+        copy.id = new_id;
+    }
 
     Ok(GlobalToggleResult { updated: None, forked })
 }
@@ -906,7 +1015,7 @@ pub async fn vault_change_password(
     s.db.rekey(&new_salt, &new_token, re_encrypted).await?;
 
     // Update in-memory key
-    s.key = Some(Zeroizing::new(new_key));
+    s.set_key(Some(Zeroizing::new(new_key)));
     s.touch();
 
     Ok(())
@@ -915,7 +1024,7 @@ pub async fn vault_change_password(
 #[tauri::command]
 pub async fn vault_wipe(state: State<'_, SharedState>) -> Result<(), String> {
     let mut s = state.lock().await;
-    s.key = None;
+    s.set_key(None);
     s.last_activity = None;
     s.db.wipe_and_reset().await
 }
@@ -1010,220 +1119,59 @@ pub async fn vault_get_mcp_token(
     s.db.get_setting("mcp_token").await
 }
 
-// ─── Backup types ─────────────────────────────────────────────────────────────
-
-#[derive(Serialize, Deserialize)]
-struct BackupItem {
-    id: i64,
-    item_type: String,
-    /// Raw AES-GCM encrypted blob from the DB (hex-encoded nonce || ciphertext).
-    data: String,
-    created: String,
-    #[serde(default)]
-    is_global: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BackupFile {
-    version: u32,
-    created_at: u64,
-    /// Hex-encoded Argon2id salt used to derive the vault key.
-    salt: String,
-    /// AES-GCM verify token that proves the master password is correct.
-    token: String,
-    items: Vec<BackupItem>,
-    categories: Vec<serde_json::Value>,
-}
-
 // ─── Backup commands ──────────────────────────────────────────────────────────
+// Format and restore logic live in `backup.rs`.
 
-/// Export all vault items and categories to a `.cenvbak` file.
-/// The backup preserves the vault's existing salt and verify token so that
-/// restoring only requires the original master password — no separate backup password.
-/// Returns the number of items written.
+/// Export the whole vault (items, categories, projects, environments,
+/// variable bindings, ownership) to a v2 `.cenvbak` file. Organisational
+/// metadata is encrypted with the vault key. The backup preserves the vault's
+/// salt and verify token so restoring only requires the original master
+/// password. Returns the number of items written.
 #[tauri::command]
 pub async fn vault_export_backup(
     path: String,
     state: State<'_, SharedState>,
 ) -> Result<usize, String> {
     let mut s = state.lock().await;
-    s.key.as_ref().ok_or("vault is locked")?;
+    let key = s.key.as_ref().ok_or("vault is locked")?.clone();
     s.touch();
 
-    // Read vault crypto material
-    let (salt, token) = s
-        .db
-        .get_meta()
-        .await?
-        .ok_or("vault_meta missing")?;
-
-    // Read all raw (already-encrypted) item rows
-    let raw_items = s.db.list_items().await?;
-    let items: Vec<BackupItem> = raw_items
-        .iter()
-        .map(|(id, item_type, data, created, is_global)| BackupItem {
-            id: *id,
-            item_type: item_type.clone(),
-            data: data.clone(),
-            created: created.clone(),
-            is_global: *is_global,
-        })
-        .collect();
-    let item_count = items.len();
-
-    // Read categories as generic JSON values
-    let db_cats = s.db.list_categories().await?;
-    let categories: Vec<serde_json::Value> = db_cats
-        .iter()
-        .map(|c| serde_json::json!({ "id": c.cid, "name": c.name, "color": c.color, "description": c.description }))
-        .collect();
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let backup = BackupFile {
-        version: 1,
-        created_at,
-        salt,
-        token,
-        items,
-        categories,
-    };
-
+    let (backup, item_count) = backup::build_backup(&s.db, &key).await?;
     let json = serde_json::to_string_pretty(&backup)
         .map_err(|e| format!("serialize backup: {e}"))?;
-
     std::fs::write(&path, json).map_err(|e| format!("write backup: {e}"))?;
-
     Ok(item_count)
 }
 
-/// Import a `.cenvbak` file by filesystem path.
-///
-/// - `merge = false`: wipes the current vault and restores the backup exactly,
-///   keeping the original crypto material so the same master password applies.
-/// - `merge = true`: re-encrypts each imported item with the *current* vault key
-///   and upserts into the live vault. Categories are merged (no duplicates by id).
-///
-/// Returns the number of items restored.
+/// Restore a `.cenvbak` file by filesystem path. See `backup::restore`:
+/// requires an unlocked vault; `merge = false` also requires
+/// `current_password`.
 #[tauri::command]
 pub async fn vault_import_backup(
     path: String,
     master_password: String,
     merge: bool,
+    current_password: Option<String>,
     state: State<'_, SharedState>,
-) -> Result<usize, String> {
+) -> Result<backup::RestoreSummary, String> {
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("read backup: {e}"))?;
-    do_restore_backup(&json, &master_password, merge, &state).await
+    let mut s = state.lock().await;
+    backup::restore(&mut s, &json, &master_password, current_password.as_deref(), merge).await
 }
 
-/// Import a `.cenvbak` by passing its JSON content directly.
+/// Restore a `.cenvbak` by passing its JSON content directly.
 /// Used by the frontend file picker where only file content (not the path) is accessible.
 #[tauri::command]
 pub async fn vault_import_backup_data(
     data: String,
     master_password: String,
     merge: bool,
+    current_password: Option<String>,
     state: State<'_, SharedState>,
-) -> Result<usize, String> {
-    do_restore_backup(&data, &master_password, merge, &state).await
-}
-
-async fn do_restore_backup(
-    json: &str,
-    master_password: &str,
-    merge: bool,
-    state: &State<'_, SharedState>,
-) -> Result<usize, String> {
-    let backup: BackupFile = serde_json::from_str(json)
-        .map_err(|e| format!("parse backup: {e}"))?;
-
-    if backup.version != 1 {
-        return Err(format!("unsupported backup version: {}", backup.version));
-    }
-
-    // Verify the master password against the backup's crypto material.
-    let backup_key = crypto::unlock_vault_crypto(
-        master_password.as_bytes(),
-        &backup.salt,
-        &backup.token,
-    )
-    .map_err(|_| "incorrect master password for this backup".to_string())?;
-
+) -> Result<backup::RestoreSummary, String> {
     let mut s = state.lock().await;
-
-    if !merge {
-        // Wipe the current vault and restore the backup's crypto material verbatim.
-        // After init_vault the in-memory key equals the backup key.
-        s.key = None;
-        s.db.wipe_and_reset().await?;
-        s.db.init_vault(&backup.salt, &backup.token).await?;
-        s.key = Some(Zeroizing::new(backup_key));
-        s.touch();
-
-        // Insert items using their original encrypted blobs (already keyed with backup_key).
-        for item in &backup.items {
-            s.db
-                .upsert_item(0, &item.item_type, &item.data, &item.created, item.is_global)
-                .await?;
-        }
-
-        // Restore categories wholesale.
-        let db_cats: Vec<DbCategory> = backup
-            .categories
-            .iter()
-            .filter_map(|v| {
-                Some(DbCategory {
-                    cid: v.get("id")?.as_str()?.to_string(),
-                    name: v.get("name")?.as_str()?.to_string(),
-                    color: v.get("color")?.as_str()?.to_string(),
-                    description: v.get("description").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                })
-            })
-            .collect();
-        s.db.save_categories(&db_cats).await?;
-    } else {
-        // Merge: re-encrypt each item from backup_key → current vault key.
-        let current_key = s.key.as_ref().ok_or("vault is locked")?.clone();
-        s.touch();
-
-        for item in &backup.items {
-            let plaintext = crypto::decrypt(&backup_key, &item.data)
-                .map_err(|e| format!("decrypt backup item {}: {e}", item.id))?;
-            let new_data = crypto::encrypt(&current_key, &plaintext)
-                .map_err(|e| format!("re-encrypt item {}: {e}", item.id))?;
-            s.db
-                .upsert_item(0, &item.item_type, &new_data, &item.created, item.is_global)
-                .await?;
-        }
-
-        // Merge categories: keep existing, append any new ids from the backup.
-        let existing_cats = s.db.list_categories().await?;
-        let existing_ids: std::collections::HashSet<String> =
-            existing_cats.iter().map(|c| c.cid.clone()).collect();
-
-        let mut merged = existing_cats;
-        for v in &backup.categories {
-            let cid = match v.get("id").and_then(|x| x.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            if !existing_ids.contains(&cid) {
-                merged.push(DbCategory {
-                    cid,
-                    name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    color: v.get("color").and_then(|x| x.as_str()).unwrap_or("#888").to_string(),
-                    description: v.get("description").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                });
-            }
-        }
-        s.db.save_categories(&merged).await?;
-    }
-
-    Ok(backup.items.len())
+    backup::restore(&mut s, &data, &master_password, current_password.as_deref(), merge).await
 }
 
 // ─── Import from password managers ───────────────────────────────────────────
@@ -1286,6 +1234,10 @@ pub async fn vault_import_items(
         .unwrap_or(0);
     let now = epoch_to_iso8601(epoch_secs);
 
+    // All inserts happen in one transaction, and the items are owned by an
+    // `Imported <date>` project so they are not reported as orphans.
+    let mut tx = s.db.begin().await?;
+    let mut holding_id: Option<i64> = None;
     let mut inserted = 0usize;
 
     for imp in items {
@@ -1313,12 +1265,28 @@ pub async fn vault_import_items(
         };
 
         let encrypted = encrypt_item(key, &vault_item)?;
-        s.db
-            .upsert_item(0, &vault_item.item_type, &encrypted, &vault_item.created, false)
-            .await?;
+        let item_id = VaultDb::insert_item_tx(
+            &mut tx,
+            &vault_item.item_type,
+            &encrypted,
+            &vault_item.created,
+            false,
+        )
+        .await?;
+        let project_id = match holding_id {
+            Some(id) => id,
+            None => {
+                let name = format!("Imported {}", &now[..10]);
+                let id = VaultDb::ensure_holding_project_tx(&mut tx, &name).await?;
+                holding_id = Some(id);
+                id
+            }
+        };
+        VaultDb::add_item_owner_tx(&mut tx, item_id, project_id).await?;
         inserted += 1;
     }
 
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(inserted)
 }
 
@@ -1922,5 +1890,87 @@ mod tests {
         assert!(err.contains("'C'"));
         assert!(!err.contains("secret-value"), "error leaked a value: {err}");
         assert_nothing_created(&db).await;
+    }
+
+    // ─── vault-db-transactional-integrity ─────────────────────────────
+
+    #[tokio::test]
+    async fn failed_unlock_migration_leaves_vault_locked_and_rest_rejects_token() {
+        use crate::test_support::{locked_vault, req, router};
+        let v = locked_vault().await;
+        {
+            let s = v.state.lock().await;
+            literal_var(&s.db, "legacy", "LEGACY_KEY", "legacy-secret").await;
+            sqlx::query(
+                "CREATE TRIGGER boom BEFORE INSERT ON items
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .execute(&s.db.pool)
+            .await
+            .unwrap();
+        }
+
+        {
+            let mut s = v.state.lock().await;
+            let res = do_unlock(v.master_password.as_bytes(), &mut s).await;
+            assert!(res.is_err());
+            assert!(s.key.is_none(), "key must stay None when unlock fails");
+        }
+
+        let app = router(&v);
+        let (status, _) = req(&app, "GET", "/items", Some(&v.token), None).await;
+        assert_eq!(status.as_u16(), 403);
+    }
+
+    #[tokio::test]
+    async fn set_item_global_fork_failure_leaves_original_and_links_unchanged() {
+        let (_dir, db, key) = test_db().await;
+        let project_a = db.upsert_project(0, "proj-a", None, "generic").await.unwrap();
+        let project_b = db.upsert_project(0, "proj-b", None, "generic").await.unwrap();
+        let env_a = db.upsert_environment(0, project_a, "production", true).await.unwrap();
+        let item = plain_secret("SHARED", "shared-value", true);
+        let encrypted = encrypt_item(&key, &item).unwrap();
+        let original_id = db.upsert_item(0, &item.item_type, &encrypted, &item.created, true).await.unwrap();
+        db.add_item_owner(original_id, project_a).await.unwrap();
+        db.add_item_owner(original_id, project_b).await.unwrap();
+        db.upsert_environment_var(env_a, "SHARED", original_id).await.unwrap();
+
+        // Fails after the first copy row is inserted (on its ownership link).
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON item_projects
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(set_item_global(&db, &key, original_id, false).await.is_err());
+
+        let items = db.list_items().await.unwrap();
+        assert_eq!(items.len(), 1, "no copy may remain");
+        assert_eq!(items[0].0, original_id);
+        assert_eq!(db.list_owning_projects(original_id).await.unwrap().len(), 2);
+        let vars = db.get_environment_vars(env_a).await.unwrap();
+        assert_eq!(vars[0].item_id, Some(original_id));
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_and_does_not_set_flag() {
+        let (_dir, db, key) = test_db().await;
+        let (_, env_id) = literal_var(&db, "proj-a", "LITERAL_KEY", "literal-secret").await;
+        sqlx::query(
+            "CREATE TRIGGER boom BEFORE INSERT ON item_projects
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert!(migrate_literal_vars_to_items(&db, &key).await.is_err());
+
+        assert!(db.list_items().await.unwrap().is_empty());
+        assert!(db.get_setting("migrated_literals_v1").await.unwrap().is_none());
+        let vars = db.get_environment_vars(env_id).await.unwrap();
+        assert!(vars[0].item_id.is_none() && vars[0].literal.is_some());
     }
 }

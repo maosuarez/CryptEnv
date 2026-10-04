@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { copySecret } from '../lib/clipboard';
 import { Icon } from './ui/Icon';
 import { RelayCodeDisplay } from './ui/RelayCodeDisplay';
+import { RelaySchemaOutdatedNotice, isRelaySchemaOutdated } from './ui/RelaySql';
 import { useTranslation } from '../i18n';
 
 // ---------------------------------------------------------------------------
@@ -158,6 +159,7 @@ function BtnDanger({
 }
 
 function InlineError({ msg }: { msg: string }) {
+  if (isRelaySchemaOutdated(msg)) return <RelaySchemaOutdatedNotice />;
   return (
     <div className="text-[12px] text-danger font-mono bg-danger-b border border-danger rounded-[3px] px-3 py-2">
       {msg}
@@ -264,7 +266,7 @@ function PairingCodeInput({
 function FingerprintDisplay({ fp }: { fp: string }) {
   return (
     <div className="bg-raised border border-bd2 rounded-[3px] px-4 py-3 text-center my-3">
-      <span className="text-[18px] font-mono text-accent tracking-[0.15em] select-all">
+      <span className="text-[16px] font-mono text-accent tracking-[0.08em] select-all">
         {fp}
       </span>
     </div>
@@ -360,7 +362,11 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
   }, []);
 
   useEffect(() => {
-    return () => { stopPolling(); };
+    return () => {
+      stopPolling();
+      // Closing the modal ends any LAN session (frees the port, drops the key copy).
+      invoke('share_cancel').catch(() => { /* best effort */ });
+    };
   }, [stopPolling]);
 
   const startPolling = useCallback(() => {

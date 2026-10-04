@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vault write integrity** (`vault-db-transactional-integrity`):
+  - Saving the category list no longer erases project-category links: it now diffs and upserts in one transaction, removing links only for categories that were actually deleted. Links lost by earlier versions cannot be reconstructed.
+  - Saving an environment is atomic (rename, paths, ownership and variables commit together) and rejects duplicate variable keys or paths before writing anything.
+  - Unlock is all-or-nothing: a failed migration leaves the vault locked for the GUI, REST and MCP.
+  - `PUT /items/:id` holds the vault lock and a transaction across read-merge-write, so concurrent updates no longer overwrite each other.
+  - Un-globaling a multi-owner item and the legacy literal-variable migration are atomic.
+  - `foreign_keys`, `secure_delete` and WAL are now set on every pooled SQLite connection (5 s busy timeout).
+
 ---
 
 ## [1.0.3] - 2026-09-27

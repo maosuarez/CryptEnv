@@ -2,32 +2,20 @@ use super::ImportItem;
 
 // ─── ENV file parser ──────────────────────────────────────────────────────────
 
-/// Parses KEY=VALUE lines from a .env file.
-/// Lines starting with # or empty lines are skipped.
-/// Each pair becomes a "secret" type item.
+/// Parses a .env file with the same grammar crypt-env writes
+/// (`envfile::serialize_value`): bare, single- and double-quoted values,
+/// comments and blank lines skipped. Each pair becomes a "secret" type item.
 pub fn parse_env_file(content: &str) -> Vec<ImportItem> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let eq = line.find('=')?;
-            let key = line[..eq].trim().to_string();
-            let val = line[eq + 1..].trim().to_string();
-            if key.is_empty() {
-                return None;
-            }
-            Some(ImportItem {
-                name: key,
-                value: Some(val),
-                username: None,
-                password: None,
-                url: None,
-                notes: None,
-                item_type: "secret".to_string(),
-            })
+    crate::envfile::parse_dotenv(content)
+        .into_iter()
+        .map(|(key, val)| ImportItem {
+            name: key,
+            value: Some(val),
+            username: None,
+            password: None,
+            url: None,
+            notes: None,
+            item_type: "secret".to_string(),
         })
         .collect()
 }

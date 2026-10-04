@@ -9,6 +9,8 @@ CryptEnv exposes a **stdio-based MCP server** (`crypt-env-mcp`, JSON-RPC 2.0) th
 - **Zero Plaintext in Context**: Secret values are **never returned** in JSON-RPC responses or logs. They are injected directly as environment variables or written securely into files.
 - **Token Authentication**: MCP commands authenticate with the local REST API using an MCP token generated in CryptEnv Settings.
 - **Stdio Subprocess**: The server runs as a local subprocess over standard I/O (no open network listening ports).
+- **Restricted token**: The MCP token cannot reveal values, confirm pairings, change security settings, or write outside a project root. Exfiltration-capable operations (relay send, share export, `generate_env`, MCP host config edits) wait for **your approval in the desktop app**; relay codes and passphrases are shown only there.
+- **Commands run in the app**: `crypt_env_run_command` executes inside CryptEnv with a cleared environment, strict `{{param}}` characters (`[A-Za-z0-9._/:@=+,-]`), redacted output, a 120 s limit and process-tree kill.
 
 ---
 
@@ -51,12 +53,12 @@ src-tauri\target\release\crypt-env-mcp.exe
 | `crypt_env_get_item` | `item_id` | Item metadata | Get item details without exposing the secret value |
 | `crypt_env_search_items` | `query`, `type`, `category` (optional) | Matching metadata | Search vault without revealing secret contents |
 | `crypt_env_add_item` | `name`, `type`, `value`, `category`, `notes` | Confirmation | Add a new secret to the vault |
-| `crypt_env_generate_env` | `items: [KEY, ...]` | Shell export statements | Generate `.env` syntax for keys (injected, values redacted in output) |
-| `crypt_env_inject_env` | `items: [KEY, ...]` | Shell assignment code | Inject secrets directly as environment variables in the current process |
-| `crypt_env_fill_env` | `template_path`, `output_path` | File path confirmation | Fill a `.env.example` template with vault secrets and save to `.env` |
-| `crypt_env_update_settings` | `timeout`, `theme`, etc. | Updated settings | Modify app settings |
+| `crypt_env_generate_env` | `keys`, scope | `pending_approval` + `approvalId` | After you approve in the app, writes a private (`0600`) `.env` and reports its path via `crypt_env_approval_status`. Deleted after 10 minutes, on lock and at exit |
+| `crypt_env_inject_env` | `key`, scope | Confirmation | Selects a secret to inject into later `crypt_env_run_command` calls (key name only; the MCP process never holds the value) |
+| `crypt_env_fill_env` | `template`, `output_path` or `output_dir`, scope | Stats | Fill a template and write it inside a registered project root (never returned inline; foreign files are not overwritten) |
+| `crypt_env_update_settings` | `hotkey` | Confirmation | Change the hotkey. Security settings (auto-lock, etc.) are user-only |
 | `crypt_env_list_commands` | — | Command list with placeholders | List all saved commands in the vault |
-| `crypt_env_run_command` | `command_name`, `variables: {VAR=value, ...}` | `{ exit_code, stdout, stderr }` | Execute command with resolved `{{placeholder}}` variables; secrets never in response |
+| `crypt_env_run_command` | `name`, `params`, scope | `{ exit_code, timed_out, stdout, stderr }` | Run a saved command in the app; secrets from `crypt_env_inject_env` are in its environment, output is redacted |
 | `crypt_env_list_categories` | — | Category list | List all categories (id, name, color, description) |
 | `crypt_env_create_category` | `name`, `color`, `description` | Category object | Create a new category |
 | `crypt_env_update_category` | `id`, `name`, `color`, `description` | Category object | Update category fields |
@@ -65,10 +67,10 @@ src-tauri\target\release\crypt-env-mcp.exe
 | `crypt_env_delete_item` | `id` | `{ deleted: true }` | Delete a vault item |
 | `crypt_env_share_listen` | `item_ids: [...]` | `{ pairing_code, expires_in }` | Start LAN send session |
 | `crypt_env_share_connect` | `pairing_code` | `{ fingerprint }` | Start LAN receive session |
-| `crypt_env_share_confirm` | `confirmed: bool` | `{ status }` | Confirm fingerprint match |
 | `crypt_env_share_cancel` | — | `{ cancelled }` | Cancel active share session |
 | `crypt_env_share_status` | — | `{ state, progress }` | Poll share session status |
-| `crypt_env_share_export` | `item_ids: [...]` | `{ ciphertext, salt, nonce, passphrase }` | Export encrypted package |
+| `crypt_env_share_export` | `items`, `output_path` | `pending_approval` + `approvalId` | You approve in the app, which shows the passphrase (never returned to the agent) |
+| `crypt_env_approval_status` | `id` | Status + non-secret metadata | Poll a request waiting for your approval (`pending`, `approved`, `denied`, `expired`; expires after 120 s) |
 | `crypt_env_share_import` | `package, passphrase` | `{ imported_count }` | Import from encrypted package |
 
 ---
@@ -101,8 +103,7 @@ AI: "Initiating LAN share session..."
 AI: "Pairing code 492015 generated. Ask Alice to open CryptEnv → Receive and enter 492015"
 [Alice connects]
 
-AI: "Confirming fingerprint match..."
-→ Calls: crypt_env_share_confirm(confirmed=true)
-← Returns: { status: "confirmed" }
+AI: "Compare the fingerprint shown in CryptEnv with Alice's screen and confirm it in the app."
+[You confirm the fingerprint in the desktop app: the agent cannot confirm it]
 AI: "Item transferred securely."
 ```

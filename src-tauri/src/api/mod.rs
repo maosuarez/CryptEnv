@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
@@ -12,6 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
+
+pub mod approvals;
+mod auth;
+mod confine;
+mod exec_routes;
+mod mcp_servers;
+use self::auth::{AuthedPrincipal, McpPolicy, Principal};
 
 use crate::crypto;
 // `DbWorkspaceVar` went unused when issue #4 replaced the workspace-relay
@@ -46,6 +53,8 @@ struct Session {
     expires: Instant,
     ttl: Duration,
     last_used: Instant,
+    /// Vault lock epoch at issue time; a session is dead once it differs.
+    epoch: u64,
 }
 
 /// Upper bound on concurrently live sessions; the least recently used one
@@ -60,19 +69,21 @@ fn session_ttl(minutes: u64) -> Duration {
 }
 
 impl SessionStore {
-    fn insert(&mut self, token: String, ttl: Duration, now: Instant) {
+    fn insert(&mut self, token: String, ttl: Duration, now: Instant, epoch: u64) {
         self.entries.retain(|e| e.expires > now);
         if self.entries.len() >= MAX_SESSIONS {
             if let Some(i) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].last_used) {
                 self.entries.swap_remove(i);
             }
         }
-        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now });
+        self.entries.push(Session { token, expires: now + ttl, ttl, last_used: now, epoch });
     }
 
-    /// `true` when `provided` is a live session; renews it. Every entry is
+    /// `true` when `provided` is a live session of the current lock `epoch`;
+    /// renews it. Entries from an older epoch are dropped. Every entry is
     /// compared in constant time (no early exit on a match).
-    fn touch(&mut self, provided: &str, now: Instant) -> bool {
+    fn touch(&mut self, provided: &str, now: Instant, epoch: u64) -> bool {
+        self.entries.retain(|e| e.epoch == epoch);
         let mut hit: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if bool::from(e.token.as_bytes().ct_eq(provided.as_bytes())) && now < e.expires {
@@ -95,10 +106,28 @@ pub struct ApiState {
     vault: SharedState,
     sessions: Mutex<SessionStore>,
     unlock_rate: Mutex<RateLimitState>,
-    share: Arc<ShareState>,
+    /// Pending human approvals for MCP requests (memory only, lock-epoch bound).
+    approvals: Mutex<approvals::ApprovalStore>,
+    /// Told about each new approval so the desktop app can show it.
+    notifier: std::sync::OnceLock<approvals::Notifier>,
+    /// Limits concurrent `POST /exec` commands.
+    exec_slots: Arc<tokio::sync::Semaphore>,
+    /// Requests currently queued for an exec slot.
+    exec_waiting: std::sync::atomic::AtomicUsize,
+    /// Cancel flags of running commands, by run id.
+    runs: std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Wall-clock limit of one `POST /exec` command, in milliseconds. Fixed at
+    /// [`crate::exec::EXEC_TIMEOUT`] outside tests.
+    exec_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ApiState {
+    /// LAN share session slot. Owned by the vault state (shared with the Tauri
+    /// commands) so that locking the vault cancels any active session.
+    async fn share(&self) -> Arc<ShareState> {
+        self.vault.lock().await.share.clone()
+    }
+
     /// Builds a fresh state: no active session, rate limiter reset, new share
     /// session. Used by `start_server` and by `crate::test_support::router`
     /// so both build `ApiState` identically — no duplicated initialisation to
@@ -112,8 +141,30 @@ impl ApiState {
                 attempts: 0,
                 window_start: Instant::now(),
             }),
-            share: Arc::new(ShareState::new()),
+            approvals: Mutex::new(approvals::ApprovalStore::default()),
+            notifier: std::sync::OnceLock::new(),
+            exec_slots: Arc::new(tokio::sync::Semaphore::new(exec_routes::MAX_CONCURRENT_RUNS)),
+            exec_waiting: std::sync::atomic::AtomicUsize::new(0),
+            runs: std::sync::Mutex::new(HashMap::new()),
+            exec_timeout_ms: std::sync::atomic::AtomicU64::new(crate::exec::EXEC_TIMEOUT.as_millis() as u64),
         }
+    }
+}
+
+#[cfg(test)]
+impl ApiState {
+    /// Test harness: shortens the command time limit.
+    pub(crate) fn set_exec_timeout_ms(&self, ms: u64) {
+        self.exec_timeout_ms.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test harness: registers `token` as a live session of the current lock epoch.
+    pub(crate) async fn seed_session(&self, token: &str) {
+        let epoch = self.vault.lock().await.epoch;
+        self.sessions
+            .lock()
+            .await
+            .insert(token.to_string(), Duration::from_secs(3600), Instant::now(), epoch);
     }
 }
 
@@ -221,38 +272,15 @@ fn err_envfile(e: envfile::EnvFileError) -> axum::response::Response {
         envfile::EnvFileError::BackupExists(_) => {
             err_json(StatusCode::CONFLICT, &e.to_string(), "BACKUP_EXISTS").into_response()
         }
+        envfile::EnvFileError::Symlink(_) => {
+            err_json(StatusCode::CONFLICT, &e.to_string(), "TARGET_SYMLINK").into_response()
+        }
+        envfile::EnvFileError::NotRegularFile(_) => {
+            err_json(StatusCode::CONFLICT, &e.to_string(), "NOT_REGULAR_FILE").into_response()
+        }
         envfile::EnvFileError::Io(..) => {
             err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot write file: {e}"), "INTERNAL_ERROR")
                 .into_response()
-        }
-    }
-}
-
-/// Verifica el header X-Vault-Token.
-/// Acepta session token (con expiración) o MCP token estático (sin expiración).
-async fn verify_token(headers: &HeaderMap, state: &ApiState) -> Result<(), StatusCode> {
-    let provided = headers
-        .get("x-vault-token")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    // --- Verificar session token (expiración deslizante) ---
-    if state.sessions.lock().await.touch(provided, Instant::now()) {
-        let vault = state.vault.lock().await;
-        return if vault.key.is_some() { Ok(()) } else { Err(StatusCode::FORBIDDEN) };
-    }
-
-    // --- Fallback: MCP token estático (sin expiración) ---
-    {
-        let vault = state.vault.lock().await;
-        if vault.key.is_none() {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        let mcp_token = vault.db.get_setting("mcp_token").await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        match mcp_token {
-            Some(t) if bool::from(t.as_bytes().ct_eq(provided.as_bytes())) => Ok(()),
-            _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
 }
@@ -636,7 +664,7 @@ async fn handle_unlock(
         }
     };
 
-    vault.key = Some(Zeroizing::new(key));
+    vault.set_key(Some(Zeroizing::new(key)));
 
     if let Err(e) = crate::vault::migrate_literal_vars_to_items(&vault.db, &key).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response();
@@ -648,6 +676,7 @@ async fn handle_unlock(
         _ => 5,
     };
 
+    let epoch = vault.epoch;
     drop(vault);
 
     // Generar token de sesión: 16 bytes = 32 chars hex
@@ -659,7 +688,7 @@ async fn handle_unlock(
         .sessions
         .lock()
         .await
-        .insert(session_token.clone(), session_ttl(minutes), Instant::now());
+        .insert(session_token.clone(), session_ttl(minutes), Instant::now(), epoch);
 
     (StatusCode::OK, Json(UnlockResponse { token: session_token })).into_response()
 }
@@ -685,18 +714,9 @@ fn environment_item_ids(env: &project::Environment) -> HashSet<i64> {
 
 async fn handle_list_items(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(params): Query<ItemsQuery>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let env = match resolve_scope(
         &state,
         params.environment_id,
@@ -750,18 +770,9 @@ async fn handle_list_items(
 
 async fn handle_get_item(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let items = match decrypt_all_items(&state).await {
         Ok(i) => i,
         Err(StatusCode::FORBIDDEN) => {
@@ -811,20 +822,11 @@ fn parse_link_mode(raw: Option<&str>) -> Result<crate::db::LinkMode, axum::respo
 
 async fn handle_create_item(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Query(conflict): Query<ConflictQuery>,
     Json(mut body): Json<CreateItemBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let mode = match parse_link_mode(conflict.on_conflict.as_deref()) {
         Ok(m) => m,
         Err(resp) => return resp,
@@ -920,64 +922,16 @@ async fn handle_create_item(
 
 async fn handle_update_item(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
     Json(body): Json<VaultItem>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if let Err(resp) = validate_update(&body) {
         return resp;
     }
 
-    // Decrypt existing item so we can merge — secrets stay server-side
-    let items = match decrypt_all_items(&state).await {
-        Ok(i) => i,
-        Err(StatusCode::FORBIDDEN) => {
-            return err_json(StatusCode::FORBIDDEN, "bóveda bloqueada", "VAULT_LOCKED")
-                .into_response()
-        }
-        Err(_) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "error interno", "INTERNAL_ERROR")
-                .into_response()
-        }
-    };
-
-    let existing = match items.into_iter().find(|item| item.id == id) {
-        Some(e) => e,
-        None => return err_json(StatusCode::NOT_FOUND, "item no encontrado", "NOT_FOUND").into_response(),
-    };
-
-    // Merge: body fields override existing; None/empty keeps the existing value.
-    // Secret fields (value, password, content) are preserved from the encrypted
-    // store when the caller does not supply them — they never leave this process.
-    let merged = VaultItem {
-        id,
-        item_type: if body.item_type.is_empty() { existing.item_type } else { body.item_type },
-        name:        body.name.or(existing.name),
-        value:       body.value.or(existing.value),
-        url:         body.url.or(existing.url),
-        username:    body.username.or(existing.username),
-        password:    body.password.or(existing.password),
-        title:       body.title.or(existing.title),
-        description: body.description.or(existing.description),
-        command:     body.command.or(existing.command),
-        shell:       body.shell.or(existing.shell),
-        notes:       body.notes.or(existing.notes),
-        content:     body.content.or(existing.content),
-        // None = not sent → keep existing. Some([]) = explicitly clear. Some([...]) = replace.
-        categories: body.categories.or(existing.categories),
-        created: existing.created,
-        is_global: body.is_global.or(existing.is_global),
-    };
-
+    // Hold the vault lock across read-merge-write so concurrent GUI/CLI updates
+    // never merge into a stale copy. Secrets stay server-side.
     let vault = state.vault.lock().await;
     let key = match vault.key.as_ref() {
         Some(k) => k.clone(),
@@ -987,48 +941,25 @@ async fn handle_update_item(
         }
     };
 
-    let encrypted = match crate::vault::encrypt_item(&key, &merged) {
-        Ok(e) => e,
-        Err(_) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "error cifrando item",
-                "INTERNAL_ERROR",
-            )
-            .into_response()
+    let merged = match crate::vault::update_item_merged(&vault.db, &key, id, body).await {
+        Ok(m) => m,
+        Err(crate::vault::UpdateItemError::NotFound) => {
+            return err_json(StatusCode::NOT_FOUND, "item no encontrado", "NOT_FOUND").into_response()
         }
-    };
-
-    let is_global = merged.is_global.unwrap_or(false);
-    match vault
-        .db
-        .upsert_item(id, &merged.item_type, &encrypted, &merged.created, is_global)
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
+        Err(crate::vault::UpdateItemError::Other(e)) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
                 .into_response()
         }
-    }
+    };
 
     (StatusCode::OK, Json(redact_item(merged))).into_response()
 }
 
 async fn handle_delete_item(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     // Verificar que el item existe
     let items = match decrypt_all_items(&state).await {
         Ok(i) => i,
@@ -1063,17 +994,8 @@ async fn handle_delete_item(
 /// operation. Lets `crypt-env doctor` surface a one-line orphan count.
 async fn handle_list_orphans(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     let key = match vault.key.as_ref() {
         Some(k) => k.clone(),
@@ -1094,22 +1016,9 @@ async fn handle_list_orphans(
 
 async fn handle_list_categories(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
     // Categorías no requieren key, solo token válido
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => {
-                // Para categorías, FORBIDDEN (vault sin key) también es aceptable
-                // pero el verify_token ya verifica key, así que devolvemos el error
-                ("bóveda bloqueada", "VAULT_LOCKED")
-            }
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     match vault.db.list_categories().await {
         Ok(cats) => {
@@ -1134,18 +1043,9 @@ struct CreateCategoryBody {
 
 async fn handle_create_category(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<CreateCategoryBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.name.is_empty() {
         return err_validation("name", "required and must not be empty");
     }
@@ -1183,19 +1083,10 @@ struct UpdateCategoryBody {
 
 async fn handle_update_category(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<String>,
     Json(body): Json<UpdateCategoryBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     // Fetch existing category to merge fields
     let vault = state.vault.lock().await;
     let cats = match vault.db.list_categories().await {
@@ -1246,18 +1137,9 @@ async fn handle_update_category(
 
 async fn handle_delete_category(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     match vault.db.delete_category(&id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -1270,18 +1152,9 @@ async fn handle_delete_category(
 
 async fn handle_list_commands(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let env = match resolve_scope(
         &state,
         scope.environment_id,
@@ -1341,18 +1214,9 @@ async fn handle_list_commands(
 
 async fn handle_get_command(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let items = match decrypt_all_items(&state).await {
         Ok(i) => i,
         Err(StatusCode::FORBIDDEN) => {
@@ -1396,19 +1260,10 @@ struct RevealBody {
 
 async fn handle_reveal_item(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
     Json(body): Json<RevealBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("no autorizado", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("bóveda bloqueada", "VAULT_LOCKED"),
-            _ => ("error interno", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.confirm != Some(true) {
         return err_json(
             StatusCode::BAD_REQUEST,
@@ -1448,11 +1303,8 @@ async fn handle_reveal_item(
 
 async fn handle_get_settings(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        return err_json(code, "no autorizado", "UNAUTHORIZED").into_response();
-    }
     let vault = state.vault.lock().await;
     let timeout = vault.db.get_setting("auto_lock_timeout").await
         .unwrap_or_default()
@@ -1476,11 +1328,13 @@ struct UpdateSettingsBody {
 
 async fn handle_put_settings(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(principal): AuthedPrincipal,
     Json(body): Json<UpdateSettingsBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        return err_json(code, "no autorizado", "UNAUTHORIZED").into_response();
+    // Security settings (auto-lock) are the user's: an agent must not be able to
+    // disable the lock. Checked before anything is written.
+    if principal == Principal::Mcp && body.auto_lock_timeout.is_some() {
+        return auth::mcp_forbidden("changing auto_lock_timeout");
     }
     let vault = state.vault.lock().await;
     if let Some(t) = body.auto_lock_timeout {
@@ -1609,8 +1463,13 @@ impl Drop for TempEnvFile {
         // Use max(content_len, 1) so we always issue at least one write attempt
         // even if content_len is somehow zero. A zero pass is defense-in-depth,
         // not an erasure guarantee, on journaling/copy-on-write filesystems.
+        // Opened no-follow like the original write: a path swapped for a
+        // symlink since then is never written through.
         let zeros = vec![0u8; self.content_len.max(1)];
-        let _ = std::fs::write(&self.path, &zeros);
+        if let Ok(mut f) = envfile::open_nofollow(&self.path, envfile::FileMode::Inherit) {
+            use std::io::Write as _;
+            let _ = f.write_all(&zeros);
+        }
 
         if self.pre_existed {
             // The original bytes are already gone by this point (and
@@ -1619,7 +1478,7 @@ impl Drop for TempEnvFile {
             // deleting a path we did not create would destroy the inode,
             // its permissions and its existence, which callers may depend
             // on. Truncate to zero length instead of removing it.
-            let _ = std::fs::File::create(&self.path);
+            let _ = envfile::open_nofollow(&self.path, envfile::FileMode::Inherit);
         } else {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -1664,19 +1523,10 @@ struct FillResponse {
 
 async fn handle_fill(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<FillBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let env = match resolve_scope(
         &state,
         scope.environment_id,
@@ -1700,6 +1550,21 @@ async fn handle_fill(
     // environment's `name` — untrusted, persisted data — so it goes through
     // `fsguard::resolve_within`, which guarantees the result cannot land
     // outside the caller-supplied directory.
+    // MCP callers may only write inside a registered project root and never get
+    // the filled content inline (it would be a plaintext secret in the response).
+    if principal == Principal::Mcp {
+        let checked = match (body.output_path.as_deref(), body.output_dir.as_deref()) {
+            (Some(p), _) => confine::authorize_file(&state, std::path::Path::new(p), body.overwrite).await,
+            (None, Some(d)) => confine::authorize_dir(&state, d).await,
+            (None, None) => Err(auth::mcp_forbidden(
+                "inline fill output would expose secret values; write to a path inside a project root",
+            )),
+        };
+        if let Err(resp) = checked {
+            return resp;
+        }
+    }
+
     let write_target: Option<PathBuf> = if let Some(out) = body.output_path.as_deref() {
         Some(PathBuf::from(out))
     } else if let Some(dir) = body.output_dir.as_deref() {
@@ -1733,6 +1598,15 @@ async fn handle_fill(
     } else {
         None
     };
+
+    // `output_dir` derived its file name just now: re-check the final path.
+    if principal == Principal::Mcp && body.output_path.is_none() {
+        if let Some(path) = &write_target {
+            if let Err(resp) = confine::authorize_file(&state, path, body.overwrite).await {
+                return resp;
+            }
+        }
+    }
 
     let items = match decrypt_all_items(&state).await {
         Ok(i) => i,
@@ -1787,7 +1661,7 @@ async fn handle_fill(
             if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 let key_lower = key.to_lowercase();
                 if let Some(value) = key_to_value.get(&key_lower) {
-                    new_lines.push(format!("{key}={value}"));
+                    new_lines.push(format!("{key}={}", envfile::serialize_value(value)));
                     injected += 1;
                     continue;
                 } else {
@@ -1893,19 +1767,10 @@ struct ShareListenResponse {
 
 async fn handle_share_listen(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<ShareListenBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.items.is_empty() {
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, "items list must not be empty", "VALIDATION_ERROR").into_response();
     }
@@ -1935,16 +1800,16 @@ async fn handle_share_listen(
     }
 
     // Extract vault key
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => zeroize::Zeroizing::new(**k),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
 
     let pairing_code = match crate::share::start_listen_session(
-        state.share.clone(),
+        state.share().await,
         body.items,
         vault_key,
         state.vault.clone(),
@@ -1954,6 +1819,14 @@ async fn handle_share_listen(
     .await
     {
         Ok(code) => code,
+        Err(crate::share::ShareError::SessionActive) => {
+            return err_json(
+                StatusCode::CONFLICT,
+                "a share session is already active; cancel it first",
+                "SESSION_ACTIVE",
+            )
+            .into_response()
+        }
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1989,19 +1862,10 @@ struct ShareConnectResponse {
 
 async fn handle_share_connect(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<ShareConnectBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     // Resolve the project+environment received items should land in — see
     // `share::import_plain_items_into_vault`, which owns and links each
     // imported item into this environment once the transfer completes.
@@ -2017,16 +1881,16 @@ async fn handle_share_connect(
         Err(resp) => return resp,
     };
 
-    let vault_key: [u8; 32] = {
+    let vault_key = {
         let guard = state.vault.lock().await;
         match guard.key.as_ref() {
-            Some(k) => **k,
+            Some(k) => zeroize::Zeroizing::new(**k),
             None => return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED").into_response(),
         }
     };
 
     let fingerprint = match crate::share::connect_to_peer(
-        state.share.clone(),
+        state.share().await,
         body.pairing_code,
         vault_key,
         state.vault.clone(),
@@ -2036,6 +1900,14 @@ async fn handle_share_connect(
     .await
     {
         Ok(fp) => fp,
+        Err(crate::share::ShareError::SessionActive) => {
+            return err_json(
+                StatusCode::CONFLICT,
+                "a share session is already active; cancel it first",
+                "SESSION_ACTIVE",
+            )
+            .into_response()
+        }
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2068,19 +1940,10 @@ struct ShareConfirmResponse {
 
 async fn handle_share_confirm(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<ShareConfirmBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
-    match crate::share::confirm_fingerprint(&state.share, body.confirmed).await {
+    match crate::share::confirm_fingerprint(&state.share().await, body.confirmed).await {
         Ok(()) => {
             let status = if body.confirmed { "active" } else { "cancelled" };
             (StatusCode::OK, Json(ShareConfirmResponse { status: status.to_string() })).into_response()
@@ -2103,18 +1966,10 @@ struct ShareStatusResponse {
 
 async fn handle_share_status(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
-    let guard = state.share.session.lock().await;
+    let share = state.share().await;
+    let guard = share.session.lock().await;
     match guard.as_ref() {
         None => (
             StatusCode::OK,
@@ -2157,18 +2012,9 @@ struct ShareCancelResponse {
 
 async fn handle_share_cancel(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
-    match crate::share::cancel_session(&state.share).await {
+    match crate::share::cancel_session(&state.share().await).await {
         Ok(()) => (StatusCode::OK, Json(ShareCancelResponse { cancelled: true })).into_response(),
         Err(e) => err_json(StatusCode::BAD_REQUEST, &e.to_string(), "BAD_REQUEST").into_response(),
     }
@@ -2188,45 +2034,41 @@ struct ShareExportResponse {
 
 async fn handle_share_export(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(principal): AuthedPrincipal,
     Json(body): Json<ShareExportBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.items.is_empty() {
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, "items list must not be empty", "VALIDATION_ERROR").into_response();
     }
 
-    let output_path = std::path::PathBuf::from(&body.output_path);
-    if let Some(parent) = output_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("cannot create output directory: {e}"),
-                "INTERNAL_ERROR",
-            )
-            .into_response();
-        }
+    // The MCP principal never gets the passphrase: the request waits for the
+    // user's approval in the desktop app, which shows it.
+    if principal == Principal::Mcp {
+        let names = item_names(&state, &body.items).await;
+        let summary = approvals::ApprovalSummary {
+            operation: format!("Export {} item(s) to an encrypted share package", body.items.len()),
+            kind: approvals::ApprovalKind::ShareExport,
+            item_count: body.items.len(),
+            items: names,
+            details: vec!["You will see the package passphrase here after approving.".to_string()],
+            destination: Some(body.output_path.clone()),
+            requested_by: "mcp",
+        };
+        return approvals::respond_pending(
+            &state,
+            summary,
+            approvals::ApprovalPayload::ShareExport { item_ids: body.items, output_path: body.output_path },
+        )
+        .await;
     }
 
-    match crate::share::export_package(&body.items, &output_path, &state.vault).await {
+    match state.share_export_core(&body.items, &body.output_path).await {
         Ok(passphrase) => (
             StatusCode::OK,
-            Json(ShareExportResponse {
-                passphrase,
-                path: body.output_path,
-            }),
+            Json(ShareExportResponse { passphrase, path: body.output_path }),
         )
             .into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2248,19 +2090,10 @@ struct ShareImportResponse {
 
 async fn handle_share_import(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<ShareImportBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     // Imported items must land in a resolvable project+environment, same as
     // /share/connect and /relay/receive, so they're actually findable
     // afterwards via GET /items / search / MCP instead of only by guessing
@@ -2300,17 +2133,8 @@ async fn handle_share_import(
 
 async fn handle_list_projects(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     match project::list_projects(&vault.db).await {
         Ok(projects) => (StatusCode::OK, Json(projects)).into_response(),
@@ -2320,18 +2144,9 @@ async fn handle_list_projects(
 
 async fn handle_save_project(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<ProjectInput>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.name.is_empty() {
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, "name: required and must not be empty", "VALIDATION_ERROR")
             .into_response();
@@ -2377,18 +2192,9 @@ async fn handle_save_project(
 
 async fn handle_delete_project(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
 
     let projects = match project::list_projects(&vault.db).await {
@@ -2409,18 +2215,9 @@ async fn handle_delete_project(
 
 async fn handle_preview_delete_project(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     match project::project_delete_preview(&vault.db, id).await {
         Ok(impact) => (StatusCode::OK, Json(impact)).into_response(),
@@ -2430,18 +2227,9 @@ async fn handle_preview_delete_project(
 
 async fn handle_save_environment(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<EnvironmentInput>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.name.is_empty() {
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, "name: required and must not be empty", "VALIDATION_ERROR")
             .into_response();
@@ -2499,18 +2287,9 @@ async fn handle_save_environment(
 
 async fn handle_delete_environment(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let vault = state.vault.lock().await;
     match project::delete_environment(&vault.db, id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2540,17 +2319,41 @@ struct InjectBody {
 
 async fn handle_inject_environment(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(principal): AuthedPrincipal,
     Path(id): Path<i64>,
     Json(body): Json<InjectBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
+    // Caller-supplied destinations of an MCP request stay inside a registered
+    // project root. Owner-configured `environment.paths[]` are not caller input.
+    if principal == Principal::Mcp {
+        let checked = match (body.output_path.as_deref(), body.output_dir.as_deref()) {
+            (Some(p), _) => confine::authorize_file(&state, std::path::Path::new(p), body.overwrite).await,
+            (None, Some(d)) => {
+                let dir_ok = confine::authorize_dir(&state, d).await;
+                match (dir_ok, body.overwrite) {
+                    (Ok(()), true) => {
+                        // The file name is derived from the environment name.
+                        let env = {
+                            let vault = state.vault.lock().await;
+                            project::resolve_environment(&vault.db, Some(id), None, None).await
+                        };
+                        match env {
+                            Ok(env) => {
+                                let target = std::path::Path::new(d).join(project::environment_filename(&env.name));
+                                confine::authorize_file(&state, &target, true).await
+                            }
+                            Err(_) => Err(err_json(StatusCode::NOT_FOUND, "environment not found", "NOT_FOUND")
+                                .into_response()),
+                        }
+                    }
+                    (other, _) => other,
+                }
+            }
+            (None, None) => Ok(()),
         };
-        return err_json(code, msg, err_code).into_response();
+        if let Err(resp) = checked {
+            return resp;
+        }
     }
 
     let vault = state.vault.lock().await;
@@ -2575,6 +2378,12 @@ async fn handle_inject_environment(
         }
         Err(e) if e.starts_with(envfile::BACKUP_EXISTS_PREFIX) => {
             err_json(StatusCode::CONFLICT, &e, "BACKUP_EXISTS").into_response()
+        }
+        Err(e) if e.starts_with(envfile::SYMLINK_PREFIX) => {
+            err_json(StatusCode::CONFLICT, &e, "TARGET_SYMLINK").into_response()
+        }
+        Err(e) if e.starts_with(envfile::NOT_REGULAR_PREFIX) => {
+            err_json(StatusCode::CONFLICT, &e, "NOT_REGULAR_FILE").into_response()
         }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR").into_response(),
     }
@@ -2614,19 +2423,10 @@ struct ExampleResponse {
 
 async fn handle_environment_example(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(principal): AuthedPrincipal,
     Path(id): Path<i64>,
     Json(body): Json<ExampleBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     let env = {
         let vault = state.vault.lock().await;
         match project::resolve_environment(&vault.db, Some(id), None, None).await {
@@ -2652,6 +2452,19 @@ async fn handle_environment_example(
     // here is placeholder keys only (never decrypted), so there is no
     // decrypt-ordering concern like `/fill`'s objective 3 — but the code
     // shape is kept the same so the two sinks stay diff-comparable.
+    // Placeholder content is safe to return inline, but writes by an MCP caller
+    // stay inside a registered project root and never clobber foreign files.
+    if principal == Principal::Mcp {
+        let checked = match (body.output_path.as_deref(), body.output_dir.as_deref()) {
+            (Some(p), _) => confine::authorize_file(&state, std::path::Path::new(p), body.overwrite).await,
+            (None, Some(d)) => confine::authorize_dir(&state, d).await,
+            (None, None) => Ok(()),
+        };
+        if let Err(resp) = checked {
+            return resp;
+        }
+    }
+
     let write_target: Option<PathBuf> = if let Some(p) = body.output_path.as_deref() {
         Some(PathBuf::from(p))
     } else if let Some(dir) = body.output_dir.as_deref() {
@@ -2681,6 +2494,14 @@ async fn handle_environment_example(
     } else {
         None
     };
+
+    if principal == Principal::Mcp && body.output_path.is_none() {
+        if let Some(path) = &write_target {
+            if let Err(resp) = confine::authorize_file(&state, path, body.overwrite).await {
+                return resp;
+            }
+        }
+    }
 
     if let Some(path) = write_target {
         if body.output_path.is_some() {
@@ -2733,20 +2554,171 @@ struct RelaySendResponse {
     passphrase: String,
 }
 
-async fn handle_relay_send(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-    Json(body): Json<RelaySendBody>,
-) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
+/// A failure from an operation shared by the direct (session) route and the
+/// approved (MCP) path. `message` never contains a secret, relay code or
+/// passphrase.
+pub(crate) struct CoreError {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CoreError {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: String) -> CoreError {
+        CoreError { status, code, message }
     }
 
+    fn internal(message: impl Into<String>) -> CoreError {
+        CoreError::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message.into())
+    }
+}
+
+impl IntoResponse for CoreError {
+    fn into_response(self) -> axum::response::Response {
+        err_json(self.status, &self.message, self.code).into_response()
+    }
+}
+
+/// Names of the vault items with the given ids, for approval summaries. Names
+/// are not secret; values never leave `decrypt_all_items`.
+async fn item_names(state: &ApiState, ids: &[i64]) -> Vec<String> {
+    match decrypt_all_items(state).await {
+        Ok(items) => items
+            .into_iter()
+            .filter(|i| ids.contains(&i.id))
+            .map(|i| i.name.or(i.title).unwrap_or_else(|| format!("item #{}", i.id)))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+impl ApiState {
+    /// Uploads the items to the internet relay and returns `(code, passphrase)`.
+    /// The pair is secret: callers hand it to the user, never to an MCP caller.
+    pub(crate) async fn relay_send_core(&self, item_ids: &[i64]) -> Result<(String, String), CoreError> {
+        if item_ids.is_empty() {
+            return Err(CoreError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_ERROR",
+                "item_ids must not be empty".to_string(),
+            ));
+        }
+
+        // Extract everything needed while holding the lock, then release it before
+        // the blocking relay upload.
+        let (supabase_url, anon_key, plain_items) = {
+            let vault = self.vault.lock().await;
+            let k = match vault.key.as_ref() {
+                Some(k) => **k,
+                None => return Err(CoreError::new(StatusCode::FORBIDDEN, "VAULT_LOCKED", "vault locked".to_string())),
+            };
+
+            let supabase_url = match vault.db.get_setting("relay_supabase_url").await {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    return Err(CoreError::new(
+                        StatusCode::BAD_REQUEST,
+                        "NOT_CONFIGURED",
+                        "relay not configured: set relay_supabase_url in Settings".to_string(),
+                    ))
+                }
+                Err(e) => return Err(CoreError::internal(e)),
+            };
+
+            let anon_key = match vault.db.get_setting("relay_supabase_anon_key").await {
+                Ok(Some(k)) => k,
+                Ok(None) => {
+                    return Err(CoreError::new(
+                        StatusCode::BAD_REQUEST,
+                        "NOT_CONFIGURED",
+                        "relay not configured: set relay_supabase_anon_key in Settings".to_string(),
+                    ))
+                }
+                Err(e) => return Err(CoreError::internal(e)),
+            };
+
+            let raw = vault.db.list_items().await.map_err(CoreError::internal)?;
+
+            let mut items: Vec<PlainItem> = Vec::new();
+            for (id, _, data, _, _) in &raw {
+                if !item_ids.contains(id) {
+                    continue;
+                }
+                let json = match crypto::decrypt(&k, data) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                let item: VaultItem = match serde_json::from_slice(&json) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                items.push(PlainItem {
+                    item_type: item.item_type,
+                    name: item.name.unwrap_or_default(),
+                    value: item.value,
+                    username: item.username,
+                    password: item.password,
+                    url: item.url,
+                    notes: item.notes,
+                    category: item.categories.and_then(|v| v.into_iter().next()),
+                    command: item.command,
+                });
+            }
+
+            (supabase_url, anon_key, items)
+        };
+
+        let code = relay::generate_share_code();
+        let passphrase = crate::share::crypto::generate_passphrase();
+
+        let relay_key = relay::derive_relay_key_async(&code, &passphrase)
+            .await
+            .map_err(|e| CoreError::internal(e.to_string()))?;
+        let payload = relay::encrypt_items(&plain_items, &relay_key).map_err(|e| CoreError::internal(e.to_string()))?;
+
+        let code_clone = code.clone();
+        let upload_result = tokio::task::spawn_blocking(move || {
+            relay::relay_upload(&supabase_url, &anon_key, &code_clone, &payload)
+        })
+        .await;
+
+        match upload_result {
+            Ok(Ok(())) => Ok((code, passphrase)),
+            Ok(Err(e)) => Err(CoreError::new(
+                StatusCode::BAD_GATEWAY,
+                "RELAY_ERROR",
+                format!("relay upload failed: {e}"),
+            )),
+            Err(e) => Err(CoreError::internal(format!("task error: {e}"))),
+        }
+    }
+
+    /// Writes the encrypted share package and returns its passphrase (secret:
+    /// for the user only).
+    pub(crate) async fn share_export_core(&self, items: &[i64], output_path: &str) -> Result<String, CoreError> {
+        if items.is_empty() {
+            return Err(CoreError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_ERROR",
+                "items list must not be empty".to_string(),
+            ));
+        }
+        let path = std::path::PathBuf::from(output_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::internal(format!("cannot create output directory: {e}")))?;
+        }
+        crate::share::export_package(items, &path, &self.vault)
+            .await
+            .map_err(|e| CoreError::internal(e.to_string()))
+    }
+}
+
+async fn handle_relay_send(
+    State(state): State<Arc<ApiState>>,
+    AuthedPrincipal(principal): AuthedPrincipal,
+    Json(body): Json<RelaySendBody>,
+) -> impl IntoResponse {
     if body.item_ids.is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2756,141 +2728,31 @@ async fn handle_relay_send(
         .into_response();
     }
 
-    // Extract everything needed while holding the lock, then release it before
-    // the blocking relay upload.
-    let (_vault_key, supabase_url, anon_key, plain_items) = {
-        let vault = state.vault.lock().await;
-        let k = match vault.key.as_ref() {
-            Some(k) => **k,
-            None => {
-                return err_json(StatusCode::FORBIDDEN, "vault locked", "VAULT_LOCKED")
-                    .into_response()
-            }
+    // The MCP principal never gets the code/passphrase: the request waits for
+    // the user's approval in the desktop app, which shows them.
+    if principal == Principal::Mcp {
+        let names = item_names(&state, &body.item_ids).await;
+        let summary = approvals::ApprovalSummary {
+            operation: format!("Send {} item(s) through the internet relay", body.item_ids.len()),
+            kind: approvals::ApprovalKind::RelaySend,
+            item_count: body.item_ids.len(),
+            items: names,
+            details: vec!["You will see the relay code and passphrase here after approving.".to_string()],
+            destination: Some("internet relay".to_string()),
+            requested_by: "mcp",
         };
-
-        let supabase_url = match vault.db.get_setting("relay_supabase_url").await {
-            Ok(Some(u)) => u,
-            Ok(None) => {
-                return err_json(
-                    StatusCode::BAD_REQUEST,
-                    "relay not configured: set relay_supabase_url in Settings",
-                    "NOT_CONFIGURED",
-                )
-                .into_response()
-            }
-            Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
-                    .into_response()
-            }
-        };
-
-        let anon_key = match vault.db.get_setting("relay_supabase_anon_key").await {
-            Ok(Some(k)) => k,
-            Ok(None) => {
-                return err_json(
-                    StatusCode::BAD_REQUEST,
-                    "relay not configured: set relay_supabase_anon_key in Settings",
-                    "NOT_CONFIGURED",
-                )
-                .into_response()
-            }
-            Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
-                    .into_response()
-            }
-        };
-
-        let raw = match vault.db.list_items().await {
-            Ok(r) => r,
-            Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e, "INTERNAL_ERROR")
-                    .into_response()
-            }
-        };
-
-        let mut items: Vec<PlainItem> = Vec::new();
-        for (id, _, data, _, _) in &raw {
-            if !body.item_ids.contains(id) {
-                continue;
-            }
-            let json = match crypto::decrypt(&k, data) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            let item: VaultItem = match serde_json::from_slice(&json) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-            items.push(PlainItem {
-                item_type: item.item_type,
-                name: item.name.unwrap_or_default(),
-                value: item.value,
-                username: item.username,
-                password: item.password,
-                url: item.url,
-                notes: item.notes,
-                category: item.categories.and_then(|v| v.into_iter().next()),
-                command: item.command,
-            });
-        }
-
-        (k, supabase_url, anon_key, items)
-    };
-
-    let code = relay::generate_share_code();
-    let passphrase = crate::share::crypto::generate_passphrase();
-
-    let relay_key = match relay::derive_relay_key(&code, &passphrase) {
-        Ok(k) => k,
-        Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-                "INTERNAL_ERROR",
-            )
-            .into_response()
-        }
-    };
-
-    let payload = match relay::encrypt_items(&plain_items, &relay_key) {
-        Ok(p) => p,
-        Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-                "INTERNAL_ERROR",
-            )
-            .into_response()
-        }
-    };
-
-    let code_clone = code.clone();
-    let upload_result = tokio::task::spawn_blocking(move || {
-        relay::relay_upload(&supabase_url, &anon_key, &code_clone, &payload)
-    })
-    .await;
-
-    match upload_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return err_json(
-                StatusCode::BAD_GATEWAY,
-                &format!("relay upload failed: {e}"),
-                "RELAY_ERROR",
-            )
-            .into_response()
-        }
-        Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("task error: {e}"),
-                "INTERNAL_ERROR",
-            )
-            .into_response()
-        }
+        return approvals::respond_pending(
+            &state,
+            summary,
+            approvals::ApprovalPayload::RelaySend { item_ids: body.item_ids },
+        )
+        .await;
     }
 
-    (StatusCode::OK, Json(RelaySendResponse { code, passphrase })).into_response()
+    match state.relay_send_core(&body.item_ids).await {
+        Ok((code, passphrase)) => (StatusCode::OK, Json(RelaySendResponse { code, passphrase })).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2910,19 +2772,10 @@ struct RelayReceiveResponse {
 
 async fn handle_relay_receive(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Query(scope): Query<EnvScopeQuery>,
     Json(body): Json<RelayReceiveBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.code.is_empty() || body.passphrase.is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2949,7 +2802,7 @@ async fn handle_relay_receive(
     };
 
     // Derive relay key before spawning blocking tasks (no I/O needed)
-    let relay_key = match relay::derive_relay_key(&body.code, &body.passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(
@@ -3012,7 +2865,7 @@ async fn handle_relay_receive(
     let key_clone = anon_key.clone();
     let code_clone = body.code.clone();
     let download_result = tokio::task::spawn_blocking(move || {
-        relay::relay_download(&url_clone, &key_clone, &code_clone)
+        relay::relay_claim(&url_clone, &key_clone, &code_clone)
     })
     .await;
 
@@ -3047,15 +2900,6 @@ async fn handle_relay_receive(
             .into_response()
         }
     };
-
-    // Delete after first use (burn-after-read, best-effort)
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = body.code.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)
-    })
-    .await;
 
     // Import items into the vault, owned by and linked into the resolved
     // project/environment — reuses the exact same helper LAN share and
@@ -3112,19 +2956,10 @@ struct ProjectRelaySendResponse {
 /// here; this endpoint shares exactly what it's asked to.
 async fn handle_project_relay_send(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Path(id): Path<i64>,
     Json(body): Json<ProjectRelaySendBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.environment_ids.is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3199,7 +3034,7 @@ async fn handle_project_relay_send(
     let code = relay::generate_share_code();
     let passphrase = crate::share::crypto::generate_passphrase();
 
-    let relay_key = match relay::derive_relay_key(&code, &passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&code, &passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
@@ -3273,18 +3108,9 @@ struct ProjectRelayReceiveResponse {
 /// CONFLICT` so the caller can retry with `project_name_override`.
 async fn handle_project_relay_receive(
     State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
+    AuthedPrincipal(_principal): AuthedPrincipal,
     Json(body): Json<ProjectRelayReceiveBody>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &state).await {
-        let (msg, err_code) = match code {
-            StatusCode::UNAUTHORIZED => ("unauthorized", "UNAUTHORIZED"),
-            StatusCode::FORBIDDEN => ("vault locked", "VAULT_LOCKED"),
-            _ => ("internal error", "INTERNAL_ERROR"),
-        };
-        return err_json(code, msg, err_code).into_response();
-    }
-
     if body.code.is_empty() || body.passphrase.is_empty() {
         return err_json(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3294,7 +3120,7 @@ async fn handle_project_relay_receive(
         .into_response();
     }
 
-    let relay_key = match relay::derive_relay_key(&body.code, &body.passphrase) {
+    let relay_key = match relay::derive_relay_key_async(&body.code, &body.passphrase).await {
         Ok(k) => k,
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "INTERNAL_ERROR")
@@ -3348,7 +3174,7 @@ async fn handle_project_relay_receive(
     let key_clone = anon_key.clone();
     let code_clone = body.code.clone();
     let download_result = tokio::task::spawn_blocking(move || {
-        relay::relay_download(&url_clone, &key_clone, &code_clone)
+        relay::relay_claim(&url_clone, &key_clone, &code_clone)
     })
     .await;
     let payload = match download_result {
@@ -3383,15 +3209,6 @@ async fn handle_project_relay_receive(
         }
     };
 
-    // Burn-after-read (best-effort).
-    let url_clone2 = supabase_url.clone();
-    let key_clone2 = anon_key.clone();
-    let code_clone2 = body.code.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        relay::relay_delete(&url_clone2, &key_clone2, &code_clone2)
-    })
-    .await;
-
     let vault = state.vault.lock().await;
     let result = project::relay::receive_project_bundle(&vault.db, &vault_key, bundle, body.project_name_override)
         .await;
@@ -3418,58 +3235,140 @@ async fn handle_project_relay_receive(
 
 // ─── Función pública de arranque ──────────────────────────────────────────────
 
-/// Builds the plain `axum::Router` with all 36 routes plus the `cors_guard`
-/// middleware layer, given an already-constructed `ApiState`. `pub(crate)`
+// ─── Routes and MCP policy ────────────────────────────────────────────────────
+
+/// What the MCP token may do on each authenticated route (`Allow` = as a
+/// session caller, subject to handler-level narrowing such as output-path
+/// confinement; `Deny` = 403 `MCP_FORBIDDEN`; `Approve` = the handler returns
+/// 202 and waits for the user in the desktop app). Every route MUST appear
+/// here: a route without an entry is denied to MCP, and the test
+/// `every_route_has_an_explicit_mcp_policy` fails.
+const MCP_POLICIES: &[(&str, &str, McpPolicy)] = &[
+    ("POST", "/fill", McpPolicy::Allow),
+    ("GET", "/items", McpPolicy::Allow),
+    ("POST", "/items", McpPolicy::Allow),
+    ("GET", "/items/:id", McpPolicy::Allow),
+    ("PUT", "/items/:id", McpPolicy::Allow),
+    ("DELETE", "/items/:id", McpPolicy::Allow),
+    // Reveals a secret value: never to MCP (commands run through POST /exec).
+    ("POST", "/items/:id/reveal", McpPolicy::Deny),
+    ("GET", "/maintenance/orphans", McpPolicy::Deny),
+    ("GET", "/categories", McpPolicy::Allow),
+    ("POST", "/categories", McpPolicy::Allow),
+    ("PUT", "/categories/:id", McpPolicy::Allow),
+    ("DELETE", "/categories/:id", McpPolicy::Allow),
+    ("GET", "/commands", McpPolicy::Allow),
+    ("GET", "/commands/:id", McpPolicy::Allow),
+    ("GET", "/settings", McpPolicy::Allow),
+    // Allow, but `auto_lock_timeout` is refused for MCP inside the handler.
+    ("PUT", "/settings", McpPolicy::Allow),
+    ("POST", "/share/listen", McpPolicy::Allow),
+    ("POST", "/share/connect", McpPolicy::Allow),
+    // Only a human may confirm a pairing fingerprint.
+    ("POST", "/share/confirm", McpPolicy::Deny),
+    ("GET", "/share/status", McpPolicy::Allow),
+    ("DELETE", "/share/session", McpPolicy::Allow),
+    ("POST", "/share/export", McpPolicy::Approve),
+    ("POST", "/share/import", McpPolicy::Allow),
+    ("GET", "/projects", McpPolicy::Allow),
+    // Project/environment structure (including write paths) is the user's.
+    ("POST", "/projects", McpPolicy::Deny),
+    ("DELETE", "/projects/:id", McpPolicy::Deny),
+    ("GET", "/projects/:id/preview-delete", McpPolicy::Deny),
+    ("POST", "/environments", McpPolicy::Deny),
+    ("DELETE", "/environments/:id", McpPolicy::Deny),
+    ("POST", "/environments/:id/inject", McpPolicy::Allow),
+    ("POST", "/environments/:id/example", McpPolicy::Allow),
+    ("POST", "/relay/send", McpPolicy::Approve),
+    ("POST", "/relay/receive", McpPolicy::Allow),
+    ("POST", "/projects/:id/relay/send", McpPolicy::Deny),
+    ("POST", "/projects/relay/receive", McpPolicy::Deny),
+    ("GET", "/approvals/:id", McpPolicy::Allow),
+    ("POST", "/exec", McpPolicy::Allow),
+    ("DELETE", "/exec/:runId", McpPolicy::Allow),
+    ("POST", "/generate-env", McpPolicy::Approve),
+    ("POST", "/mcp-servers", McpPolicy::Approve),
+    ("PUT", "/mcp-servers", McpPolicy::Approve),
+    ("DELETE", "/mcp-servers", McpPolicy::Approve),
+];
+
+fn explicit_mcp_policy(method: &str, path: &str) -> Option<McpPolicy> {
+    MCP_POLICIES.iter().find(|(m, p, _)| *m == method && *p == path).map(|(_, _, pol)| *pol)
+}
+
+type RouteEntry = (&'static str, &'static str, axum::routing::MethodRouter<Arc<ApiState>>);
+
+/// Every authenticated route, as `(method, path, handler)`. `/health` and
+/// `/unlock` are unauthenticated and registered separately.
+fn api_routes() -> Vec<RouteEntry> {
+    vec![
+        ("POST", "/fill", post(handle_fill)),
+        ("GET", "/items", get(handle_list_items)),
+        ("POST", "/items", post(handle_create_item)),
+        ("GET", "/items/:id", get(handle_get_item)),
+        ("PUT", "/items/:id", put(handle_update_item)),
+        ("DELETE", "/items/:id", delete(handle_delete_item)),
+        ("POST", "/items/:id/reveal", post(handle_reveal_item)),
+        ("GET", "/maintenance/orphans", get(handle_list_orphans)),
+        ("GET", "/categories", get(handle_list_categories)),
+        ("POST", "/categories", post(handle_create_category)),
+        ("PUT", "/categories/:id", put(handle_update_category)),
+        ("DELETE", "/categories/:id", delete(handle_delete_category)),
+        ("GET", "/commands", get(handle_list_commands)),
+        ("GET", "/commands/:id", get(handle_get_command)),
+        ("GET", "/settings", get(handle_get_settings)),
+        ("PUT", "/settings", put(handle_put_settings)),
+        ("POST", "/share/listen", post(handle_share_listen)),
+        ("POST", "/share/connect", post(handle_share_connect)),
+        ("POST", "/share/confirm", post(handle_share_confirm)),
+        ("GET", "/share/status", get(handle_share_status)),
+        ("DELETE", "/share/session", delete(handle_share_cancel)),
+        ("POST", "/share/export", post(handle_share_export)),
+        ("POST", "/share/import", post(handle_share_import)),
+        ("GET", "/projects", get(handle_list_projects)),
+        ("POST", "/projects", post(handle_save_project)),
+        ("DELETE", "/projects/:id", delete(handle_delete_project)),
+        ("GET", "/projects/:id/preview-delete", get(handle_preview_delete_project)),
+        ("POST", "/environments", post(handle_save_environment)),
+        ("DELETE", "/environments/:id", delete(handle_delete_environment)),
+        ("POST", "/environments/:id/inject", post(handle_inject_environment)),
+        ("POST", "/environments/:id/example", post(handle_environment_example)),
+        ("POST", "/relay/send", post(handle_relay_send)),
+        ("POST", "/relay/receive", post(handle_relay_receive)),
+        ("POST", "/projects/:id/relay/send", post(handle_project_relay_send)),
+        ("POST", "/projects/relay/receive", post(handle_project_relay_receive)),
+        ("GET", "/approvals/:id", get(approvals::handle_get_approval)),
+        ("POST", "/exec", post(exec_routes::handle_exec)),
+        ("DELETE", "/exec/:runId", delete(exec_routes::handle_cancel_exec)),
+        ("POST", "/generate-env", post(exec_routes::handle_generate_env)),
+        ("POST", "/mcp-servers", post(mcp_servers::handle_add_mcp_server)),
+        ("PUT", "/mcp-servers", put(mcp_servers::handle_update_mcp_server)),
+        ("DELETE", "/mcp-servers", delete(mcp_servers::handle_delete_mcp_server)),
+    ]
+}
+
+/// Builds the plain `axum::Router` with every route plus the `cors_guard`
+/// middleware layer, given an already-constructed `ApiState`. Each
+/// authenticated route carries its [`McpPolicy`] as a request extension, which
+/// the `AuthedPrincipal` extractor reads (missing = `Deny`). `pub(crate)`
 /// (not `pub`): reachable from `api::tests` (a descendant module) and from
 /// `crate::test_support::router` (same crate), but never part of the crate's
 /// external public API — no production caller outside this crate can build a
 /// router or bind it to a socket other than the one fixed inside
 /// `start_server` below.
 pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(handle_health))
-        .route("/unlock", post(handle_unlock))
-        .route("/fill", post(handle_fill))
-        .route("/items", get(handle_list_items))
-        .route("/items", post(handle_create_item))
-        .route("/items/:id", get(handle_get_item))
-        .route("/items/:id", put(handle_update_item))
-        .route("/items/:id", delete(handle_delete_item))
-        .route("/items/:id/reveal", post(handle_reveal_item))
-        .route("/maintenance/orphans", get(handle_list_orphans))
-        .route("/categories", get(handle_list_categories))
-        .route("/categories", post(handle_create_category))
-        .route("/categories/:id", put(handle_update_category))
-        .route("/categories/:id", delete(handle_delete_category))
-        .route("/commands", get(handle_list_commands))
-        .route("/commands/:id", get(handle_get_command))
-        .route("/settings", get(handle_get_settings))
-        .route("/settings", put(handle_put_settings))
-        .route("/share/listen", post(handle_share_listen))
-        .route("/share/connect", post(handle_share_connect))
-        .route("/share/confirm", post(handle_share_confirm))
-        .route("/share/status", get(handle_share_status))
-        .route("/share/session", delete(handle_share_cancel))
-        .route("/share/export", post(handle_share_export))
-        .route("/share/import", post(handle_share_import))
-        .route("/projects", get(handle_list_projects))
-        .route("/projects", post(handle_save_project))
-        .route("/projects/:id", delete(handle_delete_project))
-        .route("/projects/:id/preview-delete", get(handle_preview_delete_project))
-        .route("/environments", post(handle_save_environment))
-        .route("/environments/:id", delete(handle_delete_environment))
-        .route("/environments/:id/inject", post(handle_inject_environment))
-        .route("/environments/:id/example", post(handle_environment_example))
-        .route("/relay/send", post(handle_relay_send))
-        .route("/relay/receive", post(handle_relay_receive))
-        .route("/projects/:id/relay/send", post(handle_project_relay_send))
-        .route("/projects/relay/receive", post(handle_project_relay_receive))
-        .with_state(state)
-        .layer(middleware::from_fn(cors_guard))
+        .route("/unlock", post(handle_unlock));
+    for (method, path, handler) in api_routes() {
+        let policy = explicit_mcp_policy(method, path).unwrap_or(McpPolicy::Deny);
+        router = router.route(path, handler.layer(axum::Extension(policy)));
+    }
+    router.with_state(state).layer(middleware::from_fn(cors_guard))
 }
 
-pub async fn start_server(vault: SharedState, app_data_dir: PathBuf) {
-    let api_state = Arc::new(ApiState::new(vault));
+/// Serves `api_state` on the fixed localhost TLS endpoint.
+pub async fn start_server(api_state: Arc<ApiState>, app_data_dir: PathBuf) {
     let app = build_router(api_state);
 
     const ADDR: &str = "127.0.0.1:47821";

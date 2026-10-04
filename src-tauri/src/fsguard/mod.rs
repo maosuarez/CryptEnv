@@ -12,7 +12,9 @@
 //! to that path should proceed (see #8's `guarded_write`, which composes on
 //! top of this).
 
+use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 /// Why `resolve_within` refused to produce a path. `Display` on this type
@@ -155,14 +157,107 @@ pub fn resolve_within(base_dir: &str, file_name: &str) -> Result<PathBuf, Contai
     // pre-planted symlink from an earlier attack attempt), re-resolve it and
     // re-assert containment. If it does not exist, step 4 already proved
     // the parent directory is real and step 5's join is authoritative.
-    if target.exists() {
-        match fs::canonicalize(&target) {
+    // `symlink_metadata` (not `exists()`) so a dangling symlink, which
+    // `exists()` reports as absent, is still checked and rejected.
+    match fs::symlink_metadata(&target) {
+        Ok(_) => match fs::canonicalize(&target) {
             Ok(resolved) if resolved.starts_with(&real_base) => {}
             _ => return Err(ContainmentError::Escapes),
-        }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(ContainmentError::Escapes),
     }
 
     Ok(target)
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and returns it with
+/// the not-yet-existing components that follow it. A component that exists
+/// only as a dangling symlink is `Escapes`: it cannot be proven to stay put.
+fn canonical_existing_prefix(path: &Path) -> Result<(PathBuf, Vec<OsString>), ContainmentError> {
+    let mut current = path.to_path_buf();
+    let mut remaining: Vec<OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&current) {
+            Ok(real) => {
+                remaining.reverse();
+                return Ok((real, remaining));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(&current).is_ok() {
+                    return Err(ContainmentError::Escapes);
+                }
+                match (current.file_name().map(|n| n.to_os_string()), current.parent()) {
+                    (Some(name), Some(parent)) => {
+                        remaining.push(name);
+                        current = parent.to_path_buf();
+                    }
+                    _ => return Err(ContainmentError::BaseUnusable(e.to_string())),
+                }
+            }
+            Err(e) => return Err(ContainmentError::BaseUnusable(e.to_string())),
+        }
+    }
+}
+
+/// `\\?\C:\x` -> `C:\x`, `\\?\UNC\h\s` -> `\\h\s`: canonicalize returns verbatim
+/// paths on Windows, which should not leak into user-visible output.
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+
+/// Resolves the relative path `rel` under `root` and proves, after following
+/// every existing symlink, that the result is still inside the canonical
+/// root. The deepest existing ancestor of the joined path is canonicalized
+/// and must be under the canonical root; the not-yet-existing tail is
+/// appended as-is. `..`, drive/stream specifiers (`:`), NUL and control
+/// characters, and absolute paths are rejected. Both `/` and `\` separate
+/// components, matching `project::resolve_env_path`. Nothing is created.
+pub fn contain_relative(root: &Path, rel: &str) -> Result<PathBuf, ContainmentError> {
+    if rel.contains('\0') || rel.chars().any(|c| c.is_control()) {
+        return Err(ContainmentError::NulByte);
+    }
+    if Path::new(rel).is_absolute() || rel.starts_with('\\') {
+        return Err(ContainmentError::NotASingleComponent);
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rel.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return Err(ContainmentError::Escapes),
+            p if p.contains(':') => return Err(ContainmentError::TrailingDotOrSpace),
+            p => parts.push(p),
+        }
+    }
+    if parts.is_empty() {
+        return Err(ContainmentError::EmptyName);
+    }
+
+    // The root is vault-owner configured and trusted, but it may not exist
+    // yet (injection creates missing directories), so it is canonicalized
+    // through its own deepest existing ancestor.
+    let (root_real, root_tail) = canonical_existing_prefix(root)?;
+    let mut real_root = root_real;
+    real_root.extend(root_tail);
+
+    let mut joined = real_root.clone();
+    joined.extend(&parts);
+    let (mut real, tail) = canonical_existing_prefix(&joined)?;
+    if !real.starts_with(&real_root) {
+        return Err(ContainmentError::Escapes);
+    }
+    real.extend(tail);
+    Ok(strip_verbatim(real))
 }
 
 #[cfg(test)]
@@ -309,5 +404,56 @@ mod tests {
                 "unexpected outcome for {name}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn contain_relative_accepts_nested_and_not_yet_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(dir.path().join("apps/api")).unwrap();
+        assert_eq!(
+            contain_relative(dir.path(), "apps/api/.env").unwrap(),
+            real.join("apps/api/.env")
+        );
+        // Neither `new` nor `deep` exists yet.
+        assert_eq!(
+            contain_relative(dir.path(), "./new\\deep/.env").unwrap(),
+            real.join("new/deep/.env")
+        );
+    }
+
+    #[test]
+    fn contain_relative_rejects_lexical_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../x/.env", "a/../../x", "/etc/passwd", "C:foo", "a\0b", "", "./"] {
+            assert!(contain_relative(dir.path(), bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contain_relative_rejects_symlinked_directory_escaping_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("config")).unwrap();
+        assert_eq!(
+            contain_relative(root.path(), "config/.env").unwrap_err(),
+            ContainmentError::Escapes
+        );
+        // A symlink that stays inside the root is fine.
+        fs::create_dir(root.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("alias")).unwrap();
+        assert!(contain_relative(root.path(), "alias/.env").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contain_relative_rejects_dangling_symlink_component() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/nonexistent-crypt-env-target", root.path().join("gone")).unwrap();
+        assert_eq!(
+            contain_relative(root.path(), "gone/.env").unwrap_err(),
+            ContainmentError::Escapes
+        );
     }
 }

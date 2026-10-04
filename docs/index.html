@@ -339,6 +339,14 @@
     <h3 id="globals">Global items<a class="anchor" href="#globals">#</a></h3>
     <p>Items marked <strong>global</strong> are reusable across projects (the GUI's Global Secrets view). Discovery surfaces — <code>search</code>, <code>GET /items</code>, <code>GET /commands</code>, the MCP list/search tools — union globals in by default and tag each row as <code>linked</code>, <code>global</code> or <code>global+linked</code>. Materialization surfaces — <code>fill</code>, <code>inject</code>, env example generation, LAN share — only ever use what is <strong>linked</strong>. Linking a global into an environment is always an explicit act.</p>
 
+    <h3 id="backup">Backup &amp; restore<a class="anchor" href="#backup">#</a></h3>
+    <p>Settings &rarr; Backup &amp; Restore writes a <code>.cenvbak</code> file (format v2) containing every item (still as ciphertext), category, project (name, description, template, root path, categories), environment (name, default flag, paths), variable binding and item-ownership link. The organisational metadata is encrypted with your vault key inside the file, so project names, paths and variable keys are not readable without the master password. The MCP token and biometric enrollment are never included.</p>
+    <ul>
+      <li><strong>Replace</strong> needs the vault <em>unlocked</em>, the backup&rsquo;s master password and your <em>current</em> master password. The restore is atomic: a complete replacement database is built and verified next to the live one and only then swapped in; if anything fails, the current vault is left untouched. The previous database is kept as <code>vault.db.pre-restore</code> until the next successful unlock.</li>
+      <li><strong>Merge</strong> needs an unlocked vault and the backup&rsquo;s master password. Items are re-encrypted with the current key; projects and environments that already exist (matched by name) are kept and missing ones are added. It also runs as a single all-or-nothing operation.</li>
+      <li><strong>Older (v1) backups</strong> still restore items and categories. They carried no projects, so non-global items are placed in an auto-created <code>Restored YYYY-MM-DD</code> project and the restore summary says projects were not included. Items added through <em>Import</em> without a target go to an <code>Imported YYYY-MM-DD</code> project. These two projects are never reported as orphans.</li>
+    </ul>
+
     <!-- ===================== 4. CLIENT CONFIG ===================== -->
     <h2 id="client-config"><span class="num">03</span>Client configuration<a class="anchor" href="#client-config">#</a></h2>
     <p>The CLI, TUI and MCP server read these optional environment variables. The defaults work when client and app run on the same machine; overrides exist for split setups such as WSL ↔ Windows.</p>
@@ -354,7 +362,7 @@
 
     <!-- ===================== 5. CLI ===================== -->
     <h2 id="cli"><span class="num">04</span>CLI reference<a class="anchor" href="#cli">#</a></h2>
-    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
+    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. <strong>Locking the vault ends every CLI session</strong> (a locked vault never renews one, and after the next unlock each terminal asks for the password again). Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
     <div class="table-wrap"><table>
       <tr><th>Command</th><th>Purpose</th></tr>
       <tr><td><code>init [NAME] [--path PATH]</code></td><td>Register this directory as a project root and write <code>.crypt-env.yaml</code></td></tr>
@@ -371,13 +379,14 @@
     <div class="note warn"><p><code>memory</code>, <code>list</code>, <code>exec</code>, <code>cmd</code>, <code>project</code>, <code>share</code>, <code>relay</code>, <code>category</code> and <code>set</code> were removed from the CLI (unrecognized subcommand). Sharing, saved commands, categories and project deletion remain in the GUI; use <code>inject</code> instead of <code>set</code>.</p></div>
 
     <h3 id="cli-projects">Project workflow<a class="anchor" href="#cli-projects">#</a></h3>
-    <h4>crypt-env init [NAME] [--path PATH]</h4>
-    <p>Creates the vault project (or links an existing one with that name), records the current directory as its root and writes <code>.crypt-env.yaml</code>. <code>NAME</code> defaults to the folder name. <code>--path</code> sets the default environment's target: a directory (its <code>.env</code>) or a <code>.env*</code> file; default <code>.env</code>. An existing <code>.crypt-env.yaml</code> is never overwritten.</p>
+    <h4>crypt-env init [NAME] [--path PATH] [--yes]</h4>
+    <p>Creates the vault project (or links an existing one with that name), records the current directory as its root and writes <code>.crypt-env.yaml</code>. <code>NAME</code> defaults to the folder name. <code>--path</code> sets the default environment's target: a directory (its <code>.env</code>) or a <code>.env*</code> file; default <code>.env</code>. An existing <code>.crypt-env.yaml</code> is never overwritten. If a project with that name is already bound to another directory, <code>init</code> fails (use <code>config --relink</code>); if it has no root yet, adopting this directory needs the same confirmation as <code>config</code>; with stdin not a terminal pass <code>--yes</code> (the session is still required).</p>
     <div class="code"><span class="label">shell</span><pre><code>cd ~/code/my-service
 crypt-env init                           <span class="c"># project "my-service", default env → .env</span>
 crypt-env init backend-api --path ./app  <span class="c"># default env → app/.env</span></code></pre></div>
-    <h4>crypt-env config</h4>
+    <h4>crypt-env config [--relink] [--yes]</h4>
     <p>Compares the file's modification time with the vault's last change (project or any environment). File newer → the vault is updated (description, categories — created if missing —, environments and their paths, root). Vault newer → the file is regenerated. Vault environments missing from the file are kept (they may hold secrets) and reported.</p>
+    <p><strong>Root binding:</strong> a project with a root belongs to that directory. From any other directory (for example a fresh clone) <code>config</code> and <code>fill</code> fail with <code>project 'X' is bound to &lt;root&gt;, not this directory</code> and change nothing; <code>config --relink</code> is the only way to move it, and always asks for confirmation. <strong>Consent:</strong> a push that changes the root or any environment's target paths prints a diff, needs a live session and a <kbd>y</kbd>/<kbd>N</kbd> answer (default no); with stdin not a terminal pass <code>--yes</code>. Metadata-only changes and brand-new projects need no confirmation.</p>
 
     <h3 id="cli-items">Secrets &amp; env files<a class="anchor" href="#cli-items">#</a></h3>
     <h4>crypt-env add KEY=value | $VARNAME | FILE [--env NAME] [--global]</h4>
@@ -387,7 +396,7 @@ crypt-env add '$DATABASE_URL'
 crypt-env add .env.local --env staging
 crypt-env add "SHARED_AUTH_URL=https://auth.example" --global</code></pre></div>
     <h4>crypt-env fill [--env NAME] 🔒</h4>
-    <p>Writes every environment (or only <code>--env</code>) into its configured paths — the app does the writing, so WSL repos work with a Windows vault — and writes/extends a keys-only <code>.env.example</code> next to each target. A pre-existing file not created by CryptEnv is backed up to <code>&lt;path&gt;.bak</code> first.</p>
+    <p>Writes every environment (or only <code>--env</code>) into its configured paths — the app does the writing, so WSL repos work with a Windows vault — and writes/extends a keys-only <code>.env.example</code> next to each target. A pre-existing file not created by CryptEnv is backed up to <code>&lt;path&gt;.bak</code> first. <code>.env.example</code> goes next to each <code>.env</code> actually written. A symlink target is refused (<code>TARGET_SYMLINK</code>, nothing written) and a relative path may not leave the project root through a symlinked directory.</p>
     <h4>crypt-env sync [--global] [--env NAME] [--example PATH] 🔒</h4>
     <p>Reads <code>.env.example</code> (current directory, then the project root) and creates each key missing from the environment with the value <code>change-me</code>. With <code>--global</code>, keys matching a global secret are linked to it instead and the environment is then written to its <code>.env</code> target(s).</p>
     <h4>crypt-env inject KEY... [--env NAME] [--shell pwsh|bash|zsh|sh] 🔒</h4>
@@ -421,13 +430,13 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><kbd>/</kbd></td><td>Filter variables (<kbd>Esc</kbd> clears)</td></tr>
       <tr><td><kbd>v</kbd></td><td>Reveal value — asks for the master password unless the terminal has a live session; wiped from memory when the popup closes</td></tr>
       <tr><td><kbd>i</kbd></td><td><code>init</code> the current directory</td></tr>
-      <tr><td><kbd>c</kbd></td><td><code>config</code> sync</td></tr>
+      <tr><td><kbd>c</kbd></td><td><code>config</code> sync (a path change opens a confirmation modal)</td></tr>
       <tr><td><kbd>f</kbd></td><td><code>fill</code> (session or master password)</td></tr>
       <tr><td><kbd>s</kbd> / <kbd>S</kbd></td><td><code>sync</code> / <code>sync --global</code> (session or master password)</td></tr>
       <tr><td><kbd>d</kbd></td><td><code>doctor</code></td></tr>
       <tr><td><kbd>r</kbd></td><td>Reload</td></tr>
       <tr><td><kbd>?</kbd></td><td>Help</td></tr>
-      <tr><td><kbd>q</kbd></td><td>Quit</td></tr>
+      <tr><td><kbd>q</kbd> / <kbd>Ctrl</kbd>+<kbd>C</kbd></td><td>Quit (Ctrl+C works in every state, including password prompts)</td></tr>
     </table></div>
 
     <!-- ===================== 7. MCP ===================== -->
@@ -456,7 +465,8 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><th>Tool</th><th>What it does</th></tr>
       <tr><td colspan="2"><strong>Diagnostics &amp; settings</strong></td></tr>
       <tr><td><code>crypt_env_doctor</code></td><td>App status, lock state, token configuration</td></tr>
-      <tr><td><code>crypt_env_update_settings</code></td><td>Change <code>auto_lock_timeout</code> or <code>hotkey</code></td></tr>
+      <tr><td><code>crypt_env_update_settings</code></td><td>Change the <code>hotkey</code>. Auto-lock and other security settings are the user's only (<code>403 MCP_FORBIDDEN</code>)</td></tr>
+      <tr><td><code>crypt_env_approval_status</code></td><td>Poll a request waiting for the user's approval (<code>pending</code> / <code>approved</code> / <code>denied</code> / <code>expired</code>); non-secret metadata only</td></tr>
       <tr><td colspan="2"><strong>Items</strong> (metadata only)</td></tr>
       <tr><td><code>crypt_env_list_items</code></td><td>List items in scope; filter by <code>type</code>, <code>category</code></td></tr>
       <tr><td><code>crypt_env_search_items</code></td><td>Search by name in scope</td></tr>
@@ -466,9 +476,9 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><code>crypt_env_delete_item</code></td><td>Delete by <code>id</code></td></tr>
       <tr><td><code>crypt_env_import_env_file</code></td><td>Import a <code>.env</code> from disk into the environment</td></tr>
       <tr><td colspan="2"><strong>Materialize secrets</strong> (values never in the response)</td></tr>
-      <tr><td><code>crypt_env_fill_env</code></td><td>Fill a template; write to <code>output_path</code> / <code>output_dir</code></td></tr>
-      <tr><td><code>crypt_env_generate_env</code></td><td>Write a temp <code>.env</code> for the given keys; returns its path</td></tr>
-      <tr><td><code>crypt_env_inject_env</code></td><td>Set one secret as an env var in the MCP process</td></tr>
+      <tr><td><code>crypt_env_fill_env</code></td><td>Fill a template; write to <code>output_path</code> / <code>output_dir</code> inside a project root (never returned inline)</td></tr>
+      <tr><td><code>crypt_env_generate_env</code></td><td><strong>Needs your approval.</strong> Writes a private (<code>0600</code>) <code>.env</code> for the given keys; you get its path after approving. Deleted after 10 minutes, on lock and on exit</td></tr>
+      <tr><td><code>crypt_env_inject_env</code></td><td>Select a secret to inject into later <code>crypt_env_run_command</code> calls. Records only the key name; the MCP process never holds the value</td></tr>
       <tr><td><code>crypt_env_inject_environment</code></td><td>Write an environment to its configured paths (+ optional output)</td></tr>
       <tr><td><code>crypt_env_inject_env_by_name</code></td><td>Same, resolved by <code>project_path</code> + environment name</td></tr>
       <tr><td><code>crypt_env_generate_example_env</code></td><td>Placeholder-only <code>KEY=</code> file, safe to commit</td></tr>
@@ -477,17 +487,29 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><code>crypt_env_list_environments_by_name</code></td><td>Environments grouped by name across projects</td></tr>
       <tr><td colspan="2"><strong>Commands</strong></td></tr>
       <tr><td><code>crypt_env_list_commands</code></td><td>Saved commands and their placeholders</td></tr>
-      <tr><td><code>crypt_env_run_command</code></td><td>Run a saved command with <code>params</code>; returns exit code, stdout, stderr (truncated)</td></tr>
+      <tr><td><code>crypt_env_run_command</code></td><td>Run a saved command <em>inside the app</em> with <code>params</code>; returns exit code, stdout, stderr (redacted, 2000 characters each). See <a href="#mcp-safeguards">MCP safeguards</a></td></tr>
       <tr><td colspan="2"><strong>Categories</strong></td></tr>
       <tr><td><code>crypt_env_list_categories</code> · <code>_create_category</code> · <code>_update_category</code> · <code>_delete_category</code></td><td>Category CRUD</td></tr>
       <tr><td colspan="2"><strong>Sharing</strong></td></tr>
-      <tr><td><code>crypt_env_share_listen</code> · <code>_share_connect</code> · <code>_share_confirm</code> · <code>_share_status</code> · <code>_share_cancel</code></td><td>LAN bridge session</td></tr>
-      <tr><td><code>crypt_env_share_export</code> · <code>_share_import</code></td><td>Encrypted <code>.vault</code> package</td></tr>
-      <tr><td><code>crypt_env_relay_send</code> · <code>_relay_receive</code></td><td>Internet relay (per item)</td></tr>
+      <tr><td><code>crypt_env_share_listen</code> · <code>_share_connect</code> · <code>_share_status</code> · <code>_share_cancel</code></td><td>LAN bridge session. The fingerprint is confirmed by you in the app; there is no MCP confirm tool</td></tr>
+      <tr><td><code>crypt_env_share_export</code> · <code>_share_import</code></td><td>Encrypted <code>.vault</code> package. Export <strong>needs your approval</strong>; the passphrase is shown only to you</td></tr>
+      <tr><td><code>crypt_env_relay_send</code> · <code>_relay_receive</code></td><td>Internet relay (per item). Send <strong>needs your approval</strong>; the code and passphrase are shown only to you</td></tr>
       <tr><td colspan="2"><strong>MCP config management</strong></td></tr>
-      <tr><td><code>crypt_env_list_mcp_servers</code> · <code>_add_mcp_server</code> · <code>_update_mcp_server</code> · <code>_delete_mcp_server</code></td><td>Edit Claude MCP config entries. <code>env</code> values are stored as empty placeholders, never real secrets</td></tr>
+      <tr><td><code>crypt_env_list_mcp_servers</code> · <code>_add_mcp_server</code> · <code>_update_mcp_server</code> · <code>_delete_mcp_server</code></td><td>Edit Claude MCP config entries. <strong>Add / update / delete need your approval</strong> and are written by the app; <code>env</code> values are stored as empty placeholders, never real secrets</td></tr>
     </table></div>
-    <div class="note warn"><p><code>crypt_env_add_item</code> with a <code>value</code> passes that plaintext through the model's tool call, and <code>crypt_env_fill_env</code> without an output target returns filled content inline. Prefer adding secrets through the GUI or CLI, and always give fill an output path.</p></div>
+    <div class="note warn"><p><code>crypt_env_add_item</code> with a <code>value</code> passes that plaintext through the model's tool call. Prefer adding secrets through the GUI or CLI. <code>crypt_env_fill_env</code> and the inject / example tools may only write inside a registered project root.</p></div>
+
+    <h3 id="mcp-safeguards">MCP safeguards<a class="anchor" href="#mcp-safeguards">#</a></h3>
+    <p>The MCP token never reads secret values. The server tells the MCP token apart from your own session and enforces this on every route.</p>
+    <ul>
+      <li><strong>Reserved for you (<code>403 MCP_FORBIDDEN</code>):</strong> revealing a value, confirming a LAN pairing fingerprint, changing <code>auto_lock_timeout</code>, writing files outside a project's root, overwriting a file CryptEnv does not manage, returning filled content inline, and project/environment structure changes.</li>
+      <li><strong>Needs your approval:</strong> <code>relay_send</code>, <code>share_export</code>, <code>generate_env</code> and <code>add/update/delete_mcp_server</code>. The app shows a modal naming the operation, the items and the destination (Deny is focused by default) and brings the window forward. The agent gets <code>pending_approval</code> and an <code>approvalId</code> and polls <code>crypt_env_approval_status</code>. A request expires after 120&nbsp;s, at most 8 are pending (<code>429 APPROVALS_FULL</code>), and locking the vault discards them. The relay code, passphrase and export passphrase are shown <em>only</em> in the app, never returned to the agent.</li>
+      <li><strong><code>crypt_env_run_command</code> runs inside the app:</strong> the child starts from an empty environment (a fixed baseline such as <code>PATH</code>, <code>HOME</code>, <code>SystemRoot</code>, <code>TEMP</code>, <code>LANG</code>, plus the keys you selected with <code>crypt_env_inject_env</code>); stdin is empty; every <code>{{param}}</code> value must match <code>[A-Za-z0-9._/:@=+,-]{0,256}</code> (no spaces or shell metacharacters, otherwise nothing runs); injected values and their base64 and hex forms are replaced by <code>[REDACTED:KEY]</code> in the output; each stream is capped at 64&nbsp;KiB captured and 2000 characters returned; the whole process tree is killed after 120&nbsp;s, on vault lock, or when the MCP session ends (Unix process group, Windows Job Object). At most 4 commands run at once (<code>429 EXEC_BUSY</code> beyond a queue of 8). Values shorter than 4 characters are not redacted, and a command that transforms a secret (for example <code>rev</code>) before printing it can defeat redaction.</li>
+      <li><strong>WSL:</strong> when the MCP client runs in WSL and the app on Windows, the app runs the command in the client's distribution with <code>wsl.exe -d &lt;distro&gt; --cd &lt;dir&gt; --exec</code>. Secrets travel over stdin, never on the command line or in <code>WSLENV</code>.</li>
+      <li><strong>Generated files:</strong> <code>crypt_env_generate_env</code> writes to a private directory inside the app data folder (mode <code>0700</code>, files <code>0600</code>), not to the shared temp directory. They are deleted after 10 minutes, when the vault locks and at app exit; leftovers are swept at startup.</li>
+      <li><strong>MCP host config:</strong> the app, not the MCP process, writes <code>claude_desktop_config.json</code> and <code>.claude/mcp_servers.json</code>, so the approval cannot be bypassed. With WSL, the global config written is the one on the app's side (Windows).</li>
+    </ul>
+    <div class="note warn"><p><strong>Breaking for agents.</strong> <code>relay_send</code>, <code>share_export</code>, <code>generate_env</code> and the MCP-server tools now return <code>pending_approval</code> instead of a result; <code>crypt_env_share_confirm</code> and <code>auto_lock_timeout</code> in <code>update_settings</code> are gone; <code>run_command</code> rejects parameters with spaces or shell metacharacters; <code>crypt_env_inject_env</code> no longer sets the MCP process environment.</p></div>
     <p>Whole-project relay sharing has no MCP tool on purpose: it needs the sender's explicit consent in the GUI or CLI.</p>
 
     <!-- ===================== 8. API ===================== -->
@@ -498,30 +520,37 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
     <ul>
       <li><strong>TLS:</strong> a self-signed certificate is generated on first launch at <code>&lt;app data&gt;/com.maosuarez.cryptenv/tls/cert.pem</code>. Pass <code>--cacert</code> with that file (or <code>-k</code> for quick tests).</li>
       <li><strong>Token:</strong> send <code>X-Vault-Token</code> with either a session token from <code>POST /unlock</code> (expires) or the static MCP token from Settings.</li>
+      <li>The static MCP token is a separate principal: every route is allowed, denied (<code>403 MCP_FORBIDDEN</code>) or approval-gated for it (see <a href="#mcp-safeguards">MCP safeguards</a>). Unclassified routes are denied.</li>
       <li>Tokens are compared in constant time. <code>/unlock</code> is rate-limited to 5 attempts per 60 s (<code>429 RATE_LIMITED</code> with <code>Retry-After</code>).</li>
     </ul>
 
     <h3 id="api-endpoints">Endpoints<a class="anchor" href="#api-endpoints">#</a></h3>
-    <p><strong>Scoped</strong> endpoints need <code>?environment_id=ID</code> or <code>?project=NAME&amp;environment=NAME</code> (case-insensitive); otherwise they return <code>422 VALIDATION_ERROR</code>. Scope is a display filter, not an access boundary: any valid token can reach an item by id.</p>
+    <p><strong>Scoped</strong> endpoints need <code>?environment_id=ID</code> or <code>?project=NAME&amp;environment=NAME</code> (case-insensitive); otherwise they return <code>422 VALIDATION_ERROR</code>. Scope is a display filter, not an access boundary: any valid token can reach an item by id (but only session tokens can reveal its value).</p>
     <div class="table-wrap"><table>
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td colspan="3"><strong>System</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/health</code></td><td>No auth. <code>version</code>, <code>status</code>, <code>vault_locked</code>, <code>mcp_token_configured</code></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request. Locking the vault invalidates all sessions: requests get <code>403</code> while locked and <code>401</code> with a pre-lock token after the next unlock</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code></td></tr>
-      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings</td></tr>
+      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings (the MCP token may only set <code>hotkey</code>)</td></tr>
       <tr><td colspan="3"><strong>Items</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/items</code></td><td>Scoped. Redacted list; <code>type</code>, <code>category</code>, <code>search</code>, <code>include_global</code>. Rows carry <code>isGlobal</code> and <code>linked</code></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/items</code></td><td>Scoped. Create + link under <code>key</code> (defaults to <code>name</code>). <code>?on_conflict=update|replace|error</code></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/items/:id</code></td><td>Item metadata (redacted)</td></tr>
       <tr><td><span class="m put">PUT</span></td><td><code>/items/:id</code></td><td>Merge update; send <code>type</code> with every update</td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/items/:id</code></td><td>Delete (204)</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/items/:id/reveal</code></td><td>Plaintext value; body must be <code>{"confirm": true}</code></td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/items/:id/reveal</code></td><td>Plaintext value; body must be <code>{"confirm": true}</code>. Session tokens only: the MCP token gets <code>403 MCP_FORBIDDEN</code></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/maintenance/orphans</code></td><td>Read-only list of unlinked, non-global items (pruning is GUI-only)</td></tr>
       <tr><td colspan="3"><strong>Env files</strong></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/fill</code></td><td>Scoped. <code>{template, output_path?, output_dir?, overwrite?}</code>; inline content if no output</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/fill</code></td><td>Scoped. <code>{template, output_path?, output_dir?, overwrite?}</code>; inline content if no output (session tokens only: the MCP token must write inside a project root)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/inject</code></td><td>Write to configured paths (+ <code>output_path</code> / <code>output_dir</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/example</code></td><td>Placeholder-only <code>KEY=</code> output; never decrypts</td></tr>
+      <tr><td colspan="3"><strong>Command execution &amp; MCP approvals</strong></td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/exec</code></td><td>Scoped. <code>{commandId, params?, injectKeys?, cwd?, clientContext?, runId?}</code> runs a stored command in the app with the given secrets in its environment and returns <code>{runId, exitCode, timedOut, cancelled, stdout, stderr, stdoutTruncated, stderrTruncated}</code>, redacted. <code>422</code> for an invalid parameter or key, <code>429 EXEC_BUSY</code> when saturated</td></tr>
+      <tr><td><span class="m del">DELETE</span></td><td><code>/exec/:runId</code></td><td>Kill a running command's process tree</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/generate-env</code></td><td><code>{keys, environment_id | project + environment}</code>. Session: writes a private <code>0600</code> file and returns <code>{path, count, expiresInSeconds}</code>. MCP token: <code>202</code> + <code>approvalId</code></td></tr>
+      <tr><td><span class="m post">POST</span> <span class="m put">PUT</span> <span class="m del">DELETE</span></td><td><code>/mcp-servers</code></td><td>Add / update (JSON body) / delete (<code>?name=&amp;scope=&amp;cwd=</code>) an entry in the Claude MCP config (<code>scope</code> <code>global</code> or <code>project</code>; <code>project</code> needs an absolute <code>cwd</code>). MCP token: <code>202</code> + <code>approvalId</code></td></tr>
+      <tr><td><span class="m get">GET</span></td><td><code>/approvals/:id</code></td><td>Status (<code>pending</code>, <code>approved</code>, <code>denied</code>, <code>expired</code>), summary and non-secret result metadata. Never contains codes, passphrases or values. Approving or denying is possible only in the desktop app</td></tr>
       <tr><td colspan="3"><strong>Projects &amp; environments</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/projects</code></td><td>Projects with nested environments and <code>rootPath</code> (when set)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects</code></td><td>Create (<code>id: 0</code>) or update; <code>409</code> on duplicate name. <code>rootPath</code>: omitted keeps, <code>""</code> clears, otherwise an absolute directory</td></tr>
@@ -535,18 +564,54 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><span class="m get">GET</span> <span class="m post">POST</span></td><td><code>/categories</code></td><td>List / create (<code>name</code>, <code>color</code>, <code>description?</code>)</td></tr>
       <tr><td><span class="m put">PUT</span> <span class="m del">DELETE</span></td><td><code>/categories/:id</code></td><td>Update / delete</td></tr>
       <tr><td colspan="3"><strong>Sharing</strong></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/listen</code></td><td>Scoped. Start LAN send; returns <code>pairing_code</code></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/connect</code></td><td>Scoped. Join as receiver; returns fingerprint</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/confirm</code></td><td>Accept or reject the fingerprint (both sides)</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/listen</code></td><td>Scoped. Start LAN send; returns <code>pairing_code</code>. 409 <code>SESSION_ACTIVE</code> if a share session is already active (cancel it first)</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/connect</code></td><td>Scoped. Join as receiver; returns the 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>). 409 <code>SESSION_ACTIVE</code> if a session is already active</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/confirm</code></td><td>Accept or reject the fingerprint (both sides). Session tokens only</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/share/status</code></td><td>State, fingerprint, <code>received_names</code>, <code>skipped_keys</code></td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/share/session</code></td><td>Cancel the session</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/export</code></td><td>Encrypted <code>.vault</code> package + passphrase</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/export</code></td><td>Encrypted <code>.vault</code> package + passphrase. With the MCP token: <code>202</code> + <code>approvalId</code>, the passphrase is shown only in the app</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/import</code></td><td>Scoped. Import a package</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/relay/send</code></td><td>Upload items to the relay; returns code + passphrase</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/relay/receive</code></td><td>Scoped. Download, decrypt, import; burns the payload</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/relay/send</code></td><td>Upload items to the relay; returns code + passphrase. With the MCP token: <code>202</code> + <code>approvalId</code>, code and passphrase are shown only in the app</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/relay/receive</code></td><td>Scoped. Claim (single use), decrypt, import</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/:id/relay/send</code></td><td>Share a whole project (selected <code>environment_ids</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/relay/receive</code></td><td>Receive a project as new; <code>project_name_override</code> on collision</td></tr>
     </table></div>
+
+    <h3 id="api-relay">Internet relay (Supabase SQL v2)<a class="anchor" href="#api-relay">#</a></h3>
+    <p>The relay is your own Supabase project. Single use and the 24-hour expiry are enforced <strong>by the database</strong>, not by the client: the table has no access for the <code>anon</code> key, and every operation goes through two <code>SECURITY DEFINER</code> functions. A package can be claimed once (the claim deletes it), expired packages are never returned and are purged on every relay call, and only a hash of the code is stored. Payloads are capped at 1&nbsp;MiB and stay encrypted client-side.</p>
+    <div class="note warn"><p><strong>Breaking change.</strong> Earlier versions used a permissive <code>relay_packages</code> table that did not enforce either guarantee. Send and receive now fail with <code>RELAY_SCHEMA_OUTDATED</code> until you apply the SQL below. In-flight shares on the old table are not migrated: re-share after upgrading.</p></div>
+    <ol>
+      <li>Open <strong>Settings → Internet Sharing → Custom relay → Setup SQL</strong> (or copy the block below) and run it in the Supabase <strong>SQL Editor</strong>.</li>
+      <li>Click <strong>Check schema</strong> in the same panel; it reports whether v2 is detected.</li>
+      <li>Optional cleanup of the old table: <code>drop table relay_packages;</code></li>
+    </ol>
+    <div class="code"><span class="label">sql</span><pre><code>create table if not exists relay_packages_v2 (
+  code_hash  text primary key,
+  payload    text not null check (octet_length(payload) &lt;= 1048576),
+  expires_at timestamptz not null default now() + interval &#x27;24 hours&#x27;
+);
+alter table relay_packages_v2 enable row level security;
+revoke all on relay_packages_v2 from anon, authenticated;
+
+create or replace function relay_put(p_code_hash text, p_payload text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from relay_packages_v2 where expires_at &lt; now();
+  insert into relay_packages_v2(code_hash, payload) values (p_code_hash, p_payload);
+end $$;
+
+create or replace function relay_claim(p_code_hash text) returns text
+language plpgsql security definer set search_path = public as $$
+declare v text;
+begin
+  delete from relay_packages_v2 where expires_at &lt; now();
+  delete from relay_packages_v2 where code_hash = p_code_hash returning payload into v;
+  return v;
+end $$;
+
+create or replace function relay_schema_version() returns int language sql as $$ select 2 $$;
+grant execute on function relay_put(text,text), relay_claim(text), relay_schema_version() to anon;</code></pre></div>
+    <p>Notes: whoever guesses a live code can claim it first, which burns the package (it is still encrypted with the passphrase); the receiver sees "code not found or already used" and the sender re-shares. A wrong passphrase also consumes the package. All relay calls time out after 10&nbsp;s to connect and 30&nbsp;s total, and at most two Argon2id derivations run at once.</p>
 
     <h3 id="api-writes">Write-target gating<a class="anchor" href="#api-writes">#</a></h3>
     <p>Files written by <code>/fill</code>, <code>/environments/:id/inject</code> and <code>/environments/:id/example</code> start with a marker line:</p>
@@ -556,6 +621,18 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <li>With <code>overwrite: true</code> the old content is copied to <code>&lt;path&gt;.bak</code> first (<code>409 BACKUP_EXISTS</code> if a backup is already there).</li>
       <li>Paths configured on the environment itself are always written through, with the same backup, and reported in <code>unmanagedPaths</code>. Relative configured paths resolve against the project's <code>rootPath</code> and may not leave it; a relative path on a project without a root is an error.</li>
       <li>Names derived from <code>output_dir</code> are contained to that directory (<code>422 PATH_NOT_CONTAINED</code> otherwise).</li>
+      <li>A target whose final component is a symlink (or Windows reparse point) is refused with <code>409 TARGET_SYMLINK</code>; nothing is written and no <code>.bak</code> is made.</li>
+      <li>A target that exists but is not a regular file (device, FIFO, socket, directory) is refused with <code>409 NOT_REGULAR_FILE</code> without being read. An existing target is read for classification up to 1&nbsp;MiB; a larger file counts as foreign.</li>
+      <li>Writes are atomic: content goes to a <code>.cenv-*</code> temp file in the same directory (mode 0600 on Unix), is flushed, then renamed over the target. A failed write leaves the previous file intact and no temp file behind.</li>
+    </ul>
+    <h3 id="api-dotenv">Value quoting<a class="anchor" href="#api-dotenv">#</a></h3>
+    <p>Each variable is written as one <code>KEY=VALUE</code> line that common dotenv parsers read back exactly:</p>
+    <ul>
+      <li>Values made only of <code>A-Za-z0-9_./:@+,=-</code> are written bare.</li>
+      <li>Other values without a newline, carriage return or <code>'</code> are single-quoted (literal).</li>
+      <li>Everything else (multi-line values such as PEM keys, values containing <code>'</code>) is double-quoted with <code>\\</code>, <code>\"</code>, <code>\$</code>, <code>\n</code> and <code>\r</code> escaped.</li>
+      <li>Keys must match <code>^[A-Za-z_][A-Za-z0-9_.]*$</code>; other keys are not written. Inject also decrypts only the items the environment references. Keys that were not written (undecryptable item or invalid name) are listed by name in <code>failedKeys</code> of the inject response; the other keys are still written. <code>crypt-env fill</code> prints them.</li>
+      <li>Single-quoted and bare values also work with <code>source</code> in bash; double-quoted escapes are understood by python-dotenv and Node <code>dotenv</code>, not by the shell. Node <code>dotenv</code> does not unescape <code>\$</code>.</li>
     </ul>
     <p>Add <code>*.bak</code> to <code>.gitignore</code> wherever CryptEnv writes.</p>
 
@@ -593,7 +670,8 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <div class="card"><h4>Encryption at rest</h4><p>Each item is encrypted with AES-256-GCM using a key derived from your master password with Argon2id. Deletes are zeroed on disk (<code>secure_delete</code>).</p></div>
       <div class="card"><h4>Volatile keys</h4><p>The master password and derived key live in memory only while unlocked and are zeroized on lock. Auto-lock after a configurable timeout.</p></div>
       <div class="card"><h4>Local-only API</h4><p>Loopback binding, TLS, token auth with constant-time comparison, rate-limited unlock.</p></div>
-      <div class="card"><h4>No plaintext leaks</h4><p>Values never appear in logs, errors or list responses. Reveal requires an explicit confirm; the MCP server writes or injects instead of returning.</p></div>
+      <div class="card"><h4>LAN sharing</h4><p>The 6-digit pairing code feeds a SPAKE2 key exchange, so only a peer that knows it can derive the session key; mDNS advertises only a random session id and a protocol version, never anything derived from the code. Both sides prove the key (key confirmation) before any item moves, then compare a 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>) and confirm in the desktop app. Sockets time out after 30 s (handshake 60 s), 3 wrong-code attempts abort the session, only one session runs at a time, and locking the vault or closing the dialog cancels it. <strong>Both devices must run the same version</strong>: v1.0.6 peers are rejected with an &ldquo;update the other device&rdquo; message.</p></div>
+      <div class="card"><h4>No plaintext leaks</h4><p>Values never appear in logs, errors or list responses. Reveal requires an explicit confirm and is refused to the MCP token; commands run inside the app and their output is redacted. Relay codes and passphrases reach only you, through an approval in the app.</p></div>
       <div class="card"><h4>Clipboard hygiene</h4><p>Secrets copied from the desktop app are cleared from the clipboard after 30 seconds and immediately on lock, unless you copied something else meanwhile. On Windows they are excluded from clipboard history (Win+V) and cloud sync. Third-party clipboard managers that ignore these flags may still capture them. Locking also closes any open command, setup or token dialog.</p></div>
     </div>
     <p>Report vulnerabilities privately as described in <a href="https://github.com/maosuarez/CryptEnv/blob/main/SECURITY.md">SECURITY.md</a>.</p>
@@ -606,6 +684,8 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <tr><td>Vault locked / 401</td><td>Unlock in the app, or run any CLI command and enter the master password.</td></tr>
       <tr><td><code>no .crypt-env.yaml found</code></td><td>Run <code>crypt-env init</code> in the project root (or <code>cd</code> into it).</td></tr>
       <tr><td><code>project '…' does not exist in the vault</code></td><td>Run <code>crypt-env config</code> to register it from <code>.crypt-env.yaml</code>.</td></tr>
+      <tr><td><code>project '…' is bound to … not this directory</code></td><td>The project belongs to another checkout. Work there, or run <code>crypt-env config --relink</code> here to move it (asks for confirmation).</td></tr>
+      <tr><td><code>refusing to write through a symlink</code></td><td>The configured <code>.env</code> is a symlink. Point the environment at the real file.</td></tr>
       <tr><td><code>path '…' is relative but the project has no root directory</code></td><td>Set the project root in the GUI project form, or run <code>crypt-env config</code> from the project root.</td></tr>
       <tr><td><code>authentication failed (demasiados intentos…)</code></td><td>Five unlock attempts per minute — wait a minute and retry.</td></tr>
       <tr><td>Prompted on every command from WSL</td><td>Re-run <strong>Settings → WSL Integration → Configure</strong> so the managed <code>crypt-env</code> launcher forwards <code>CRYPTENV_TERMINAL_ID</code>.</td></tr>

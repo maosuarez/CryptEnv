@@ -106,6 +106,9 @@ export interface InjectResult {
   unmanagedPaths: string[];
   /** `.bak` paths created because a write target was unmanaged. */
   backups:        string[];
+  /** Keys NOT written: the referenced item could not be decrypted, or the key
+   *  is not a valid dotenv name. Names only; the other keys were written. */
+  failedKeys:     string[];
 }
 
 /** Result of `environment_inject_preview` — resolves and inspects the
@@ -113,8 +116,10 @@ export interface InjectResult {
  *  so the GUI can show a confirm dialog before an inject that would
  *  overwrite unmanaged files. */
 export interface InjectPreview {
-  paths:   string[];
-  foreign: string[];
+  paths:    string[];
+  foreign:  string[];
+  /** Targets that are symlinks; injection refuses to write through them. */
+  symlinks: string[];
 }
 
 export interface ProjectDeleteImpact {
@@ -189,4 +194,37 @@ export type WslLauncherStatus = 'absent' | 'written' | 'unchanged' | 'deleted' |
 export interface WslError {
   kind:     'unsupported' | 'notAvailable' | 'unknownDistro' | 'tooling';
   message?: string;
+}
+
+/** Non-secret description of an MCP request awaiting the user's approval
+ *  (`approval_list`). Field names mirror the backend's serde output. */
+export interface ApprovalSummary {
+  operation:    string;
+  kind:         string;
+  items:        string[];
+  item_count:   number;
+  details:      string[];
+  destination:  string | null;
+  requested_by: string;
+}
+
+export interface PendingApproval {
+  id:        string;
+  kind:      string;
+  status:    'pending' | 'approved' | 'denied' | 'expired';
+  summary:   ApprovalSummary;
+  /** Seconds left to decide when the list was loaded. */
+  expiresIn: number;
+  meta:      Record<string, unknown>;
+}
+
+/** Result of `approval_resolve`. `secret` is shown to the user only. */
+export interface ApprovalResolution {
+  id:      string;
+  status:  'approved' | 'denied';
+  summary: ApprovalSummary;
+  secret?:
+    | { type: 'relay'; code: string; passphrase: string }
+    | { type: 'export'; path: string; passphrase: string };
+  meta:    Record<string, unknown>;
 }

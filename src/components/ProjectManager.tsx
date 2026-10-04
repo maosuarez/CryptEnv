@@ -1558,6 +1558,9 @@ export function ProjectManager() {
       targets = picked ?? undefined;
     }
     const preview = await previewInject(id, targets);
+    if (preview.symlinks.length > 0) {
+      throw new Error(`Refusing to write through a symlink: ${preview.symlinks.join(', ')}. Point the environment at the real file instead.`);
+    }
     if (preview.foreign.length === 0) return inject(id, false, targets);
     return new Promise<InjectResult>((resolve, reject) => {
       pendingInjectRef.current = { resolve, reject };
@@ -2161,7 +2164,10 @@ export function ProjectManager() {
       if (result.unmanagedPaths.length > 0) {
         msg += t(result.unmanagedPaths.length === 1 ? 'projects.toast.unmanaged_one' : 'projects.toast.unmanaged_other', { n: result.unmanagedPaths.length });
       }
-      showToast(msg);
+      if (result.failedKeys.length > 0) {
+        msg += t('projects.toast.failedKeys', { keys: result.failedKeys.join(', ') });
+      }
+      showToast(msg, result.failedKeys.length > 0 ? 'error' : undefined);
     } catch (e) {
       if (String(e) !== 'Error: cancelled') reportError(e);
     } finally {

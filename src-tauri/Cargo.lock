@@ -1190,9 +1190,9 @@ dependencies = [
  "cpufeatures",
  "curve25519-dalek-derive",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -5488,6 +5488,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6067,6 +6079,7 @@ name = "tauri-crypt-env"
 version = "1.0.6"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "argon2",
  "axum",
  "axum-server",
@@ -6076,8 +6089,8 @@ dependencies = [
  "crossterm 0.28.1",
  "crypt-env-setup",
  "dialoguer",
- "dotenvy",
  "hkdf",
+ "hmac",
  "libc",
  "libsqlite3-sys",
  "mdns-sd",
@@ -6096,6 +6109,7 @@ dependencies = [
  "sha2",
  "shell-escape",
  "shlex",
+ "spake2",
  "sqlx",
  "subtle",
  "tauri",
@@ -6112,7 +6126,6 @@ dependencies = [
  "tower",
  "uuid",
  "windows 0.58.0",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -8210,18 +8223,6 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
-
-[[package]]
-name = "x25519-dalek"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
-dependencies = [
- "curve25519-dalek",
- "rand_core 0.6.4",
- "serde",
- "zeroize",
-]
 
 [[package]]
 name = "xattr"

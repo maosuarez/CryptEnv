@@ -38,9 +38,15 @@ use crate::vault::{SharedState, VaultItem, VaultState};
 pub struct TestVault {
     pub dir: tempfile::TempDir,
     pub state: SharedState,
-    /// Value for the `X-Vault-Token` header — the static `settings['mcp_token']`,
-    /// seeded so tests authenticate immediately without an `/unlock` round-trip.
+    /// Value for the `X-Vault-Token` header — a live *session* token seeded
+    /// straight into `api`, so tests authenticate as the user without an
+    /// `/unlock` round-trip. Use `mcp_token` to act as the MCP principal.
     pub token: String,
+    /// The static `settings['mcp_token']`: authenticates as the MCP principal.
+    pub mcp_token: String,
+    /// The API state every `router(v)` is built on, so seeded sessions,
+    /// approvals and runs are shared across the requests of one test.
+    pub api: Arc<crate::api::ApiState>,
     pub master_password: String,
     /// Project "demo". Zero when built via `unlocked_vault_empty()`.
     pub project_id: i64,
@@ -56,6 +62,7 @@ pub struct TestVault {
 
 const MASTER_PASSWORD: &str = "test-master-password-1";
 const MCP_TOKEN: &str = "test-mcp-token-0123456789abcdef";
+const SESSION_TOKEN: &str = "test-session-token-0123456789ab";
 
 async fn open_db() -> (tempfile::TempDir, VaultDb) {
     let dir = tempfile::tempdir().expect("create tempdir for test vault");
@@ -160,14 +167,21 @@ async fn build(seed_data: bool) -> TestVault {
     let state: SharedState = Arc::new(Mutex::new(VaultState::new(db)));
     {
         let mut s = state.lock().await;
-        s.key = Some(Zeroizing::new(key));
+        s.set_key(Some(Zeroizing::new(key)));
         s.touch();
     }
+
+    let api = Arc::new(crate::api::ApiState::new(state.clone()));
+    api.seed_session(SESSION_TOKEN).await;
+    // Generated MCP files go into the test's own tempdir.
+    state.lock().await.generated.init(dir.path().join("mcp-tmp"));
 
     TestVault {
         dir,
         state,
-        token: MCP_TOKEN.to_string(),
+        token: SESSION_TOKEN.to_string(),
+        mcp_token: MCP_TOKEN.to_string(),
+        api,
         master_password: MASTER_PASSWORD.to_string(),
         project_id,
         env_id,
@@ -197,15 +211,15 @@ pub async fn unlocked_vault_empty() -> TestVault {
 /// the request.
 pub async fn locked_vault() -> TestVault {
     let v = build(true).await;
-    v.state.lock().await.key = None;
+    v.state.lock().await.set_key(None);
     v
 }
 
-/// The plain axum Router with state — no TLS, no socket. Builds `ApiState`
+/// The plain axum Router with state — no TLS, no socket. `v.api` was built
 /// via the same `ApiState::new` that `start_server` uses, so tests and the
 /// real server construct state identically.
 pub fn router(v: &TestVault) -> axum::Router {
-    crate::api::build_router(Arc::new(crate::api::ApiState::new(v.state.clone())))
+    crate::api::build_router(v.api.clone())
 }
 
 /// One request through `ServiceExt::oneshot`. `token: None` omits the

@@ -156,27 +156,71 @@ pub fn pick_environment<'a>(
         .ok_or_else(|| CliError::Config(format!("project '{}' has no environments", project.name)))
 }
 
+/// How a workspace directory relates to a vault project's bound root.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// The project's root is this directory.
+    Bound,
+    /// The project has no root yet.
+    Unbound,
+    /// The project is bound to another directory (carried as stored).
+    Mismatch(String),
+}
+
+/// Canonical form for comparing roots: trailing separators dropped; for
+/// Windows-shaped paths (drive letter or UNC) also `/` -> `\` and lowercase,
+/// because those filesystems are case-insensitive.
+fn root_key(root: &str) -> String {
+    let trimmed = root.trim_end_matches(['/', '\\']);
+    let trimmed = if trimmed.is_empty() { root } else { trimmed };
+    if manifest::is_absolute_any(trimmed) && !trimmed.starts_with('/') {
+        trimmed.replace('/', "\\").to_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Compares the workspace root (as the vault host sees it, via
+/// `paths::to_host`) with the project's bound root.
+pub fn check_root_binding(ws_root: &Path, project: &Project) -> Result<Binding, CliError> {
+    let host = crate::paths::to_host(ws_root);
+    if host.trim().is_empty() {
+        return Err(CliError::Config("cannot determine the workspace directory".into()));
+    }
+    Ok(binding_of(&host, project.root_path.as_deref()))
+}
+
+/// Pure core of [`check_root_binding`], on host-form paths.
+pub fn binding_of(ws_root_host: &str, bound: Option<&str>) -> Binding {
+    match bound.filter(|b| !b.trim().is_empty()) {
+        None => Binding::Unbound,
+        Some(b) if root_key(b) == root_key(ws_root_host) => Binding::Bound,
+        Some(b) => Binding::Mismatch(b.to_string()),
+    }
+}
+
+/// [`check_root_binding`] that turns `Mismatch` into the user-facing error
+/// naming the bound root and `config --relink`.
+pub fn ensure_bound(ws_root: &Path, project: &Project) -> Result<Binding, CliError> {
+    match check_root_binding(ws_root, project)? {
+        Binding::Mismatch(bound) => Err(mismatch_error(&project.name, &bound)),
+        other => Ok(other),
+    }
+}
+
+pub fn mismatch_error(project: &str, bound_root: &str) -> CliError {
+    CliError::Config(format!(
+        "project '{project}' is bound to {bound_root}, not this directory. \
+         Run `crypt-env config --relink` here to move it (this changes where secrets are written)"
+    ))
+}
+
 /// Workspace + vault project + selected environment, in one call.
 pub fn resolve(env_flag: Option<&str>) -> Result<(Workspace, Project, Environment), CliError> {
     let ws = workspace()?;
     let project = vault_project(&ws)?;
     let env = pick_environment(&project, ws.default_env.as_deref(), env_flag)?.clone();
     Ok((ws, project, env))
-}
-
-/// Local filesystem path of a configured environment target: relative paths
-/// are under the workspace root, absolute ones are translated from the host
-/// form (see `paths`).
-pub fn local_target(root: &Path, configured: &str) -> PathBuf {
-    if manifest::is_absolute_any(configured) {
-        PathBuf::from(crate::paths::to_local(configured))
-    } else {
-        let mut p = root.to_path_buf();
-        for part in configured.split(['/', '\\']).filter(|c| !c.is_empty() && *c != ".") {
-            p.push(part);
-        }
-        p
-    }
 }
 
 #[cfg(test)]
@@ -257,9 +301,38 @@ mod tests {
     }
 
     #[test]
-    fn local_target_joins_relative_paths() {
-        let root = Path::new("/r");
-        assert_eq!(local_target(root, "./apps\\api/.env"), PathBuf::from("/r/apps/api/.env"));
-        assert_eq!(local_target(root, "/abs/.env"), PathBuf::from("/abs/.env"));
+    fn binding_bound_unbound_mismatch() {
+        assert_eq!(binding_of("/home/u/app", Some("/home/u/app")), Binding::Bound);
+        assert_eq!(binding_of("/home/u/app", Some("/home/u/app/")), Binding::Bound, "trailing separator");
+        assert_eq!(binding_of("/home/u/app", None), Binding::Unbound);
+        assert_eq!(binding_of("/home/u/app", Some("")), Binding::Unbound);
+        assert_eq!(binding_of("/home/u/app", Some("/home/u/other")), Binding::Mismatch("/home/u/other".into()));
+        assert_eq!(
+            binding_of("/home/u/app", Some("/home/u/App")),
+            Binding::Mismatch("/home/u/App".into()),
+            "unix paths are case-sensitive"
+        );
+    }
+
+    #[test]
+    fn binding_ignores_case_and_separators_for_windows_paths() {
+        assert_eq!(binding_of(r"C:\Users\U\App", Some(r"c:\users\u\app")), Binding::Bound);
+        assert_eq!(binding_of(r"C:\Users\u\app\", Some("C:/Users/u/app")), Binding::Bound);
+        assert_eq!(
+            binding_of(r"\\wsl.localhost\Ubuntu\home\u\app", Some(r"\\WSL.LOCALHOST\ubuntu\home\u\app")),
+            Binding::Bound
+        );
+        assert!(matches!(binding_of(r"C:\a", Some(r"C:\b")), Binding::Mismatch(_)));
+    }
+
+    #[test]
+    fn mismatch_error_names_bound_root_and_relink() {
+        let mut p = project();
+        // Stored in host form, as the vault would hold it (WSL-translated or not).
+        let real_host = crate::paths::to_host(Path::new("/home/u/real"));
+        p.root_path = Some(real_host.clone());
+        let err = ensure_bound(Path::new("/home/u/clone"), &p).unwrap_err().to_string();
+        assert!(err.contains(&real_host) && err.contains("--relink"), "{err}");
+        assert_eq!(ensure_bound(Path::new("/home/u/real"), &p).unwrap(), Binding::Bound);
     }
 }

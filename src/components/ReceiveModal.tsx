@@ -187,7 +187,7 @@ function PairingCodeInput({
 function FingerprintDisplay({ fp }: { fp: string }) {
   return (
     <div className="bg-raised border border-bd2 rounded-[3px] px-4 py-3 text-center my-3">
-      <span className="text-[18px] font-mono text-accent tracking-[0.15em] select-all">
+      <span className="text-[16px] font-mono text-accent tracking-[0.08em] select-all">
         {fp}
       </span>
     </div>
@@ -218,7 +218,11 @@ export function ReceiveModal({ onClose }: ReceiveModalProps) {
   }, []);
 
   useEffect(() => {
-    return () => { stopPolling(); };
+    return () => {
+      stopPolling();
+      // Closing the modal ends any LAN session (frees the port, drops the key copy).
+      invoke('share_cancel').catch(() => { /* best effort */ });
+    };
   }, [stopPolling]);
 
   const startPolling = useCallback(() => {

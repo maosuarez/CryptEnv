@@ -64,7 +64,9 @@ pem = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Secret sharing — LAN bridge + encrypted packages
-x25519-dalek = { version = "2", features = ["static_secrets", "reusable_secrets"] }
+# LAN pairing: SPAKE2 (RustCrypto, pure Rust) keyed by the pairing code + HMAC key confirmation
+spake2 = "=0.4.0"
+hmac = "0.12"
 mdns-sd = "0.11"
 sha2 = "0.10"
 hkdf = "0.12"
@@ -75,9 +77,11 @@ rpassword = "7"
 comfy-table = "7"
 regex = "1"
 dialoguer = "0.11"
-dotenvy = "0.15"
 shell-escape = "0.1"
 shlex = "1"
+# Output redaction for backend-side MCP command execution. Already in the tree
+# through `regex`; listed directly because `exec::redact` uses it.
+aho-corasick = "1"
 
 # Native file dialogs for share export/import
 rfd = "0.14"
@@ -85,6 +89,9 @@ rfd = "0.14"
 # HTTP client — only for the crypt-env CLI binary
 # rustls-tls-native-roots: use the OS trust store PLUS our custom cert addition
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls-native-roots"] }
+
+# Atomic, exclusively-created temp files for `.crypt-env.yaml` writes
+tempfile = "3"
 
 # base64 encoding for relay payloads
 base64 = "0.22"
@@ -101,13 +108,16 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     "Win32_System_DataExchange",
     "Win32_System_Console",
+    # Job Object with kill-on-close for MCP `POST /exec` process-tree control.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 # Issue #12: integration tests need to seed a DB that already contains a

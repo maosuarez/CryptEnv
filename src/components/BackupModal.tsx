@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
-import { useVaultStore } from '../store';
+import { useVaultStore, isVaultLockedError } from '../store';
+import type { VaultItem, Category } from '../types';
 import { useTranslation } from '../i18n';
 
 interface BackupModalProps {
@@ -9,6 +10,17 @@ interface BackupModalProps {
 }
 
 type Tab = 'export' | 'restore';
+
+/** Mirrors `vault::backup::RestoreSummary` (camelCase from the backend). */
+interface RestoreSummary {
+  items: number;
+  categories: number;
+  projects: number;
+  environments: number;
+  backupVersion: number;
+  projectsIncluded: boolean;
+  holdingProject: string | null;
+}
 
 function PwField({
   label,
@@ -51,6 +63,8 @@ function PwField({
 export function BackupModal({ onClose }: BackupModalProps) {
   const { t } = useTranslation();
   const showToast = useVaultStore((s) => s.showToast);
+  const unlockWithPayload = useVaultStore((s) => s.unlockWithPayload);
+  const lockedByBackend = useVaultStore((s) => s.lockedByBackend);
   const [tab, setTab] = useState<Tab>('export');
 
   // ── Export state ────────────────────────────────────────────────────────────
@@ -63,6 +77,9 @@ export function BackupModal({ onClose }: BackupModalProps) {
   const [restoreMode, setRestoreMode]   = useState<'merge' | 'replace'>('merge');
   const [restorePw,   setRestorePw]     = useState('');
   const [showPw,      setShowPw]        = useState(false);
+  const [currentPw,   setCurrentPw]     = useState('');
+  const [showCurrentPw, setShowCurrentPw] = useState(false);
+  const [summary,     setSummary]       = useState<RestoreSummary | null>(null);
   const [fileContent, setFileContent]   = useState<string | null>(null);
   const [fileName,    setFileName]      = useState('');
   const [restoring,   setRestoring]     = useState(false);
@@ -117,21 +134,54 @@ export function BackupModal({ onClose }: BackupModalProps) {
       setRestoreErr(t('backup.errNoPassword'));
       return;
     }
+    if (restoreMode === 'replace' && !currentPw) {
+      setRestoreErr(t('backup.errNoCurrentPassword'));
+      return;
+    }
     setRestoring(true);
     setRestoreErr('');
     try {
-      const count = await invoke<number>('vault_import_backup_data', {
+      const result = await invoke<RestoreSummary>('vault_import_backup_data', {
         data: fileContent,
         masterPassword: restorePw,
         merge: restoreMode === 'merge',
+        currentPassword: restoreMode === 'replace' ? currentPw : null,
       });
+      if (restoreMode === 'replace') {
+        // The vault key is now the backup's: reload what the UI shows.
+        const payload = await invoke<{ items: VaultItem[]; categories: Category[] }>(
+          'vault_unlock',
+          { password: restorePw },
+        );
+        await unlockWithPayload(payload);
+      } else {
+        // Merge keeps the unlocked session and key: re-read what the store holds
+        // (screens that list projects fetch them when opened).
+        const [items, categories] = await Promise.all([
+          invoke<VaultItem[]>('vault_get_items'),
+          invoke<Category[]>('vault_get_categories'),
+        ]);
+        useVaultStore.setState({ items, cats: categories });
+      }
       showToast(
-        restoreMode === 'merge'
-          ? t(count !== 1 ? 'backup.toastMerged_other' : 'backup.toastMerged_one', { count })
-          : t(count !== 1 ? 'backup.toastRestored_other' : 'backup.toastRestored_one', { count }),
+        t(restoreMode === 'merge' ? 'backup.toastMergedFull' : 'backup.toastRestoredFull', {
+          items: result.items,
+          projects: result.projects,
+          environments: result.environments,
+        }),
       );
-      onClose();
+      setCurrentPw('');
+      setRestorePw('');
+      if (result.projectsIncluded) {
+        onClose();
+      } else {
+        setSummary(result);
+      }
     } catch (e: unknown) {
+      if (isVaultLockedError(e)) {
+        lockedByBackend();
+        return;
+      }
       setRestoreErr(e instanceof Error ? e.message : String(e));
     } finally {
       setRestoring(false);
@@ -229,7 +279,28 @@ export function BackupModal({ onClose }: BackupModalProps) {
             </>
           )}
 
-          {tab === 'restore' && (
+          {tab === 'restore' && summary && (
+            <>
+              <div className="px-3 py-2 bg-raised border border-bd rounded-[3px] text-accent text-[11px] font-mono leading-[1.7]">
+                {t('backup.toastRestoredFull', {
+                  items: summary.items,
+                  projects: summary.projects,
+                  environments: summary.environments,
+                })}
+              </div>
+              <p className="text-[11px] text-tx3 font-mono leading-[1.7]">
+                {t('backup.legacyNote', { name: summary.holdingProject ?? '' })}
+              </p>
+              <button
+                onClick={onClose}
+                className="w-full py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer bg-accent border-none text-[#020504] hover:opacity-90 transition-opacity"
+              >
+                {t('common.done')}
+              </button>
+            </>
+          )}
+
+          {tab === 'restore' && !summary && (
             <>
               {/* Mode selection */}
               <div className="flex gap-2">
@@ -286,6 +357,16 @@ export function BackupModal({ onClose }: BackupModalProps) {
                 onToggle={() => setShowPw((v) => !v)}
               />
 
+              {restoreMode === 'replace' && (
+                <PwField
+                  label={t('backup.currentPassword')}
+                  value={currentPw}
+                  show={showCurrentPw}
+                  onChange={(v) => { setCurrentPw(v); setRestoreErr(''); }}
+                  onToggle={() => setShowCurrentPw((v) => !v)}
+                />
+              )}
+
               {restoreErr && (
                 <div className="px-3 py-2 bg-danger-b border border-danger rounded-[3px] text-danger text-[11px] font-mono">
                   {restoreErr}
@@ -302,7 +383,7 @@ export function BackupModal({ onClose }: BackupModalProps) {
                 </button>
                 <button
                   onClick={handleRestore}
-                  disabled={restoring || !fileContent || !restorePw}
+                  disabled={restoring || !fileContent || !restorePw || (restoreMode === 'replace' && !currentPw)}
                   className={[
                     'flex-1 py-[8px] rounded-[3px] text-[11px] font-bold tracking-[0.06em] font-ui cursor-pointer border-none',
                     'flex items-center justify-center gap-1.5 transition-opacity disabled:opacity-40',
