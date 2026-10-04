@@ -424,12 +424,19 @@ impl ApiState {
             match found {
                 Some(item) => {
                     let value = Zeroizing::new(secret_value(item));
-                    if value.contains(['\n', '\r', '\0']) {
-                        // A line break would inject extra variables into the file.
-                        lines.push(Zeroizing::new(format!("# {key}: value contains a line break, skipped")));
+                    // Quoting keeps multi-line values on their own variable; a NUL
+                    // cannot be represented in a dotenv file or a process env.
+                    let line = if value.contains('\0') {
+                        None
                     } else {
-                        lines.push(Zeroizing::new(format!("{key}={}", value.as_str())));
-                        count += 1;
+                        crate::envfile::serialize_line(key, &value).map(Zeroizing::new)
+                    };
+                    match line {
+                        Some(line) => {
+                            lines.push(line);
+                            count += 1;
+                        }
+                        None => lines.push(Zeroizing::new(format!("# {key}: value cannot be written, skipped"))),
                     }
                 }
                 None => lines.push(Zeroizing::new(format!("# {key}: not found in vault"))),
