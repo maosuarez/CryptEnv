@@ -7,6 +7,7 @@ use std::io::BufRead;
 use std::io::Write;
 use std::sync::Mutex;
 
+use crypt_env_lib::crypto::SecretString;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -793,10 +794,10 @@ fn vault_get(path: &str, token: &str) -> Result<reqwest::blocking::Response, Str
         })
 }
 
-fn vault_post(
+fn vault_post<T: Serialize + ?Sized>(
     path: &str,
     token: &str,
-    body: &serde_json::Value,
+    body: &T,
 ) -> Result<reqwest::blocking::Response, String> {
     mcp_http_client()
         .post(format!("{}{path}", api_base()))
@@ -1795,7 +1796,7 @@ fn tool_share_import(args: &serde_json::Value, token: &str) -> serde_json::Value
         None => return tool_err("required parameter: 'path'"),
     };
     let passphrase = match args.get("passphrase").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
+        Some(p) => SecretString::new(p.to_string()),
         None => return tool_err("required parameter: 'passphrase'"),
     };
 
@@ -1803,7 +1804,13 @@ fn tool_share_import(args: &serde_json::Value, token: &str) -> serde_json::Value
     let mut sep = '?';
     append_scope_params(&mut url, &mut sep, args);
 
-    let body = serde_json::json!({ "path": path, "passphrase": passphrase });
+    // Borrowed, so the request body adds no second owned copy of the passphrase.
+    #[derive(Serialize)]
+    struct ImportBody<'a> {
+        path: &'a str,
+        passphrase: &'a str,
+    }
+    let body = ImportBody { path: &path, passphrase: passphrase.expose() };
     let resp = match vault_post(&url, token, &body) {
         Ok(r) => r,
         Err(e) => return tool_err(e),
@@ -2148,7 +2155,7 @@ fn tool_relay_receive(args: &serde_json::Value, token: &str) -> serde_json::Valu
         None => return tool_err("required parameter: 'code'"),
     };
     let passphrase = match args.get("passphrase").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
+        Some(p) => SecretString::new(p.to_string()),
         None => return tool_err("required parameter: 'passphrase'"),
     };
 
@@ -2156,7 +2163,12 @@ fn tool_relay_receive(args: &serde_json::Value, token: &str) -> serde_json::Valu
     let mut sep = '?';
     append_scope_params(&mut url, &mut sep, args);
 
-    let body = serde_json::json!({ "code": code, "passphrase": passphrase });
+    #[derive(Serialize)]
+    struct ReceiveBody<'a> {
+        code: &'a str,
+        passphrase: &'a str,
+    }
+    let body = ReceiveBody { code: &code, passphrase: passphrase.expose() };
     let resp = match vault_post(&url, token, &body) {
         Ok(r) => r,
         Err(e) => return tool_err(e),
