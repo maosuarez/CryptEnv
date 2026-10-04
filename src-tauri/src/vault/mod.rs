@@ -86,6 +86,9 @@ pub struct VaultState {
     /// LAN share session slot, shared by the Tauri commands and the REST API.
     /// Lives here so locking the vault can cancel any session (and drop its key copy).
     pub share: Arc<crate::share::ShareState>,
+    /// Private plaintext files produced for MCP `generate_env`. Lives here so
+    /// locking the vault can delete them without knowing about the API layer.
+    pub generated: Arc<crate::exec::tempfiles::GeneratedFiles>,
 }
 
 impl VaultState {
@@ -96,6 +99,7 @@ impl VaultState {
             last_activity: None,
             epoch: 0,
             share: Arc::new(crate::share::ShareState::new()),
+            generated: Arc::new(crate::exec::tempfiles::GeneratedFiles::new()),
         }
     }
 
@@ -273,6 +277,8 @@ pub async fn lock_vault(shared: &SharedState) {
         let mut s = shared.lock().await;
         s.set_key(None);  // Bumps epoch via harden-cli's set_key method
         s.last_activity = None;
+        // Plaintext files generated for MCP must not outlive the unlocked session.
+        s.generated.purge_all();
         s.share.clone()
     };
     // A share session holds its own copy of the vault key and may have a

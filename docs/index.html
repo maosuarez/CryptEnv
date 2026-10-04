@@ -457,7 +457,8 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><th>Tool</th><th>What it does</th></tr>
       <tr><td colspan="2"><strong>Diagnostics &amp; settings</strong></td></tr>
       <tr><td><code>crypt_env_doctor</code></td><td>App status, lock state, token configuration</td></tr>
-      <tr><td><code>crypt_env_update_settings</code></td><td>Change <code>auto_lock_timeout</code> or <code>hotkey</code></td></tr>
+      <tr><td><code>crypt_env_update_settings</code></td><td>Change the <code>hotkey</code>. Auto-lock and other security settings are the user's only (<code>403 MCP_FORBIDDEN</code>)</td></tr>
+      <tr><td><code>crypt_env_approval_status</code></td><td>Poll a request waiting for the user's approval (<code>pending</code> / <code>approved</code> / <code>denied</code> / <code>expired</code>); non-secret metadata only</td></tr>
       <tr><td colspan="2"><strong>Items</strong> (metadata only)</td></tr>
       <tr><td><code>crypt_env_list_items</code></td><td>List items in scope; filter by <code>type</code>, <code>category</code></td></tr>
       <tr><td><code>crypt_env_search_items</code></td><td>Search by name in scope</td></tr>
@@ -467,9 +468,9 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><code>crypt_env_delete_item</code></td><td>Delete by <code>id</code></td></tr>
       <tr><td><code>crypt_env_import_env_file</code></td><td>Import a <code>.env</code> from disk into the environment</td></tr>
       <tr><td colspan="2"><strong>Materialize secrets</strong> (values never in the response)</td></tr>
-      <tr><td><code>crypt_env_fill_env</code></td><td>Fill a template; write to <code>output_path</code> / <code>output_dir</code></td></tr>
-      <tr><td><code>crypt_env_generate_env</code></td><td>Write a temp <code>.env</code> for the given keys; returns its path</td></tr>
-      <tr><td><code>crypt_env_inject_env</code></td><td>Set one secret as an env var in the MCP process</td></tr>
+      <tr><td><code>crypt_env_fill_env</code></td><td>Fill a template; write to <code>output_path</code> / <code>output_dir</code> inside a project root (never returned inline)</td></tr>
+      <tr><td><code>crypt_env_generate_env</code></td><td><strong>Needs your approval.</strong> Writes a private (<code>0600</code>) <code>.env</code> for the given keys; you get its path after approving. Deleted after 10 minutes, on lock and on exit</td></tr>
+      <tr><td><code>crypt_env_inject_env</code></td><td>Select a secret to inject into later <code>crypt_env_run_command</code> calls. Records only the key name; the MCP process never holds the value</td></tr>
       <tr><td><code>crypt_env_inject_environment</code></td><td>Write an environment to its configured paths (+ optional output)</td></tr>
       <tr><td><code>crypt_env_inject_env_by_name</code></td><td>Same, resolved by <code>project_path</code> + environment name</td></tr>
       <tr><td><code>crypt_env_generate_example_env</code></td><td>Placeholder-only <code>KEY=</code> file, safe to commit</td></tr>
@@ -478,17 +479,29 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td><code>crypt_env_list_environments_by_name</code></td><td>Environments grouped by name across projects</td></tr>
       <tr><td colspan="2"><strong>Commands</strong></td></tr>
       <tr><td><code>crypt_env_list_commands</code></td><td>Saved commands and their placeholders</td></tr>
-      <tr><td><code>crypt_env_run_command</code></td><td>Run a saved command with <code>params</code>; returns exit code, stdout, stderr (truncated)</td></tr>
+      <tr><td><code>crypt_env_run_command</code></td><td>Run a saved command <em>inside the app</em> with <code>params</code>; returns exit code, stdout, stderr (redacted, 2000 characters each). See <a href="#mcp-safeguards">MCP safeguards</a></td></tr>
       <tr><td colspan="2"><strong>Categories</strong></td></tr>
       <tr><td><code>crypt_env_list_categories</code> · <code>_create_category</code> · <code>_update_category</code> · <code>_delete_category</code></td><td>Category CRUD</td></tr>
       <tr><td colspan="2"><strong>Sharing</strong></td></tr>
-      <tr><td><code>crypt_env_share_listen</code> · <code>_share_connect</code> · <code>_share_confirm</code> · <code>_share_status</code> · <code>_share_cancel</code></td><td>LAN bridge session</td></tr>
-      <tr><td><code>crypt_env_share_export</code> · <code>_share_import</code></td><td>Encrypted <code>.vault</code> package</td></tr>
-      <tr><td><code>crypt_env_relay_send</code> · <code>_relay_receive</code></td><td>Internet relay (per item)</td></tr>
+      <tr><td><code>crypt_env_share_listen</code> · <code>_share_connect</code> · <code>_share_status</code> · <code>_share_cancel</code></td><td>LAN bridge session. The fingerprint is confirmed by you in the app; there is no MCP confirm tool</td></tr>
+      <tr><td><code>crypt_env_share_export</code> · <code>_share_import</code></td><td>Encrypted <code>.vault</code> package. Export <strong>needs your approval</strong>; the passphrase is shown only to you</td></tr>
+      <tr><td><code>crypt_env_relay_send</code> · <code>_relay_receive</code></td><td>Internet relay (per item). Send <strong>needs your approval</strong>; the code and passphrase are shown only to you</td></tr>
       <tr><td colspan="2"><strong>MCP config management</strong></td></tr>
-      <tr><td><code>crypt_env_list_mcp_servers</code> · <code>_add_mcp_server</code> · <code>_update_mcp_server</code> · <code>_delete_mcp_server</code></td><td>Edit Claude MCP config entries. <code>env</code> values are stored as empty placeholders, never real secrets</td></tr>
+      <tr><td><code>crypt_env_list_mcp_servers</code> · <code>_add_mcp_server</code> · <code>_update_mcp_server</code> · <code>_delete_mcp_server</code></td><td>Edit Claude MCP config entries. <strong>Add / update / delete need your approval</strong> and are written by the app; <code>env</code> values are stored as empty placeholders, never real secrets</td></tr>
     </table></div>
-    <div class="note warn"><p><code>crypt_env_add_item</code> with a <code>value</code> passes that plaintext through the model's tool call, and <code>crypt_env_fill_env</code> without an output target returns filled content inline. Prefer adding secrets through the GUI or CLI, and always give fill an output path.</p></div>
+    <div class="note warn"><p><code>crypt_env_add_item</code> with a <code>value</code> passes that plaintext through the model's tool call. Prefer adding secrets through the GUI or CLI. <code>crypt_env_fill_env</code> and the inject / example tools may only write inside a registered project root.</p></div>
+
+    <h3 id="mcp-safeguards">MCP safeguards<a class="anchor" href="#mcp-safeguards">#</a></h3>
+    <p>The MCP token never reads secret values. The server tells the MCP token apart from your own session and enforces this on every route.</p>
+    <ul>
+      <li><strong>Reserved for you (<code>403 MCP_FORBIDDEN</code>):</strong> revealing a value, confirming a LAN pairing fingerprint, changing <code>auto_lock_timeout</code>, writing files outside a project's root, overwriting a file CryptEnv does not manage, returning filled content inline, and project/environment structure changes.</li>
+      <li><strong>Needs your approval:</strong> <code>relay_send</code>, <code>share_export</code>, <code>generate_env</code> and <code>add/update/delete_mcp_server</code>. The app shows a modal naming the operation, the items and the destination (Deny is focused by default) and brings the window forward. The agent gets <code>pending_approval</code> and an <code>approvalId</code> and polls <code>crypt_env_approval_status</code>. A request expires after 120&nbsp;s, at most 8 are pending (<code>429 APPROVALS_FULL</code>), and locking the vault discards them. The relay code, passphrase and export passphrase are shown <em>only</em> in the app, never returned to the agent.</li>
+      <li><strong><code>crypt_env_run_command</code> runs inside the app:</strong> the child starts from an empty environment (a fixed baseline such as <code>PATH</code>, <code>HOME</code>, <code>SystemRoot</code>, <code>TEMP</code>, <code>LANG</code>, plus the keys you selected with <code>crypt_env_inject_env</code>); stdin is empty; every <code>{{param}}</code> value must match <code>[A-Za-z0-9._/:@=+,-]{0,256}</code> (no spaces or shell metacharacters, otherwise nothing runs); injected values and their base64 and hex forms are replaced by <code>[REDACTED:KEY]</code> in the output; each stream is capped at 64&nbsp;KiB captured and 2000 characters returned; the whole process tree is killed after 120&nbsp;s, on vault lock, or when the MCP session ends (Unix process group, Windows Job Object). At most 4 commands run at once (<code>429 EXEC_BUSY</code> beyond a queue of 8). Values shorter than 4 characters are not redacted, and a command that transforms a secret (for example <code>rev</code>) before printing it can defeat redaction.</li>
+      <li><strong>WSL:</strong> when the MCP client runs in WSL and the app on Windows, the app runs the command in the client's distribution with <code>wsl.exe -d &lt;distro&gt; --cd &lt;dir&gt; --exec</code>. Secrets travel over stdin, never on the command line or in <code>WSLENV</code>.</li>
+      <li><strong>Generated files:</strong> <code>crypt_env_generate_env</code> writes to a private directory inside the app data folder (mode <code>0700</code>, files <code>0600</code>), not to the shared temp directory. They are deleted after 10 minutes, when the vault locks and at app exit; leftovers are swept at startup.</li>
+      <li><strong>MCP host config:</strong> the app, not the MCP process, writes <code>claude_desktop_config.json</code> and <code>.claude/mcp_servers.json</code>, so the approval cannot be bypassed. With WSL, the global config written is the one on the app's side (Windows).</li>
+    </ul>
+    <div class="note warn"><p><strong>Breaking for agents.</strong> <code>relay_send</code>, <code>share_export</code>, <code>generate_env</code> and the MCP-server tools now return <code>pending_approval</code> instead of a result; <code>crypt_env_share_confirm</code> and <code>auto_lock_timeout</code> in <code>update_settings</code> are gone; <code>run_command</code> rejects parameters with spaces or shell metacharacters; <code>crypt_env_inject_env</code> no longer sets the MCP process environment.</p></div>
     <p>Whole-project relay sharing has no MCP tool on purpose: it needs the sender's explicit consent in the GUI or CLI.</p>
 
     <!-- ===================== 8. API ===================== -->
@@ -499,30 +512,37 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
     <ul>
       <li><strong>TLS:</strong> a self-signed certificate is generated on first launch at <code>&lt;app data&gt;/com.maosuarez.cryptenv/tls/cert.pem</code>. Pass <code>--cacert</code> with that file (or <code>-k</code> for quick tests).</li>
       <li><strong>Token:</strong> send <code>X-Vault-Token</code> with either a session token from <code>POST /unlock</code> (expires) or the static MCP token from Settings.</li>
+      <li>The static MCP token is a separate principal: every route is allowed, denied (<code>403 MCP_FORBIDDEN</code>) or approval-gated for it (see <a href="#mcp-safeguards">MCP safeguards</a>). Unclassified routes are denied.</li>
       <li>Tokens are compared in constant time. <code>/unlock</code> is rate-limited to 5 attempts per 60 s (<code>429 RATE_LIMITED</code> with <code>Retry-After</code>).</li>
     </ul>
 
     <h3 id="api-endpoints">Endpoints<a class="anchor" href="#api-endpoints">#</a></h3>
-    <p><strong>Scoped</strong> endpoints need <code>?environment_id=ID</code> or <code>?project=NAME&amp;environment=NAME</code> (case-insensitive); otherwise they return <code>422 VALIDATION_ERROR</code>. Scope is a display filter, not an access boundary: any valid token can reach an item by id.</p>
+    <p><strong>Scoped</strong> endpoints need <code>?environment_id=ID</code> or <code>?project=NAME&amp;environment=NAME</code> (case-insensitive); otherwise they return <code>422 VALIDATION_ERROR</code>. Scope is a display filter, not an access boundary: any valid token can reach an item by id (but only session tokens can reveal its value).</p>
     <div class="table-wrap"><table>
       <tr><th>Method</th><th>Path</th><th>Description</th></tr>
       <tr><td colspan="3"><strong>System</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/health</code></td><td>No auth. <code>version</code>, <code>status</code>, <code>vault_locked</code>, <code>mcp_token_configured</code></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/unlock</code></td><td>No auth. <code>{"master_password"}</code> → <code>{"token"}</code>. Several sessions coexist; each expires after <code>auto_lock_timeout</code> minutes without use and is renewed by every authenticated request. Locking the vault invalidates all sessions: requests get <code>403</code> while locked and <code>401</code> with a pre-lock token after the next unlock</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/settings</code></td><td><code>auto_lock_timeout</code> (minutes), <code>hotkey</code></td></tr>
-      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings</td></tr>
+      <tr><td><span class="m put">PUT</span></td><td><code>/settings</code></td><td>Update those settings (the MCP token may only set <code>hotkey</code>)</td></tr>
       <tr><td colspan="3"><strong>Items</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/items</code></td><td>Scoped. Redacted list; <code>type</code>, <code>category</code>, <code>search</code>, <code>include_global</code>. Rows carry <code>isGlobal</code> and <code>linked</code></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/items</code></td><td>Scoped. Create + link under <code>key</code> (defaults to <code>name</code>). <code>?on_conflict=update|replace|error</code></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/items/:id</code></td><td>Item metadata (redacted)</td></tr>
       <tr><td><span class="m put">PUT</span></td><td><code>/items/:id</code></td><td>Merge update; send <code>type</code> with every update</td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/items/:id</code></td><td>Delete (204)</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/items/:id/reveal</code></td><td>Plaintext value; body must be <code>{"confirm": true}</code></td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/items/:id/reveal</code></td><td>Plaintext value; body must be <code>{"confirm": true}</code>. Session tokens only: the MCP token gets <code>403 MCP_FORBIDDEN</code></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/maintenance/orphans</code></td><td>Read-only list of unlinked, non-global items (pruning is GUI-only)</td></tr>
       <tr><td colspan="3"><strong>Env files</strong></td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/fill</code></td><td>Scoped. <code>{template, output_path?, output_dir?, overwrite?}</code>; inline content if no output</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/fill</code></td><td>Scoped. <code>{template, output_path?, output_dir?, overwrite?}</code>; inline content if no output (session tokens only: the MCP token must write inside a project root)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/inject</code></td><td>Write to configured paths (+ <code>output_path</code> / <code>output_dir</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/environments/:id/example</code></td><td>Placeholder-only <code>KEY=</code> output; never decrypts</td></tr>
+      <tr><td colspan="3"><strong>Command execution &amp; MCP approvals</strong></td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/exec</code></td><td>Scoped. <code>{commandId, params?, injectKeys?, cwd?, clientContext?, runId?}</code> runs a stored command in the app with the given secrets in its environment and returns <code>{runId, exitCode, timedOut, cancelled, stdout, stderr, stdoutTruncated, stderrTruncated}</code>, redacted. <code>422</code> for an invalid parameter or key, <code>429 EXEC_BUSY</code> when saturated</td></tr>
+      <tr><td><span class="m del">DELETE</span></td><td><code>/exec/:runId</code></td><td>Kill a running command's process tree</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/generate-env</code></td><td><code>{keys, environment_id | project + environment}</code>. Session: writes a private <code>0600</code> file and returns <code>{path, count, expiresInSeconds}</code>. MCP token: <code>202</code> + <code>approvalId</code></td></tr>
+      <tr><td><span class="m post">POST</span> <span class="m put">PUT</span> <span class="m del">DELETE</span></td><td><code>/mcp-servers</code></td><td>Add / update (JSON body) / delete (<code>?name=&amp;scope=&amp;cwd=</code>) an entry in the Claude MCP config (<code>scope</code> <code>global</code> or <code>project</code>; <code>project</code> needs an absolute <code>cwd</code>). MCP token: <code>202</code> + <code>approvalId</code></td></tr>
+      <tr><td><span class="m get">GET</span></td><td><code>/approvals/:id</code></td><td>Status (<code>pending</code>, <code>approved</code>, <code>denied</code>, <code>expired</code>), summary and non-secret result metadata. Never contains codes, passphrases or values. Approving or denying is possible only in the desktop app</td></tr>
       <tr><td colspan="3"><strong>Projects &amp; environments</strong></td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/projects</code></td><td>Projects with nested environments and <code>rootPath</code> (when set)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects</code></td><td>Create (<code>id: 0</code>) or update; <code>409</code> on duplicate name. <code>rootPath</code>: omitted keeps, <code>""</code> clears, otherwise an absolute directory</td></tr>
@@ -538,12 +558,12 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
       <tr><td colspan="3"><strong>Sharing</strong></td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/listen</code></td><td>Scoped. Start LAN send; returns <code>pairing_code</code>. 409 <code>SESSION_ACTIVE</code> if a share session is already active (cancel it first)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/connect</code></td><td>Scoped. Join as receiver; returns the 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>). 409 <code>SESSION_ACTIVE</code> if a session is already active</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/confirm</code></td><td>Accept or reject the fingerprint (both sides)</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/confirm</code></td><td>Accept or reject the fingerprint (both sides). Session tokens only</td></tr>
       <tr><td><span class="m get">GET</span></td><td><code>/share/status</code></td><td>State, fingerprint, <code>received_names</code>, <code>skipped_keys</code></td></tr>
       <tr><td><span class="m del">DELETE</span></td><td><code>/share/session</code></td><td>Cancel the session</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/share/export</code></td><td>Encrypted <code>.vault</code> package + passphrase</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/share/export</code></td><td>Encrypted <code>.vault</code> package + passphrase. With the MCP token: <code>202</code> + <code>approvalId</code>, the passphrase is shown only in the app</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/share/import</code></td><td>Scoped. Import a package</td></tr>
-      <tr><td><span class="m post">POST</span></td><td><code>/relay/send</code></td><td>Upload items to the relay; returns code + passphrase</td></tr>
+      <tr><td><span class="m post">POST</span></td><td><code>/relay/send</code></td><td>Upload items to the relay; returns code + passphrase. With the MCP token: <code>202</code> + <code>approvalId</code>, code and passphrase are shown only in the app</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/relay/receive</code></td><td>Scoped. Claim (single use), decrypt, import</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/:id/relay/send</code></td><td>Share a whole project (selected <code>environment_ids</code>)</td></tr>
       <tr><td><span class="m post">POST</span></td><td><code>/projects/relay/receive</code></td><td>Receive a project as new; <code>project_name_override</code> on collision</td></tr>
@@ -632,7 +652,7 @@ curl -s --cacert "$CERT" -X POST $API/environments/1/inject \
       <div class="card"><h4>Volatile keys</h4><p>The master password and derived key live in memory only while unlocked and are zeroized on lock. Auto-lock after a configurable timeout.</p></div>
       <div class="card"><h4>Local-only API</h4><p>Loopback binding, TLS, token auth with constant-time comparison, rate-limited unlock.</p></div>
       <div class="card"><h4>LAN sharing</h4><p>The 6-digit pairing code feeds a SPAKE2 key exchange, so only a peer that knows it can derive the session key; mDNS advertises only a random session id and a protocol version, never anything derived from the code. Both sides prove the key (key confirmation) before any item moves, then compare a 64-bit fingerprint (<code>XXXX-XXXX-XXXX-XXXX</code>) and confirm in the desktop app. Sockets time out after 30 s (handshake 60 s), 3 wrong-code attempts abort the session, only one session runs at a time, and locking the vault or closing the dialog cancels it. <strong>Both devices must run the same version</strong>: v1.0.6 peers are rejected with an &ldquo;update the other device&rdquo; message.</p></div>
-      <div class="card"><h4>No plaintext leaks</h4><p>Values never appear in logs, errors or list responses. Reveal requires an explicit confirm; the MCP server writes or injects instead of returning.</p></div>
+      <div class="card"><h4>No plaintext leaks</h4><p>Values never appear in logs, errors or list responses. Reveal requires an explicit confirm and is refused to the MCP token; commands run inside the app and their output is redacted. Relay codes and passphrases reach only you, through an approval in the app.</p></div>
     </div>
     <p>Report vulnerabilities privately as described in <a href="https://github.com/maosuarez/CryptEnv/blob/main/SECURITY.md">SECURITY.md</a>.</p>
 

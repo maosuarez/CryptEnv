@@ -8,3 +8,4 @@ mod items;
 mod fill;
 mod projects;
 mod sessions;
+mod mcp;

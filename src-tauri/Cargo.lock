@@ -6079,6 +6079,7 @@ name = "tauri-crypt-env"
 version = "1.0.6"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "argon2",
  "axum",
  "axum-server",
