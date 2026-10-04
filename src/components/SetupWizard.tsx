@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { useTranslation } from '../i18n';
-import { copySecret } from '../lib/clipboard';
+import { copyPlain, copySecret } from '../lib/clipboard';
 
 interface SetupWizardProps {
   onClose: () => void;
@@ -18,6 +18,7 @@ export function SetupWizard({ onClose }: SetupWizardProps) {
   const [writtenPath, setWrittenPath] = useState<string | null>(null);
   const [error,       setError]       = useState<string | null>(null);
   const [copied,      setCopied]      = useState(false);
+  const [snippetCopied, setSnippetCopied] = useState(false);
   const { t } = useTranslation();
 
   useEffect(() => {
@@ -161,11 +162,35 @@ export function SetupWizard({ onClose }: SetupWizardProps) {
                 </div>
               </div>
             )}
-            {error && (
-              <div className="mb-4 text-[11px] text-danger font-mono bg-[rgba(255,80,80,0.06)] border border-[rgba(255,80,80,0.2)] rounded-[3px] px-3 py-2">
-                // {error}
-              </div>
-            )}
+            {error && (() => {
+              // The backend refuses to rewrite a config it cannot parse and appends the
+              // token-free entry to add by hand after this marker.
+              const marker = 'Add this entry by hand:\n';
+              const at = error.indexOf(marker);
+              const message = at < 0 ? error : error.slice(0, at + marker.length - 1);
+              const snippet = at < 0 ? null : error.slice(at + marker.length);
+              return (
+                <div className="mb-4 text-[11px] text-danger font-mono bg-[rgba(255,80,80,0.06)] border border-[rgba(255,80,80,0.2)] rounded-[3px] px-3 py-2">
+                  <div>// {message}</div>
+                  {snippet && (
+                    <>
+                      <pre className="mt-2 text-tx2 whitespace-pre-wrap break-all">{snippet}</pre>
+                      <button
+                        onClick={() => {
+                          copyPlain(snippet).then(() => {
+                            setSnippetCopied(true);
+                            setTimeout(() => setSnippetCopied(false), 2000);
+                          }).catch(() => {});
+                        }}
+                        className="mt-1 text-[10px] font-mono text-tx3 hover:text-tx transition-colors cursor-pointer bg-transparent border-none px-0"
+                      >
+                        {snippetCopied ? t('setup.snippetCopied') : t('setup.copySnippet')}
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })()}
 
             <div className="flex gap-2">
               <button

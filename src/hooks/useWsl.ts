@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { WslActionReport, WslError, WslStatus } from '../types';
+import type { WslActionReport, WslDistro, WslError, WslStatus } from '../types';
 import { t } from '../i18n';
 
 export const wslKeys = {
@@ -19,6 +19,17 @@ export function useWslDetect(enabled: boolean) {
     retry:                false,
     staleTime:            Infinity,
     refetchOnWindowFocus: false,
+  });
+}
+
+/** Explicit per-distro detection. **Starts the distro if it is stopped.** */
+export function useWslDetectDistro() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (distro: string) => invoke<WslDistro>('wsl_detect_distro', { distro }),
+    onSuccess:  (probed) =>
+      qc.setQueryData<WslStatus>(wslKeys.detect, (prev) =>
+        prev && { ...prev, distros: prev.distros.map((d) => (d.name === probed.name ? probed : d)) }),
   });
 }
 
@@ -41,6 +52,8 @@ export function formatWslError(e: unknown): string {
       case 'unsupported':   return t('store.wslUnsupported');
       case 'notAvailable':  return t('store.wslNotAvailable');
       case 'unknownDistro': return t('store.wslUnknownDistro', { distro: err.message ?? '' });
+      case 'timeout':       return t('store.wslTimeout', { message: err.message ?? '' });
+      case 'busy':          return t('store.wslBusy');
       case 'tooling':       return err.message ? t('store.wslToolingDetail', { message: err.message }) : t('store.wslTooling');
     }
   }

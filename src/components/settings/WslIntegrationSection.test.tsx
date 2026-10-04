@@ -13,8 +13,8 @@ const TWO_DISTROS: WslStatus = {
   available: true,
   mirrored:  false,
   distros: [
-    { name: 'Ubuntu', defaultUser: 'me',   configured: true,  launcher: true  },
-    { name: 'Debian', defaultUser: null,   configured: false, launcher: false },
+    { name: 'Ubuntu', state: 'running', defaultUser: 'me',   configured: true,  launcher: true  },
+    { name: 'Debian', state: 'running', defaultUser: null,   configured: false, launcher: false },
   ],
 };
 
@@ -191,5 +191,31 @@ describe('launcherLine', () => {
     expect(launcherLine({ ...base, launcher_status: 'absent' })).toBeNull();
     const { launcher: _l, launcher_status: _s, launcher_note: _n, ...legacy } = REPORT;
     expect(launcherLine(legacy)).toBeNull();
+  });
+});
+
+describe('stopped distributions', () => {
+  it('shows a stopped distro with a Detect action and only then probes it', async () => {
+    const stopped: WslStatus = {
+      ...TWO_DISTROS,
+      distros: [
+        TWO_DISTROS.distros[0],
+        { name: 'Debian', state: 'stopped', defaultUser: null, configured: false, launcher: false },
+      ],
+    };
+    const probed = { name: 'Debian', state: 'running', defaultUser: 'deb', configured: false, launcher: false };
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === 'wsl_detect') return Promise.resolve(stopped);
+      if (cmd === 'wsl_detect_distro') return Promise.resolve(probed);
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    renderSection(true);
+    const row = await screen.findByTestId('wsl-distro-Debian');
+    expect(row.textContent).toContain('Stopped');
+    expect(invoke).not.toHaveBeenCalledWith('wsl_detect_distro', expect.anything());
+
+    fireEvent.click(screen.getByText('Detect (starts the distribution)'));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('wsl_detect_distro', { distro: 'Debian' }));
+    await waitFor(() => expect(screen.getByTestId('wsl-distro-Debian').textContent).toContain('deb'));
   });
 });

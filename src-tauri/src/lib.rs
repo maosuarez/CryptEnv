@@ -9,6 +9,7 @@ pub mod db;
 pub mod envfile;
 pub mod exec;
 pub mod fsguard;
+pub mod hostcfg;
 pub mod hotkey;
 pub mod mcp;
 pub mod project;
@@ -48,7 +49,7 @@ use project::{
 };
 use project::relay_commands::{project_relay_receive, project_relay_send};
 use clipboard::clipboard_write_secret;
-use wsl::{wsl_configure_client, wsl_detect, wsl_distro_home, wsl_list_distros, wsl_remove_client};
+use wsl::{wsl_configure_client, wsl_detect, wsl_detect_distro, wsl_distro_home, wsl_list_distros, wsl_remove_client};
 
 struct PendingUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
 
@@ -312,6 +313,7 @@ pub fn run() {
             wsl_list_distros,
             wsl_distro_home,
             wsl_detect,
+            wsl_detect_distro,
             wsl_configure_client,
             wsl_remove_client,
             environment_inject_preview,

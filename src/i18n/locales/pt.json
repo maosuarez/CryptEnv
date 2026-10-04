@@ -681,6 +681,8 @@
     }
   },
   "setup": {
+    "copySnippet": "Copiar trecho",
+    "snippetCopied": "Trecho copiado",
     "welcomeTitle": "Bem-vindo ao CryptEnv",
     "claudeTitle": "Integração com o Claude Code",
     "intro": "Seu cofre está pronto. O CryptEnv pode se integrar ao Claude Code para que o Claude acesse seus segredos com segurança como variáveis de ambiente — sem expor os valores diretamente.",
@@ -801,7 +803,9 @@
     "wslNotAvailable": "O WSL não está instalado",
     "wslUnknownDistro": "A distribuição \"{distro}\" não está mais instalada — atualize e tente novamente",
     "wslTooling": "Erro do WSL",
-    "wslToolingDetail": "Erro do WSL: {message}"
+    "wslToolingDetail": "Erro do WSL: {message}",
+    "wslTimeout": "O WSL não respondeu a tempo: {message}",
+    "wslBusy": "Outra operação do WSL está em andamento"
   },
   "ui": {
     "ok": "OK",
@@ -870,6 +874,10 @@
     "mirroredNote": "Não é necessário para o comando {cmd} que Configurar instala — ele executa a CLI do Windows e funciona com a rede padrão. Só uma build nativa para Linux do {cmd} precisa da rede espelhada para alcançar o cofre em 127.0.0.1. Aplicar exige {shutdown} e altera a rede de todas as distros, por isso o CryptEnv nunca edita este arquivo por você.",
     "unknownUser": "usuário desconhecido",
     "notConfigured": "Não configurado",
+    "stopped": "Parada",
+    "detect": "Detectar (inicia a distribuição)",
+    "detecting": "Detectando...",
+    "detectTitle": "Inicia esta distribuição para inspecioná-la",
     "configured": "Configurado",
     "configuredNoLauncher": "Configurado · sem comando crypt-env — reconfigure",
     "configuring": "CONFIGURANDO…",

@@ -369,9 +369,12 @@ Invoked by the Settings → WSL Integration panel via `invoke()`. On every non-W
 
 | Command | Args | Returns | Side effects |
 |---------|------|---------|--------------|
-| `wsl_detect` | — | `WslStatus` | None (read-only). Runs `wsl --list --quiet`, then per distro `whoami` and a fixed `test`/`grep` probe; reads `%UserProfile%\.wslconfig`. |
+| `wsl_detect` | — | `WslStatus` | None (read-only). Runs `wsl -l -v` and probes (`whoami` + a fixed `test`/`grep` probe) only **running** distros; stopped ones come back as `state: "stopped"` and are never started; `docker-desktop*` is skipped. Reads `%UserProfile%\.wslconfig`. |
+| `wsl_detect_distro` | `distro: string` | `WslDistro` | Probes one distro on explicit request. **Starts it if stopped.** |
 | `wsl_configure_client` | `distro: string` | `WslActionReport` | Re-validates `distro` against a fresh `wsl --list`, then runs the bundled `crypt-env-setup` helper inside it (copied to `/tmp`, deleted afterwards). Writes only `~/.config/cryptenv/env.sh`, the rc marker block, and the one-time `.cryptenv.bak`. |
 | `wsl_remove_client` | `distro: string` | `WslActionReport` | Same validation; runs the helper with `--remove`. No-op when nothing is installed. |
+
+Every `wsl.exe` call is bounded (30 s probes, 120 s configure/remove) and killed on timeout (`{ "kind": "timeout" }`); concurrent WSL commands are rejected with `{ "kind": "busy" }` ("operation in progress").
 
 ```ts
 interface WslStatus {

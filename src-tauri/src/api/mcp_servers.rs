@@ -159,25 +159,6 @@ pub(crate) fn summarize(op: &McpServerOp) -> ApprovalSummary {
     }
 }
 
-fn read_json_config(path: &Path) -> Result<Value, String> {
-    if !path.exists() {
-        return Ok(json!({}));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("error reading {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("error parsing {}: {e}", path.display()))
-}
-
-/// Writes atomically: temp file, then rename.
-fn write_json_config_atomic(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
-    }
-    let tmp_path = path.with_extension("tmp");
-    let text = serde_json::to_string_pretty(value).map_err(|e| format!("error serializing config: {e}"))?;
-    std::fs::write(&tmp_path, &text).map_err(|e| format!("error writing temp file {}: {e}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path).map_err(|e| format!("error renaming temp file to {}: {e}", path.display()))
-}
-
 fn blank_env(env: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
     env.keys().map(|k| (k.clone(), Value::String(String::new()))).collect()
 }
@@ -185,7 +166,41 @@ fn blank_env(env: &serde_json::Map<String, Value>) -> serde_json::Map<String, Va
 /// Applies `op` to the config file at `path`. Pure file logic, no secrets.
 pub(crate) fn apply_to_path(path: &Path, op: &McpServerOp) -> Result<Value, String> {
     let req = op.request();
-    let mut config = read_json_config(path)?;
+    let name = req.name.clone();
+
+    // A file that is not strict JSON is never rewritten (it may hold other
+    // servers): `hostcfg` refuses and shows the snippet to apply by hand.
+    let snippet = || match op {
+        McpServerOp::Delete(_) => format!("(remove the \"{name}\" entry from \"mcpServers\")"),
+        _ => {
+            let mut entry = json!({ "command": req.command.clone().unwrap_or_default(), "args": req.args.clone().unwrap_or_default() });
+            if let Some(env) = req.env.as_ref().filter(|e| !e.is_empty()) {
+                entry["env"] = Value::Object(blank_env(env));
+            }
+            serde_json::to_string_pretty(&json!({ "mcpServers": { name.clone(): entry } })).unwrap_or_default()
+        }
+    };
+    crate::hostcfg::update_json(path, snippet, |config| {
+        edit_config(config, op).map_err(crate::hostcfg::HostCfgError::InvalidStructure)
+    })
+    .map_err(|e| e.to_string())?;
+
+    let key = match op {
+        McpServerOp::Add(_) => "added",
+        McpServerOp::Update(_) => "updated",
+        McpServerOp::Delete(_) => "deleted",
+    };
+    Ok(json!({
+        key: true,
+        "name": name,
+        "scope": req.scope.as_deref().unwrap_or("global"),
+        "config_path": path.to_string_lossy(),
+    }))
+}
+
+/// Pure in-memory edit of the parsed config.
+fn edit_config(config: &mut Value, op: &McpServerOp) -> Result<(), String> {
+    let req = op.request();
     let name = req.name.clone();
 
     match op {
@@ -238,18 +253,7 @@ pub(crate) fn apply_to_path(path: &Path, op: &McpServerOp) -> Result<Value, Stri
         }
     }
 
-    write_json_config_atomic(path, &config)?;
-    let key = match op {
-        McpServerOp::Add(_) => "added",
-        McpServerOp::Update(_) => "updated",
-        McpServerOp::Delete(_) => "deleted",
-    };
-    Ok(json!({
-        key: true,
-        "name": name,
-        "scope": req.scope.as_deref().unwrap_or("global"),
-        "config_path": path.to_string_lossy(),
-    }))
+    Ok(())
 }
 
 /// Resolves the path and applies `op`. Used by the direct (session) route and
@@ -338,6 +342,20 @@ mod tests {
 
         apply_to_path(&path, &McpServerOp::Delete(req("s", tmp.path()))).unwrap();
         assert!(apply_to_path(&path, &McpServerOp::Delete(req("s", tmp.path()))).is_err());
+    }
+
+    #[test]
+    fn unparseable_config_is_left_untouched_with_a_manual_snippet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude").join("mcp_servers.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "{\n // other servers live here\n \"mcpServers\": { \"x\": {}, },\n}";
+        std::fs::write(&path, original).unwrap();
+
+        let err = apply_to_path(&path, &McpServerOp::Add(req("s", tmp.path()))).unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(err.contains("\"command\": \"node\""), "{err}");
+        assert!(!err.contains("real-secret"), "{err}");
     }
 
     #[test]

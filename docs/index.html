@@ -358,7 +358,7 @@
       <tr><td><code>CRYPTENV_TERMINAL_ID</code></td><td>detected</td><td>Overrides the terminal identity for per-terminal sessions; the WSL managed launcher sets it and forwards it via <code>WSLENV</code>.</td></tr>
       <tr><td><code>CRYPTENV_PATH_TRANSLATION</code></td><td>on inside WSL</td><td><code>off</code> disables WSL ↔ Windows path translation (only when the app itself runs inside the distro).</td></tr>
     </table></div>
-    <p>From WSL, <code>crypt-env setup wsl</code> persists these into your shell startup (see <a href="#cli-misc">setup</a> and the <a href="https://github.com/maosuarez/CryptEnv/blob/main/docs/wsl-windows.md">WSL ↔ Windows guide</a>). On Windows the GUI offers the same under <strong>Settings → WSL Integration</strong>.</p>
+    <p>From WSL, <code>crypt-env setup wsl</code> persists these into your shell startup (see <a href="#cli-misc">setup</a> and the <a href="https://github.com/maosuarez/CryptEnv/blob/main/docs/wsl-windows.md">WSL ↔ Windows guide</a>). On Windows the GUI offers the same under <strong>Settings → WSL Integration</strong>. Detection reads distribution states with <code>wsl -l -v</code> and probes only <em>running</em> distributions: a stopped one is listed as <em>Stopped</em> with a per-distribution <strong>Detect (starts the distribution)</strong> button, and Docker Desktop's internal distributions are skipped. Every <code>wsl.exe</code> call is time-limited (30&nbsp;s for probes, 120&nbsp;s for Configure/Remove) and killed on timeout; only one WSL operation runs at a time (a second click reports <em>operation in progress</em>).</p>
 
     <!-- ===================== 5. CLI ===================== -->
     <h2 id="cli"><span class="num">04</span>CLI reference<a class="anchor" href="#cli">#</a></h2>
@@ -457,6 +457,7 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
   }
 }</code></pre></div>
     <div class="code"><span class="label">claude code</span><pre><code>claude mcp add cryptenv -- crypt-env-mcp</code></pre></div>
+    <p>The setup wizard can write the <code>cryptenv</code> entry into <code>~/.mcp.json</code> (or another path) for you. It only changes that entry: other servers are kept, the write is atomic, a one-time <code>.bak</code> of the previous file is kept, and a new file is created owner-only (<code>0600</code> on Unix). If the existing file is not strict JSON (comments, trailing commas) it is <strong>left untouched</strong> and the wizard shows the entry to paste by hand, with a placeholder instead of your token. The same rules apply to <code>/mcp-servers</code> writes.</p>
     <p>On Windows the installer puts <code>crypt-env-mcp.exe</code> on your <code>PATH</code>; use <code>where crypt-env-mcp</code> to get the absolute path if your client needs one.</p>
 
     <h3 id="mcp-tools">Tools<a class="anchor" href="#mcp-tools">#</a></h3>

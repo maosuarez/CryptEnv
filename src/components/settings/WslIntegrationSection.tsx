@@ -2,7 +2,7 @@ import { Icon } from '../ui/Icon';
 import { useVaultStore } from '../../store';
 import { copyPlain } from '../../lib/clipboard';
 import { useWslStore } from '../../store/wslStore';
-import { formatWslError, useWslConfigure, useWslDetect, useWslRemove } from '../../hooks/useWsl';
+import { formatWslError, useWslConfigure, useWslDetect, useWslDetectDistro, useWslRemove } from '../../hooks/useWsl';
 import { t as tr, useTranslation } from '../../i18n';
 import type { WslActionReport, WslDistro } from '../../types';
 
@@ -110,7 +110,8 @@ function DistroRow({ distro }: { distro: WslDistro }) {
   const setLastAction  = useWslStore((s) => s.setLastAction);
   const configure      = useWslConfigure();
   const remove         = useWslRemove();
-  const busy           = configure.isPending || remove.isPending;
+  const detectDistro   = useWslDetectDistro();
+  const busy           = configure.isPending || remove.isPending || detectDistro.isPending;
   const { t }          = useTranslation();
 
   const run = (action: 'configure' | 'remove') => {
@@ -122,6 +123,29 @@ function DistroRow({ distro }: { distro: WslDistro }) {
       onError:   (e) => showToast(formatWslError(e), 'error'),
     });
   };
+
+  if (distro.state === 'stopped') {
+    return (
+      <div
+        data-testid={`wsl-distro-${distro.name}`}
+        className="flex items-center gap-3 min-h-[44px] py-2 border-b border-bd"
+      >
+        <span className="text-tx3 shrink-0"><Icon name="terminal" size={14} /></span>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] font-medium text-tx font-ui truncate">{distro.name}</div>
+          <div className="text-[11px] font-mono text-tx3 truncate">{t('wsl.stopped')}</div>
+        </div>
+        <button
+          onClick={() => detectDistro.mutate(distro.name, { onError: (e) => showToast(formatWslError(e), 'error') })}
+          disabled={busy}
+          title={t('wsl.detectTitle')}
+          className={BTN}
+        >
+          {detectDistro.isPending ? t('wsl.detecting') : t('wsl.detect')}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div
