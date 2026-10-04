@@ -73,6 +73,16 @@ enum Gated {
     InitAdopt { name: String },
 }
 
+/// Longest password the modal accepts, in bytes. The input buffer is allocated
+/// at exactly this capacity up front and never grows, so typing cannot leave
+/// reallocated (and therefore unwiped) copies of a partial password behind.
+const PASSWORD_CAP: usize = 256;
+
+/// A fresh, pre-allocated, wiped-on-drop password input buffer.
+fn new_password_input() -> Zeroizing<String> {
+    Zeroizing::new(String::with_capacity(PASSWORD_CAP))
+}
+
 /// Status shown while a blocking backend call is pending.
 const WORKING: &str = "working…";
 
@@ -85,7 +95,7 @@ enum Pending {
 
 enum Modal {
     None,
-    Password { purpose: Gated, input: String, error: Option<String> },
+    Password { purpose: Gated, input: Zeroizing<String>, error: Option<String> },
     Input { title: &'static str, value: String },
     /// A secret-routing change awaiting `y`; `then` runs through [`gate`].
     Confirm { title: String, lines: Vec<String>, then: Gated },
@@ -293,7 +303,7 @@ impl App {
     fn fail(&mut self, e: CliError, purpose: Gated) {
         match e {
             CliError::SessionRequired => {
-                self.modal = Modal::Password { purpose, input: String::new(), error: None };
+                self.modal = Modal::Password { purpose, input: new_password_input(), error: None };
             }
             other => self.error(other),
         }
@@ -357,7 +367,7 @@ pub fn run(_args: TuiArgs) -> Result<(), CliError> {
     app.status = Some((WORKING.into(), false));
     let _ = terminal.draw(|f| render(f, &app));
     if !matches!(app.api.session_alive(), Ok(true)) || app.reload().is_err() {
-        app.modal = Modal::Password { purpose: Gated::Login, input: String::new(), error: None };
+        app.modal = Modal::Password { purpose: Gated::Login, input: new_password_input(), error: None };
     }
     app.status = None;
     app.defer = true;
@@ -403,18 +413,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Modal::None => {}
         Modal::Password { input, purpose, .. } => {
             match code {
-                KeyCode::Char(c) => input.push(c),
+                KeyCode::Char(c) => {
+                    // Refuse input past the pre-allocated capacity (no realloc).
+                    if input.len() + c.len_utf8() <= PASSWORD_CAP {
+                        input.push(c);
+                    }
+                }
                 KeyCode::Backspace => {
                     input.pop();
                 }
-                KeyCode::Esc if *purpose == Gated::Login => app.quit = true,
+                KeyCode::Esc if *purpose == Gated::Login => {
+                    input.zeroize();
+                    app.quit = true;
+                }
                 KeyCode::Esc => {
                     input.zeroize();
                     app.modal = Modal::None;
                 }
                 KeyCode::Enter => {
                     let purpose = purpose.clone();
-                    let pw = Zeroizing::new(std::mem::take(input));
+                    // Moves the single allocation out; the modal gets a fresh buffer.
+                    let pw = std::mem::replace(input, new_password_input());
                     app.schedule(Pending::Submit(purpose, pw));
                 }
                 _ => {}
@@ -578,14 +597,14 @@ fn gate(app: &mut App, purpose: Gated) {
 fn gate_now(app: &mut App, purpose: Gated) {
     match app.api.session_alive() {
         Ok(true) => run_gated(app, purpose),
-        Ok(false) => app.modal = Modal::Password { purpose, input: String::new(), error: None },
+        Ok(false) => app.modal = Modal::Password { purpose, input: new_password_input(), error: None },
         Err(e) => app.error(e),
     }
 }
 
 fn submit_password(app: &mut App, purpose: Gated, pw: &str) {
     if let Err(e) = app.api.authenticate(pw) {
-        app.modal = Modal::Password { purpose, input: String::new(), error: Some(e.to_string()) };
+        app.modal = Modal::Password { purpose, input: new_password_input(), error: Some(e.to_string()) };
         return;
     }
     app.modal = Modal::None;
@@ -881,8 +900,8 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled(key.clone(), Style::default().fg(TX2))),
-                    Line::from(Span::styled(value.as_str().to_string(), Style::default().fg(WARN))),
-                    Line::from(Span::styled("any key to hide (value is wiped from memory)", Style::default().fg(TX3))),
+                    Line::from(Span::styled(value.as_str(), Style::default().fg(WARN))),
+                    Line::from(Span::styled("any key to hide (value is cleared from crypt-env's memory; the terminal may keep it in scrollback)", Style::default().fg(TX3))),
                 ])
                 .block(modal_block(" revealed ", WARN))
                 .wrap(Wrap { trim: false }),
@@ -1000,13 +1019,94 @@ mod tests {
         assert!(matches!(app.modal, Modal::None));
 
         let mut app = app_with(FakeVault::new(vec![]), dir.path());
-        app.modal = Modal::Password { purpose: Gated::Fill, input: "secret".into(), error: None };
+        app.modal = Modal::Password { purpose: Gated::Fill, input: Zeroizing::new("secret".to_string()), error: None };
         handle_key(&mut app, ctrl('c'));
         assert!(app.quit, "Ctrl+C exits even from a modal");
 
         let mut app = app_with(FakeVault::new(vec![]), dir.path());
         handle_key(&mut app, key('q'));
         assert!(app.quit);
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    fn password_input(app: &App) -> &str {
+        match &app.modal {
+            Modal::Password { input, .. } => input.as_str(),
+            _ => panic!("password modal expected"),
+        }
+    }
+
+    fn password_app(purpose: Gated, dir: &std::path::Path) -> App {
+        let mut app = app_with(FakeVault::new(vec![]), dir);
+        app.modal = Modal::Password { purpose, input: new_password_input(), error: None };
+        app
+    }
+
+    #[test]
+    fn password_input_never_reallocates_and_refuses_input_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = password_app(Gated::Fill, dir.path());
+        let before = match &app.modal {
+            Modal::Password { input, .. } => (input.as_ptr(), input.capacity()),
+            _ => unreachable!(),
+        };
+        for _ in 0..(PASSWORD_CAP + 50) {
+            handle_key(&mut app, key('a'));
+        }
+        assert_eq!(password_input(&app).len(), PASSWORD_CAP);
+        match &app.modal {
+            Modal::Password { input, .. } => {
+                assert_eq!((input.as_ptr(), input.capacity()), before, "buffer must not move or grow")
+            }
+            _ => unreachable!(),
+        }
+        // A multi-byte char that would cross the cap is refused whole.
+        handle_key(&mut app, key('é'));
+        assert_eq!(password_input(&app).len(), PASSWORD_CAP);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(password_input(&app).len(), PASSWORD_CAP - 1);
+    }
+
+    #[test]
+    fn esc_at_login_wipes_the_typed_password_and_quits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = password_app(Gated::Login, dir.path());
+        for c in "hunter2".chars() {
+            handle_key(&mut app, key(c));
+        }
+        assert_eq!(password_input(&app), "hunter2");
+        handle_key(&mut app, esc());
+        assert!(app.quit);
+        assert_eq!(password_input(&app), "", "typed characters are wiped before exit");
+    }
+
+    #[test]
+    fn ctrl_c_wipes_the_typed_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = password_app(Gated::Fill, dir.path());
+        handle_key(&mut app, key('x'));
+        handle_key(&mut app, ctrl('c'));
+        assert!(app.quit);
+        assert_eq!(password_input(&app), "");
+    }
+
+    #[test]
+    fn esc_on_a_gated_prompt_closes_it_and_enter_moves_the_password_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = password_app(Gated::Fill, dir.path());
+        handle_key(&mut app, key('x'));
+        handle_key(&mut app, esc());
+        assert!(matches!(app.modal, Modal::None));
+
+        let mut app = password_app(Gated::Fill, dir.path());
+        app.defer = true; // keep the submission queued instead of running it
+        handle_key(&mut app, key('p'));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(password_input(&app), "", "the modal no longer holds the submitted password");
+        assert!(matches!(&app.pending, Some(Pending::Submit(_, pw)) if pw.as_str() == "p"));
     }
 
     /// A workspace whose manifest adds `apps/web/.env`; the vault project is

@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use zeroize::Zeroizing;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -225,8 +226,8 @@ impl ApprovalStore {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ApprovalSecret {
-    Relay { code: String, passphrase: String },
-    Export { path: String, passphrase: String },
+    Relay { code: String, passphrase: Zeroizing<String> },
+    Export { path: String, passphrase: Zeroizing<String> },
 }
 
 /// Returned to the GUI by `approval_resolve`.

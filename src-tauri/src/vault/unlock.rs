@@ -20,7 +20,7 @@ use super::{
     decrypt_item, migrate_literal_vars_to_items, Category, SharedState, UnlockPayload, VaultItem,
 };
 use crate::biometric::{self, wrap, HelloError, HelloSigner};
-use crate::crypto::{self, CryptoKey};
+use crate::crypto::{self, VaultKey};
 
 // ─── auto_lock_timeout ────────────────────────────────────────────────────────
 
@@ -174,7 +174,7 @@ impl UnlockError {
 
 /// Result of the derivation phase.
 pub struct Derived {
-    key: Zeroizing<CryptoKey>,
+    key: VaultKey,
     /// Salt and verify token of a brand-new vault (first-run setup).
     new_meta: Option<(String, String)>,
 }
@@ -193,14 +193,14 @@ fn derive_for_unlock(
 ) -> Result<Derived, UnlockError> {
     match meta {
         Some((salt, token)) => match crypto::unlock_vault_crypto(password, &salt, &token) {
-            Ok(key) => Ok(Derived { key: Zeroizing::new(key), new_meta: None }),
+            Ok(key) => Ok(Derived { key, new_meta: None }),
             Err(e) if e == crypto::INCORRECT_PASSWORD => Err(UnlockError::IncorrectPassword),
             Err(e) => Err(UnlockError::Other(e)),
         },
         None => {
             let (salt, token, key) =
                 crypto::init_vault_crypto(password).map_err(UnlockError::Other)?;
-            Ok(Derived { key: Zeroizing::new(key), new_meta: Some((salt, token)) })
+            Ok(Derived { key, new_meta: Some((salt, token)) })
         }
     }
 }
@@ -322,7 +322,7 @@ where
     // The key is published to `VaultState` only after every fallible step has
     // succeeded: REST/MCP treat `key.is_some()` as "unlocked", so a failure
     // below must leave the vault locked.
-    let key: &CryptoKey = &derived.key;
+    let key: &VaultKey = &derived.key;
     migrate_literal_vars_to_items(&s.db, key).await.map_err(UnlockError::Other)?;
 
     let payload = if want_payload {
@@ -336,7 +336,7 @@ where
     Ok(UnlockOutcome { epoch: s.epoch, payload })
 }
 
-async fn load_payload(db: &crate::db::VaultDb, key: &CryptoKey) -> Result<UnlockPayload, String> {
+async fn load_payload(db: &crate::db::VaultDb, key: &VaultKey) -> Result<UnlockPayload, String> {
     let raw = db.list_items().await?;
     let items: Vec<VaultItem> = raw
         .into_iter()
@@ -368,9 +368,8 @@ pub async fn verify_password(shared: &SharedState, password: &[u8]) -> Result<()
     };
     let password = Zeroizing::new(password.to_vec());
     tokio::task::spawn_blocking(move || {
-        crypto::unlock_vault_crypto(&password, &salt, &token).map(|mut k| {
-            zeroize::Zeroize::zeroize(&mut k);
-        })
+        // The derived key is dropped (and wiped) right away.
+        crypto::unlock_vault_crypto(&password, &salt, &token).map(|_| ())
     })
     .await
     .map_err(|_| "key derivation task failed".to_string())?
@@ -378,10 +377,10 @@ pub async fn verify_password(shared: &SharedState, password: &[u8]) -> Result<()
 
 /// Output of the change-password derivation phase.
 pub struct Rekey {
-    old_key: Zeroizing<CryptoKey>,
+    old_key: VaultKey,
     new_salt: String,
     new_token: String,
-    new_key: Zeroizing<CryptoKey>,
+    new_key: VaultKey,
 }
 
 fn derive_for_rekey(
@@ -390,9 +389,9 @@ fn derive_for_rekey(
     meta: (String, String),
 ) -> Result<Rekey, String> {
     let (salt, token) = meta;
-    let old_key = Zeroizing::new(crypto::unlock_vault_crypto(current, &salt, &token)?);
+    let old_key = crypto::unlock_vault_crypto(current, &salt, &token)?;
     let (new_salt, new_token, new_key) = crypto::init_vault_crypto(new)?;
-    Ok(Rekey { old_key, new_salt, new_token, new_key: Zeroizing::new(new_key) })
+    Ok(Rekey { old_key, new_salt, new_token, new_key })
 }
 
 /// Re-keys the vault from `current_password` to `new_password`.

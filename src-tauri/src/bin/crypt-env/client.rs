@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use zeroize::Zeroizing;
 
 /// Built-in REST base URL, used when `CRYPTENV_API_URL` is unset or empty.
 pub const DEFAULT_API_BASE: &str = "https://127.0.0.1:47821";
@@ -28,11 +29,14 @@ pub fn is_non_interactive() -> bool {
 /// The only place the client reads the master password from the terminal.
 /// Returns [`CliError::SessionRequired`] instead of prompting when the TUI
 /// owns the terminal.
-pub fn prompt_password() -> Result<String, CliError> {
+pub fn prompt_password() -> Result<Zeroizing<String>, CliError> {
     if is_non_interactive() {
         return Err(CliError::SessionRequired);
     }
-    rpassword::prompt_password("Master password: ").map_err(CliError::Io)
+    // The String rpassword returns is moved (not copied) into the wiping wrapper.
+    rpassword::prompt_password("Master password: ")
+        .map(Zeroizing::new)
+        .map_err(CliError::Io)
 }
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -225,9 +229,10 @@ pub struct ItemSummary {
     pub is_global: bool,
 }
 
-#[derive(Deserialize, Debug)]
+// No `Debug`: the value is a secret.
+#[derive(Deserialize)]
 struct RevealResponse {
-    value: String,
+    value: Zeroizing<String>,
 }
 
 // ─── Session token ────────────────────────────────────────────────────────────
@@ -534,7 +539,12 @@ pub fn http_client() -> Result<reqwest::blocking::Client, CliError> {
 /// POST /unlock — returns session token.
 pub fn api_unlock(password: &str) -> Result<String, CliError> {
     let client = http_client()?;
-    let body = serde_json::json!({ "master_password": password });
+    // Borrowed, so no second copy of the password is made here.
+    #[derive(serde::Serialize)]
+    struct UnlockRequest<'a> {
+        master_password: &'a str,
+    }
+    let body = UnlockRequest { master_password: password };
 
     let resp = client
         .post(format!("{}/unlock", api_base()))
@@ -566,9 +576,7 @@ pub fn ensure_session() -> Result<(), CliError> {
     if session_alive()? {
         return Ok(());
     }
-    let password = zeroize::Zeroizing::new(
-        prompt_password()?,
-    );
+    let password = prompt_password()?;
     authenticate(&password)
 }
 
@@ -803,7 +811,7 @@ pub fn authenticated_delete(url: &str) -> Result<reqwest::blocking::Response, Cl
 }
 
 /// POST /items/:id/reveal — returns the secret value of an item.
-pub fn api_reveal(item_id: i64, token: &str) -> Result<String, CliError> {
+pub fn api_reveal(item_id: i64, token: &str) -> Result<Zeroizing<String>, CliError> {
     let client = http_client()?;
     // confirm: true is required by the API to acknowledge the reveal action
     let body = serde_json::json!({ "confirm": true });
@@ -945,7 +953,7 @@ pub fn set_item_global(item_id: i64) -> Result<(), CliError> {
 /// Reveals one item's value with the cached session token.
 pub fn reveal_item(item_id: i64) -> Result<zeroize::Zeroizing<String>, CliError> {
     let token = get_auth_token()?;
-    api_reveal(item_id, &token).map(zeroize::Zeroizing::new)
+    api_reveal(item_id, &token)
 }
 
 /// `GET /items` in a project/environment scope with an `include_global`

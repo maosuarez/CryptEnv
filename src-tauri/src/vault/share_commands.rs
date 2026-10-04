@@ -3,6 +3,8 @@ use tauri::State;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
+use crate::crypto::SecretString;
+
 use crate::share::{self, package::PlainItem, relay, ShareState, ShareSessionState};
 use crate::vault::SharedState;
 
@@ -44,7 +46,7 @@ pub struct PollStatusResponse {
 
 #[derive(Serialize)]
 pub struct ExportFileResponse {
-    pub passphrase: String,
+    pub passphrase: Zeroizing<String>,
 }
 
 #[derive(Serialize)]
@@ -60,8 +62,7 @@ pub async fn share_start_send(
 ) -> Result<StartSendResponse, String> {
     let vault_key = {
         let guard = vault_state.lock().await;
-        let k = guard.key.as_ref().ok_or("vault is locked")?;
-        Zeroizing::new(**k)
+        guard.key.as_ref().ok_or("vault is locked")?.clone()
     };
 
     let pairing_code = share::start_listen_session(
@@ -86,8 +87,7 @@ pub async fn share_start_receive(
 ) -> Result<StartReceiveResponse, String> {
     let vault_key = {
         let guard = vault_state.lock().await;
-        let k = guard.key.as_ref().ok_or("vault is locked")?;
-        Zeroizing::new(**k)
+        guard.key.as_ref().ok_or("vault is locked")?.clone()
     };
 
     let fingerprint = share::connect_to_peer(
@@ -182,7 +182,7 @@ pub async fn share_export_file(
 
 #[tauri::command]
 pub async fn share_import_file(
-    passphrase: String,
+    passphrase: SecretString,
     vault_state: State<'_, SharedState>,
 ) -> Result<ImportFileResponse, String> {
     let path = tokio::task::spawn_blocking(|| {
@@ -194,7 +194,7 @@ pub async fn share_import_file(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "file open cancelled".to_string())?;
 
-    let outcome = share::import_package(&path, &passphrase, vault_state.inner(), None)
+    let outcome = share::import_package(&path, passphrase.expose(), vault_state.inner(), None)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -206,7 +206,7 @@ pub async fn share_import_file(
 #[derive(Serialize)]
 pub struct RelayShareResult {
     pub code: String,
-    pub passphrase: String,
+    pub passphrase: Zeroizing<String>,
 }
 
 #[tauri::command]
@@ -217,7 +217,7 @@ pub async fn share_relay_send(
     let (supabase_url, anon_key, plain_items) = {
         let mut guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        let vault_key: [u8; 32] = **k;
+        let vault_key = k.clone();
         guard.touch();
 
         let supabase_url = guard
@@ -314,13 +314,13 @@ pub async fn relay_schema_version(
 #[tauri::command]
 pub async fn share_relay_receive(
     code: String,
-    passphrase: String,
+    passphrase: SecretString,
     vault_state: State<'_, SharedState>,
 ) -> Result<Vec<String>, String> {
     let (vault_key, supabase_url, anon_key) = {
         let mut guard = vault_state.lock().await;
         let k = guard.key.as_ref().ok_or("vault is locked")?;
-        let vault_key: [u8; 32] = **k;
+        let vault_key = k.clone();
         guard.touch();
 
         let supabase_url = guard
@@ -341,7 +341,7 @@ pub async fn share_relay_receive(
         (vault_key, supabase_url, anon_key)
     };
 
-    let relay_key = relay::derive_relay_key_async(&code, &passphrase).await.map_err(|e| e.to_string())?;
+    let relay_key = relay::derive_relay_key_async(&code, passphrase.expose()).await.map_err(|e| e.to_string())?;
 
     let code_clone = code.clone();
     let url_clone = supabase_url.clone();
@@ -384,7 +384,7 @@ pub async fn share_relay_receive(
             created: now_ts.clone(),
             is_global: None,
         };
-        let json = serde_json::to_vec(&vault_item).map_err(|e| e.to_string())?;
+        let json = Zeroizing::new(serde_json::to_vec(&vault_item).map_err(|e| e.to_string())?);
         let encrypted = crate::crypto::encrypt(&vault_key, &json)?;
         guard
             .db

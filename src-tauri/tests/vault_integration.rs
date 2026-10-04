@@ -1,6 +1,7 @@
 // Integration tests for VaultDb using a real SQLite database in a temp directory.
 // Run with: cargo test --test vault_integration
 
+use crypt_env_lib::crypto::VaultKey;
 use crypt_env_lib::db::{LinkMode, VaultDb};
 use crypt_env_lib::project::{self, EnvironmentInput, EnvironmentVar, ProjectInput};
 use crypt_env_lib::vault::{self, VaultItem};
@@ -10,8 +11,8 @@ use tempfile::tempdir;
 /// db, one project with its auto-created default environment, and one vault
 /// item wired into that environment as `DB_PASSWORD`. Returns
 /// `(db, vault_key, environment_id)`.
-async fn setup_project_with_one_var(db: &VaultDb) -> ([u8; 32], i64) {
-    let key: [u8; 32] = [0x11u8; 32];
+async fn setup_project_with_one_var(db: &VaultDb) -> (VaultKey, i64) {
+    let key = VaultKey::from_slice(&[0x11u8; 32]).unwrap();
 
     let project_id = project::save_project(db, ProjectInput {
         id: 0,

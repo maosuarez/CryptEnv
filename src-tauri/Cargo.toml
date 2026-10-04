@@ -42,10 +42,10 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 # Cryptography
-argon2 = "0.5"
-aes-gcm = "0.10"
+argon2 = { version = "0.5", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 rand = "0.8"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
 subtle = "2"
 
 # HTTP server (local REST API on 127.0.0.1:47821)

@@ -107,7 +107,7 @@ pub fn import_package(path: &Path, passphrase: &str) -> Result<Vec<PlainItem>, S
     if salt_bytes.len() != 32 {
         return Err(ShareError::Protocol("salt must be 32 bytes".into()));
     }
-    let salt: [u8; 32] = salt_bytes.try_into().expect("length already checked");
+    let salt: [u8; 32] = salt_bytes.try_into().expect("length already checked"); // key-hygiene: not-a-key (salt)
 
     let key = derive_package_key(passphrase, &salt);
 

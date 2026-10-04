@@ -4,8 +4,6 @@
 
 use std::sync::Arc;
 
-use zeroize::Zeroizing;
-
 use super::{unlock, SharedState};
 use crate::biometric::{wrap, HelloSigner, BLOB_SETTING, NOTICE_SETTING};
 use crate::db::VaultDb;
@@ -22,7 +20,7 @@ pub async fn enroll(
     let (vault_key, epoch) = {
         let s = shared.lock().await;
         let key = s.key.as_ref().ok_or("vault is locked")?;
-        (Zeroizing::new(**key), s.epoch)
+        (key.clone(), s.epoch)
     };
     unlock::verify_password(shared, password).await?;
 
@@ -131,7 +129,7 @@ mod tests {
         let blob = setting(&v.state, BLOB_SETTING).await.unwrap();
         assert!(wrap::Enrollment::parse(&blob).is_some());
         assert!(!blob.contains(&v.master_password));
-        let key_hex = crate::crypto::hex_encode(&**v.state.lock().await.key.as_ref().unwrap());
+        let key_hex = crate::crypto::hex_encode(v.state.lock().await.key.as_ref().unwrap().expose());
         assert!(!blob.contains(&key_hex));
     }
 
@@ -162,13 +160,13 @@ mod tests {
         let v = unlocked_vault_empty().await;
         let hello = Arc::new(FakeHello::new());
         enroll(&v.state, hello.clone(), v.master_password.as_bytes()).await.unwrap();
-        let key = *v.state.lock().await.key.as_ref().unwrap().clone();
+        let key = v.state.lock().await.key.as_ref().unwrap().clone();
         crate::vault::lock_vault(&v.state).await;
         assert!(v.state.lock().await.key.is_none());
 
         let out = unlock::unlock_with_biometric(&v.state, hello.clone(), false).await.unwrap();
         let s = v.state.lock().await;
-        assert_eq!(**s.key.as_ref().unwrap(), key);
+        assert!(s.key.as_ref().unwrap().ct_eq(&key));
         assert_eq!(out.epoch, s.epoch);
         drop(s);
 

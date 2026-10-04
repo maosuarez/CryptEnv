@@ -209,8 +209,8 @@ async fn mcp_share_export_waits_for_approval_and_never_sees_the_passphrase() {
     let (_, poll) = req(&app, "GET", &format!("/approvals/{id}"), Some(&v.mcp_token), None).await;
     assert_eq!(poll.get("status").and_then(|s| s.as_str()), Some("approved"));
     assert_eq!(poll["meta"]["item_count"], 1);
-    assert!(!poll.to_string().contains(&passphrase), "polling must not reveal the passphrase");
-    assert!(!accepted.to_string().contains(&passphrase));
+    assert!(!poll.to_string().contains(passphrase.as_str()), "polling must not reveal the passphrase");
+    assert!(!accepted.to_string().contains(passphrase.as_str()));
 }
 
 #[tokio::test]
@@ -279,7 +279,7 @@ async fn lock_discards_pending_approvals() {
             &s.db.get_meta().await.unwrap().unwrap().1,
         )
         .unwrap();
-        s.set_key(Some(zeroize::Zeroizing::new(key)));
+        s.set_key(Some(key.clone()));
     }
     assert!(v.api.approval_view(&id).await.is_none());
     assert!(v.api.resolve_approval(&id, true).await.is_err());
