@@ -362,7 +362,7 @@
 
     <!-- ===================== 5. CLI ===================== -->
     <h2 id="cli"><span class="num">04</span>CLI reference<a class="anchor" href="#cli">#</a></h2>
-    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. <strong>Locking the vault ends every CLI session</strong> (a locked vault never renews one, and after the next unlock each terminal asks for the password again). Each terminal — Unix session + tty, or Windows console / Terminal tab — has its own session and token file; other terminals prompt for their own and never log each other out. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
+    <p><code>crypt-env</code> talks to the running app. The first authenticated command prompts for your master password (hidden input) and caches a session token. Commands marked 🔒 need a <strong>live session in the current terminal</strong>, like <code>sudo</code>: without one they ask for the master password (a wrong one aborts with no side effects). The session lasts the <strong>auto-lock timeout</strong> from Settings (default 5 min; "Never" still means 5 min here) and every command renews it, so a chain of commands asks once. <strong>Locking the vault ends every CLI session</strong> (a locked vault never renews one, and after the next unlock each terminal asks for the password again). Each terminal — Unix session + tty, or Windows console / Terminal tab (console host process + start time, so a recycled handle never inherits a session) — has its own session and token file (created <code>0600</code>, atomically); other terminals prompt for their own and never log each other out. A <code>5xx</code>, <code>429</code> or network error keeps the token; only a <code>401</code> discards it. <code>eval "$(crypt-env inject X)"</code> subshells count as the same terminal.</p>
     <div class="table-wrap"><table>
       <tr><th>Command</th><th>Purpose</th></tr>
       <tr><td><code>init [NAME] [--path PATH]</code></td><td>Register this directory as a project root and write <code>.crypt-env.yaml</code></td></tr>
@@ -390,7 +390,7 @@ crypt-env init backend-api --path ./app  <span class="c"># default env → app/.
 
     <h3 id="cli-items">Secrets &amp; env files<a class="anchor" href="#cli-items">#</a></h3>
     <h4>crypt-env add KEY=value | $VARNAME | FILE [--env NAME] [--global]</h4>
-    <p>Adds secrets to the environment. If any key already exists there (or among global items with <code>--global</code>) nothing is added: <code>Error: Key 'K' already exists in environment 'E'. Addition aborted.</code> The CLI then offers to show the colliding value — only after <kbd>y</kbd> <strong>and</strong> the master password.</p>
+    <p>Adds secrets to the environment. If any key already exists there (or among global items with <code>--global</code>) nothing is added: <code>Error: Key 'K' already exists in environment 'E'. Addition aborted.</code> The CLI then offers to show the colliding value — only after <kbd>y</kbd> <strong>and</strong> the master password. If a key's request fails, the rest are still attempted; <code>add</code> then lists the keys added and failed (names only) and <strong>exits with status 2</strong>.</p>
     <div class="code"><span class="label">shell</span><pre><code>crypt-env add "OPENAI_API_KEY=sk-..."
 crypt-env add '$DATABASE_URL'
 crypt-env add .env.local --env staging
@@ -421,7 +421,7 @@ crypt-env setup wsl Ubuntu         <span class="c"># from Windows</span></code><
 
     <!-- ===================== 6. TUI ===================== -->
     <h2 id="tui"><span class="num">05</span>Interactive TUI<a class="anchor" href="#tui">#</a></h2>
-    <p>Three panes — projects · environments (plus <em>global items</em>) · variables with values masked — opening on the current directory's project. Workspace actions run on the current directory's <code>.crypt-env.yaml</code>.</p>
+    <p>Three panes — projects · environments (plus <em>global items</em>) · variables with values masked — opening on the current directory's project. Workspace actions run on the current directory's <code>.crypt-env.yaml</code>. Pending requests show <code>working…</code> and time out after 5 s; the terminal is always restored on exit.</p>
     <div class="code"><span class="label">shell</span><pre><code>crypt-env tui</code></pre></div>
     <div class="table-wrap"><table>
       <tr><th>Key</th><th>Action</th></tr>

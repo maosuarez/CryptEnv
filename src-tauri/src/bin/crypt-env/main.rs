@@ -59,7 +59,8 @@ fn main() {
     });
     if let Err(e) = result {
         eprintln!("{}", e);
-        std::process::exit(1);
+        // 2 = partial failure (some items done), distinct from a hard error.
+        std::process::exit(if matches!(e, client::CliError::Partial(_)) { 2 } else { 1 });
     }
 }
 

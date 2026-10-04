@@ -78,7 +78,8 @@ pub fn run(args: AddArgs) -> Result<(), CliError> {
         client::urlencod(&project.name),
         client::urlencod(&env.name)
     );
-    for (key, value) in &pairs {
+    let scope_label = format!("{} / {}{}", project.name, env.name, if args.global { ", global" } else { "" });
+    let outcome = add_all(&pairs, |key, value| {
         let body = serde_json::json!({
             "id": 0,
             "type": "secret",
@@ -89,28 +90,69 @@ pub fn run(args: AddArgs) -> Result<(), CliError> {
             "key": key,
         });
         let resp = client::authenticated_post(&url, &body)?;
-        if resp.status().is_success() {
-            // Items are never created global server-side; flip it explicitly.
-            if args.global {
-                let id = resp
-                    .json::<serde_json::Value>()
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
-                    .ok_or_else(|| CliError::Api(format!("added '{key}' but the response had no id")))?;
-                client::set_item_global(id)?;
-            }
-            eprintln!(
-                "Added: {key} ({} / {}{})",
-                project.name,
-                env.name,
-                if args.global { ", global" } else { "" }
-            );
-        } else {
-            // Only the key name — never the value.
-            eprintln!("Failed to add '{key}': HTTP {}", resp.status());
+        if !resp.status().is_success() {
+            return Err(CliError::Api(format!("HTTP {}", resp.status())));
+        }
+        // Items are never created global server-side; flip it explicitly.
+        if args.global {
+            let id = resp
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
+                .ok_or_else(|| CliError::Api("added but the response had no id".into()))?;
+            client::set_item_global(id)?;
+        }
+        Ok(())
+    });
+    for key in &outcome.added {
+        eprintln!("Added: {key} ({scope_label})");
+    }
+    for (key, why) in &outcome.failed {
+        // Only the key name and the error — never the value.
+        eprintln!("Failed to add '{key}': {why}");
+    }
+    outcome.into_result()
+}
+
+/// Per-key results of an `add`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AddOutcome {
+    pub added: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl AddOutcome {
+    /// `Ok` when every key was added; otherwise [`CliError::Partial`] (exit 2)
+    /// with a summary that names keys only.
+    pub fn into_result(self) -> Result<(), CliError> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let names = |v: Vec<&str>| if v.is_empty() { "none".to_string() } else { v.join(", ") };
+        Err(CliError::Partial(format!(
+            "added {}: {}; failed {}: {}",
+            self.added.len(),
+            names(self.added.iter().map(String::as_str).collect()),
+            self.failed.len(),
+            names(self.failed.iter().map(|(k, _)| k.as_str()).collect()),
+        )))
+    }
+}
+
+/// Adds every pair through `add_one`, continuing past failures so the caller
+/// can report all of them. `add_one` errors never carry the value.
+pub fn add_all(
+    pairs: &[(String, String)],
+    mut add_one: impl FnMut(&str, &str) -> Result<(), CliError>,
+) -> AddOutcome {
+    let mut outcome = AddOutcome::default();
+    for (key, value) in pairs {
+        match add_one(key, value) {
+            Ok(()) => outcome.added.push(key.clone()),
+            Err(e) => outcome.failed.push((key.clone(), e.to_string())),
         }
     }
-    Ok(())
+    outcome
 }
 
 /// `$VAR` → that variable; `KEY=value` → literal; anything else → a dotenv
@@ -170,6 +212,25 @@ mod tests {
             parse_input(f.to_str().unwrap()).unwrap(),
             vec![("X".into(), "1".into()), ("Y".into(), "two".into())]
         );
+    }
+
+    #[test]
+    fn partial_failure_lists_added_and_failed_keys_and_is_an_error() {
+        let pairs: Vec<(String, String)> =
+            ["A", "B", "C", "D"].iter().map(|k| (k.to_string(), "s3cret".to_string())).collect();
+        let outcome = add_all(&pairs, |k, _| {
+            if k == "C" { Err(CliError::Api("HTTP 500".into())) } else { Ok(()) }
+        });
+        assert_eq!(outcome.added, vec!["A", "B", "D"]);
+        assert_eq!(outcome.failed.len(), 1);
+        match outcome.into_result() {
+            Err(CliError::Partial(msg)) => {
+                assert!(msg.contains("added 3: A, B, D") && msg.contains("failed 1: C"), "{msg}");
+                assert!(!msg.contains("s3cret"));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(add_all(&pairs, |_, _| Ok(())).into_result().is_ok());
     }
 
     #[test]

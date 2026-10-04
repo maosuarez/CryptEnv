@@ -8,6 +8,7 @@ use clap::Args;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
+    cursor::Show,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -18,8 +19,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::cell::{Cell, RefCell};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -70,6 +73,16 @@ enum Gated {
     InitAdopt { name: String },
 }
 
+/// Status shown while a blocking backend call is pending.
+const WORKING: &str = "working…";
+
+/// A blocking action queued so the event loop can draw [`WORKING`] first.
+enum Pending {
+    Gate(Gated),
+    Submit(Gated, Zeroizing<String>),
+    Doctor,
+}
+
 enum Modal {
     None,
     Password { purpose: Gated, input: String, error: Option<String> },
@@ -102,6 +115,19 @@ struct App {
     status: Option<(String, bool)>,
     quit: bool,
     workspace_dir: PathBuf,
+    /// Cached `find_config` result, so idle redraws never touch the
+    /// filesystem (slow over 9P on `/mnt/c`). Dropped by [`App::reload`] and
+    /// before every workspace action.
+    config_path: RefCell<Option<Option<PathBuf>>>,
+    /// Compiled filter, cached per filter string.
+    matcher: RefCell<Option<(String, Rc<search::Matcher>)>>,
+    /// Queue blocking actions for the event loop instead of running them
+    /// inline (off in unit tests, which run reducers synchronously).
+    defer: bool,
+    pending: Option<Pending>,
+    /// Counters for the cache tests.
+    config_lookups: Cell<u32>,
+    matcher_builds: Cell<u32>,
 }
 
 impl App {
@@ -120,6 +146,52 @@ impl App {
             status: None,
             quit: false,
             workspace_dir,
+            config_path: RefCell::new(None),
+            matcher: RefCell::new(None),
+            defer: false,
+            pending: None,
+            config_lookups: Cell::new(0),
+            matcher_builds: Cell::new(0),
+        }
+    }
+
+    /// Nearest manifest from the workspace dir, resolved once until
+    /// [`App::forget_config_path`].
+    fn config_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                self.config_lookups.set(self.config_lookups.get() + 1);
+                scope::find_config(&self.workspace_dir)
+            })
+            .clone()
+    }
+
+    fn forget_config_path(&self) {
+        *self.config_path.borrow_mut() = None;
+    }
+
+    /// Matcher for the current filter; recompiled only when the filter text changes.
+    fn matcher(&self) -> Rc<search::Matcher> {
+        let mut cache = self.matcher.borrow_mut();
+        match cache.as_ref() {
+            Some((f, m)) if *f == self.filter => m.clone(),
+            _ => {
+                self.matcher_builds.set(self.matcher_builds.get() + 1);
+                let m = Rc::new(search::Matcher::new(if self.filter.is_empty() { None } else { Some(&self.filter) }));
+                *cache = Some((self.filter.clone(), m.clone()));
+                m
+            }
+        }
+    }
+
+    /// Runs `p` now, or queues it (showing [`WORKING`]) for the event loop.
+    fn schedule(&mut self, p: Pending) {
+        if self.defer {
+            self.status = Some((WORKING.into(), false));
+            self.pending = Some(p);
+        } else {
+            run_pending(self, p);
         }
     }
 
@@ -152,7 +224,7 @@ impl App {
     }
 
     fn rows(&self) -> Vec<VarRow> {
-        let m = search::Matcher::new(if self.filter.is_empty() { None } else { Some(&self.filter) });
+        let m = self.matcher();
         if self.global_selected() {
             return self
                 .globals
@@ -176,7 +248,9 @@ impl App {
     fn reload(&mut self) -> Result<(), CliError> {
         let selected = self.project().map(|p| p.id);
         self.projects = self.api.fetch_projects()?;
-        let ws_name = scope::find_config(&self.workspace_dir)
+        self.forget_config_path();
+        let ws_name = self
+            .config_path()
             .and_then(|p| scope::load_config(&p).ok())
             .map(|w| w.project.to_lowercase());
         let idx = selected
@@ -228,18 +302,51 @@ impl App {
 
 // ─── Entry / loop ─────────────────────────────────────────────────────────────
 
+/// Restores the terminal when dropped: leave the alternate screen, show the
+/// cursor, disable raw mode, hand the terminal back to the client. Created
+/// right after raw mode is enabled so every later exit path restores it.
+struct TerminalGuard<F: Fn()>(F);
+
+impl<F: Fn()> Drop for TerminalGuard<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+fn restore_terminal() {
+    client::set_non_interactive(false);
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+}
+
+/// Enables raw mode, then builds the terminal. The guard exists before
+/// `build` runs, so a `build` failure still restores the terminal.
+fn open_terminal<T, R: Fn()>(
+    enable_raw: impl FnOnce() -> io::Result<()>,
+    build: impl FnOnce() -> Result<T, CliError>,
+    restore: R,
+) -> Result<(TerminalGuard<R>, T), CliError> {
+    enable_raw().map_err(CliError::Io)?;
+    let guard = TerminalGuard(restore);
+    let terminal = build()?;
+    Ok((guard, terminal))
+}
+
 pub fn run(_args: TuiArgs) -> Result<(), CliError> {
     let cwd = std::env::current_dir()?;
-    enable_raw_mode().map_err(CliError::Io)?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(CliError::Io)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(|e| CliError::Api(e.to_string()))?;
+    let (_guard, mut terminal) = open_terminal(
+        enable_raw_mode,
+        || {
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen).map_err(CliError::Io)?;
+            Terminal::new(CrosstermBackend::new(stdout)).map_err(|e| CliError::Api(e.to_string()))
+        },
+        restore_terminal,
+    )?;
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        client::set_non_interactive(false);
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal();
         default_hook(info);
     }));
 
@@ -247,21 +354,24 @@ pub fn run(_args: TuiArgs) -> Result<(), CliError> {
     client::set_non_interactive(true);
 
     let mut app = App::new(cwd, Box::new(client::Live));
+    app.status = Some((WORKING.into(), false));
+    let _ = terminal.draw(|f| render(f, &app));
     if !matches!(app.api.session_alive(), Ok(true)) || app.reload().is_err() {
         app.modal = Modal::Password { purpose: Gated::Login, input: String::new(), error: None };
     }
-    let result = run_loop(&mut terminal, &mut app);
-
-    client::set_non_interactive(false);
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    result
+    app.status = None;
+    app.defer = true;
+    run_loop(&mut terminal, &mut app)
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<(), CliError> {
     while !app.quit {
         terminal.draw(|f| render(f, app)).map_err(|e| CliError::Api(e.to_string()))?;
+        // The frame above already shows `working…`; run what it announced.
+        if let Some(p) = app.pending.take() {
+            run_pending(app, p);
+            continue;
+        }
         if event::poll(Duration::from_millis(100)).map_err(CliError::Io)? {
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press {
@@ -305,7 +415,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Enter => {
                     let purpose = purpose.clone();
                     let pw = Zeroizing::new(std::mem::take(input));
-                    submit_password(app, purpose, &pw);
+                    app.schedule(Pending::Submit(purpose, pw));
                 }
                 _ => {}
             }
@@ -405,7 +515,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') => gate(app, Gated::Fill),
         KeyCode::Char('s') => gate(app, Gated::Sync { global: false }),
         KeyCode::Char('S') => gate(app, Gated::Sync { global: true }),
-        KeyCode::Char('d') => {
+        KeyCode::Char('d') => app.schedule(Pending::Doctor),
+        _ => {}
+    }
+}
+
+/// Executes a queued action, then clears the `working…` status it set.
+fn run_pending(app: &mut App, p: Pending) {
+    match p {
+        Pending::Gate(purpose) => gate_now(app, purpose),
+        Pending::Submit(purpose, pw) => submit_password(app, purpose, &pw),
+        Pending::Doctor => {
             let lines = doctor::execute()
                 .into_iter()
                 .map(|c| {
@@ -419,7 +539,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 .collect();
             app.report("doctor", lines);
         }
-        _ => {}
+    }
+    if matches!(&app.status, Some((m, _)) if m == WORKING) {
+        app.status = None;
     }
 }
 
@@ -450,6 +572,10 @@ fn step(app: &mut App, delta: i32) {
 /// Runs a gated action directly while this terminal's session is live (the
 /// check renews it); otherwise asks for the master password first.
 fn gate(app: &mut App, purpose: Gated) {
+    app.schedule(Pending::Gate(purpose));
+}
+
+fn gate_now(app: &mut App, purpose: Gated) {
     match app.api.session_alive() {
         Ok(true) => run_gated(app, purpose),
         Ok(false) => app.modal = Modal::Password { purpose, input: String::new(), error: None },
@@ -539,7 +665,9 @@ fn join_or_none(v: &[String]) -> String {
 /// The cwd workspace, without the legacy-notice `eprintln!` of
 /// `scope::workspace` (which would corrupt the alternate screen).
 fn workspace(app: &App) -> Result<scope::Workspace, CliError> {
-    let path = scope::find_config(&app.workspace_dir).ok_or_else(|| {
+    // User-driven action: look again, the manifest may have appeared or moved.
+    app.forget_config_path();
+    let path = app.config_path().ok_or_else(|| {
         CliError::Config(format!("no {} here — press `i` to init", scope::manifest::FILE_NAME))
     })?;
     scope::load_config(&path)
@@ -614,7 +742,8 @@ fn render(f: &mut Frame, app: &App) {
     let [top, body, bottom] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
 
-    let ws = scope::find_config(&app.workspace_dir)
+    let ws = app
+        .config_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "no .crypt-env.yaml here".into());
     f.render_widget(
@@ -943,5 +1072,68 @@ mod tests {
             }
             _ => panic!("expected an error report"),
         }
+    }
+
+    #[test]
+    fn idle_redraws_do_not_look_up_the_workspace_or_recompile_the_filter() {
+        let (dir, vault) = config_fixture();
+        let mut app = app_with(vault, dir.path());
+        app.reload().unwrap();
+        let lookups = app.config_lookups.get();
+        app.filter = "DEF.*".into();
+        let builds = app.matcher_builds.get();
+
+        // What an idle tick does: render-time lookups and row filtering.
+        for _ in 0..50 {
+            let _ = app.config_path();
+            let _ = app.rows();
+            let _ = app.rows();
+        }
+        assert_eq!(app.config_lookups.get(), lookups, "no find_config on idle ticks");
+        assert_eq!(app.matcher_builds.get(), builds + 1, "filter compiled once per change");
+
+        // `r` re-resolves the workspace exactly once.
+        handle_key(&mut app, key('r'));
+        assert_eq!(app.config_lookups.get(), lookups + 1);
+        app.filter = "other".into();
+        let _ = app.rows();
+        assert_eq!(app.matcher_builds.get(), builds + 2);
+    }
+
+    #[test]
+    fn blocking_actions_are_queued_with_a_working_status_when_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(FakeVault::new(vec![]), dir.path());
+        app.defer = true;
+        handle_key(&mut app, key('r'));
+        assert!(app.pending.is_some(), "not run inline");
+        assert_eq!(app.status.as_ref().map(|s| s.0.as_str()), Some(WORKING));
+        let p = app.pending.take().unwrap();
+        run_pending(&mut app, p);
+        assert_eq!(app.status.as_ref().map(|s| s.0.as_str()), Some("Reloaded"));
+    }
+
+    #[test]
+    fn terminal_is_restored_when_setup_fails_after_raw_mode() {
+        let restored = Cell::new(0);
+        let r: Result<(TerminalGuard<_>, ()), CliError> = open_terminal(
+            || Ok(()),
+            || Err(CliError::Api("Terminal::new failed".into())),
+            || restored.set(restored.get() + 1),
+        );
+        assert!(r.is_err());
+        assert_eq!(restored.get(), 1, "guard dropped on the error path");
+
+        // Raw mode itself failing means nothing to restore.
+        let r: Result<(TerminalGuard<_>, ()), CliError> =
+            open_terminal(|| Err(io::Error::other("no tty")), || Ok(()), || restored.set(restored.get() + 1));
+        assert!(r.is_err());
+        assert_eq!(restored.get(), 1);
+
+        // Success: restored when the guard is dropped.
+        let (guard, ()) = open_terminal(|| Ok(()), || Ok(()), || restored.set(restored.get() + 1)).unwrap();
+        assert_eq!(restored.get(), 1);
+        drop(guard);
+        assert_eq!(restored.get(), 2);
     }
 }

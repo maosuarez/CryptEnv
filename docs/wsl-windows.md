@@ -6,7 +6,7 @@ This guide covers the one networking prerequisite, how the two clients keep sepa
 
 - **GUI route** — Windows installer + **Settings → WSL Integration → Configure** (no Linux build needed). See [GUI route](#gui-route-settings--wsl-integration).
 - **Manual route** — `crypt-env setup wsl` from inside the distro, or `crypt-env setup wsl <distro>` from a Windows terminal (without `<distro>` it lists the installed distributions). See [Walkthrough](#walkthrough-crypt-env-setup-wsl).
-- **Per-terminal sessions** — the managed `crypt-env` launcher forwards `CRYPTENV_TERMINAL_ID` (distro + session id + tty) to the Windows CLI through `WSLENV`, so a password entered in one WSL terminal is reused there for the auto-lock timeout. Launchers installed before this change need **Configure** re-run.
+- **Per-terminal sessions** — the managed `crypt-env` launcher forwards `CRYPTENV_TERMINAL_ID` (distro + session id + tty + session-leader start time) to the Windows CLI through `WSLENV`, so a password entered in one WSL terminal is reused there for the auto-lock timeout. Launchers installed before this change need **Configure** re-run.
 - **Project paths** — the vault stores project roots and absolute paths as Windows sees them. A native Linux `crypt-env` inside WSL translates `/home/…` ↔ `\\wsl.localhost\<distro>\…` and `/mnt/c/…` ↔ `C:\…` automatically; prefer relative environment paths in `.crypt-env.yaml`, which need no translation.
 
 Both routes apply the exact same shell configuration (one shared implementation), and neither ever edits `%UserProfile%\.wslconfig`.

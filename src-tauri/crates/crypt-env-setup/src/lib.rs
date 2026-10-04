@@ -352,7 +352,8 @@ pub fn launcher_path(home: &Path) -> PathBuf {
 
 /// The launcher script: a fixed template whose only variable is the
 /// single-quoted in-distro path of the Windows `crypt-env.exe`. It exports
-/// `CRYPTENV_TERMINAL_ID` (distro + session id + tty, computed in this Linux
+/// `CRYPTENV_TERMINAL_ID` (distro + session id + tty + the session leader's
+/// start time, so a recycled session id is a new terminal; computed in this Linux
 /// shell) through `WSLENV`: interop gives every Windows process a fresh
 /// console, so the Windows CLI could not otherwise tell terminals apart for
 /// its per-terminal sessions.
@@ -367,7 +368,9 @@ pub fn launcher_script(exe: &Path) -> String {
          fi\n\
          if [ -z \"$CRYPTENV_TERMINAL_ID\" ]; then\n\
          \x20 t=$(tty 2>/dev/null) || t=notty\n\
-         \x20 CRYPTENV_TERMINAL_ID=\"wsl:$WSL_DISTRO_NAME:$(ps -o sid= -p $$ 2>/dev/null | tr -d ' '):$t\"\n\
+         \x20 sid=$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')\n\
+         \x20 st=$(sed 's/.*) //' \"/proc/$sid/stat\" 2>/dev/null | cut -d' ' -f20)\n\
+         \x20 CRYPTENV_TERMINAL_ID=\"wsl:$WSL_DISTRO_NAME:$sid:$t:$st\"\n\
          fi\n\
          WSLENV=\"${{WSLENV:+$WSLENV:}}CRYPTENV_TERMINAL_ID\"\n\
          export CRYPTENV_TERMINAL_ID WSLENV\n\
@@ -879,7 +882,11 @@ mod tests {
         // Terminal id forwarded to the Windows CLI through WSLENV.
         let mut parts = ids.trim_start_matches('|').splitn(2, '|');
         let (id, wslenv) = (parts.next().unwrap(), parts.next().unwrap());
-        assert!(id.starts_with("wsl:Deb:") && id.ends_with(":notty"), "{id}");
+        // wsl:<distro>:<sid>:<tty>:<leader start time>
+        let fields: Vec<&str> = id.split(':').collect();
+        assert_eq!(fields.len(), 5, "{id}");
+        assert_eq!((fields[0], fields[1], fields[3]), ("wsl", "Deb", "notty"), "{id}");
+        assert!(!fields[4].is_empty() && fields[4].bytes().all(|b| b.is_ascii_digit()), "start time in {id}");
         assert_eq!(wslenv, "USERPROFILE/p:CRYPTENV_TERMINAL_ID");
 
         // An id already in the environment is kept.

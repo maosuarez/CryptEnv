@@ -52,6 +52,9 @@ pub enum CliError {
     /// `CRYPTENV_CERT_PATH`, `setup wsl` preconditions). Messages name only
     /// environment-variable names and file paths — never secret values.
     Config(String),
+    /// A multi-item command finished with some failures (already reported
+    /// per key name); the process exits with status 2.
+    Partial(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -67,6 +70,7 @@ impl std::fmt::Display for CliError {
             CliError::VaultLocked => write!(f, "Error: vault is locked"),
             CliError::SessionRequired => write!(f, "Error: a password session is required"),
             CliError::Config(msg) => write!(f, "Configuration error: {msg}"),
+            CliError::Partial(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -293,7 +297,42 @@ pub fn read_token() -> Option<String> {
 /// On Windows, `%APPDATA%` inherits user-only NTFS ACLs from the OS, so no
 /// additional ACL manipulation is needed via std. The write itself is best-effort.
 fn write_token_file(path: &Path, content: &str) -> std::io::Result<()> {
-    write_token_file_inner(path, content, harden_token_permissions)
+    // Preferred path: private temp file renamed into place, so the token is
+    // never visible with group/other bits. Where that is impossible (a
+    // filesystem that refuses the rename, e.g. DrvFs), fall back to the plain
+    // write + best-effort harden; a write that cannot succeed still errors.
+    match write_token_file_atomic(path, content) {
+        Ok(()) => Ok(()),
+        Err(_) => write_token_file_inner(path, content, harden_token_permissions),
+    }
+}
+
+/// Creates a uniquely named temp file next to `path` (0600 on Unix from the
+/// moment it exists), writes and syncs the token, then renames it over `path`.
+fn write_token_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new().prefix(".tok-").tempfile_in(dir)?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Creates `dir` (and missing parents), owner-only (0700) on Unix.
+fn create_token_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// Testable core of [`write_token_file`]: writes `content`, then runs `harden`
@@ -337,7 +376,7 @@ pub fn save_token(token: &str) {
     }
     if let Some(path) = token_file_path() {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = create_token_dir(parent);
         }
         let _ = write_token_file(&path, token);
     }
@@ -439,12 +478,27 @@ fn build_pinned_or_plain(path: Option<&Path>) -> reqwest::blocking::Client {
         let path = path.ok_or("cannot determine cert path")?;
         let pem_bytes = std::fs::read(path)?;
         let cert = reqwest::Certificate::from_pem(&pem_bytes)?;
-        Ok(reqwest::blocking::ClientBuilder::new()
+        Ok(client_builder()
             .add_root_certificate(cert)
             // Do NOT use danger_accept_invalid_certs — we load the actual cert.
             .build()?)
     })()
-    .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    .unwrap_or_else(|_| client_builder().build().unwrap_or_else(|_| reqwest::blocking::Client::new()))
+}
+
+/// Request timeout while the TUI owns the terminal: a stalled backend must
+/// not freeze its event loop for reqwest's default 30 s.
+const TUI_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Client builder shared by every constructor; applies [`TUI_HTTP_TIMEOUT`]
+/// in non-interactive (TUI) mode.
+fn client_builder() -> reqwest::blocking::ClientBuilder {
+    let b = reqwest::blocking::ClientBuilder::new();
+    if is_non_interactive() {
+        b.timeout(TUI_HTTP_TIMEOUT)
+    } else {
+        b
+    }
 }
 
 /// Build a `reqwest` blocking client that trusts exactly the vault's cert.
@@ -468,7 +522,7 @@ pub fn http_client() -> Result<reqwest::blocking::Client, CliError> {
                     path.display()
                 ))
             })?;
-            reqwest::blocking::ClientBuilder::new()
+            client_builder()
                 .add_root_certificate(cert)
                 .build()
                 .map_err(|e| CliError::Api(e.to_string()))
@@ -522,18 +576,31 @@ pub fn ensure_session() -> Result<(), CliError> {
 /// probe slides its expiry; a rejected token is deleted. Never prompts.
 pub fn session_alive() -> Result<bool, CliError> {
     let Some(token) = read_token() else { return Ok(false) };
-    let resp = http_client()?
-        .get(format!("{}/settings", api_base()))
-        .header("X-Vault-Token", &token)
+    let alive = probe_session(&http_client()?, api_base(), &token)?;
+    if !alive {
+        clear_token();
+    }
+    Ok(alive)
+}
+
+/// `GET /settings` with `token`: 2xx alive, 401 rejected (`Ok(false)`, the
+/// caller deletes the token), 403 locked, anything else (5xx, 429, network)
+/// an error that must leave the token in place.
+fn probe_session(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Result<bool, CliError> {
+    let resp = client
+        .get(format!("{base}/settings"))
+        .header("X-Vault-Token", token)
         .send()
         .map_err(|e| if e.is_connect() { CliError::ConnectionRefused } else { CliError::Api(e.to_string()) })?;
     match resp.status() {
         s if s.is_success() => Ok(true),
+        reqwest::StatusCode::UNAUTHORIZED => Ok(false),
         reqwest::StatusCode::FORBIDDEN => Err(CliError::VaultLocked),
-        _ => {
-            clear_token();
-            Ok(false)
-        }
+        s => Err(CliError::Api(format!("session check failed: HTTP {s}"))),
     }
 }
 
@@ -1143,5 +1210,85 @@ mod tests {
         set_non_interactive(false);
         assert!(matches!(result, Err(CliError::SessionRequired)));
         assert!(!is_non_interactive());
+    }
+
+    /// One-shot HTTP server answering every request with `status`.
+    fn mock_server(status: u16) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf);
+                let _ = write!(conn, "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn probe_session_maps_each_status() {
+        let c = reqwest::blocking::Client::new();
+        assert!(matches!(probe_session(&c, &mock_server(200), "t"), Ok(true)));
+        assert!(matches!(probe_session(&c, &mock_server(401), "t"), Ok(false)));
+        assert!(matches!(probe_session(&c, &mock_server(403), "t"), Err(CliError::VaultLocked)));
+        for status in [500, 503, 429] {
+            assert!(
+                matches!(probe_session(&c, &mock_server(status), "t"), Err(CliError::Api(m)) if m.contains(&status.to_string())),
+                "{status} must be an error, not a rejection"
+            );
+        }
+        // Nothing listening: a network error, not a rejection.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        assert!(probe_session(&c, &base, "t").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_is_written_private_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a").join("b");
+        create_token_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let path = dir.join(".cli_token.0123456789abcdef");
+        write_token_file(&path, "tok").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tok");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_never_exists_with_group_or_other_bits_during_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cli_token.0123456789abcdef");
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (dir, done) = (dir.path().to_path_buf(), done.clone());
+            std::thread::spawn(move || {
+                let mut loose = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                        if let Ok(m) = e.metadata() {
+                            if m.permissions().mode() & 0o077 != 0 {
+                                loose.push(e.file_name());
+                            }
+                        }
+                    }
+                }
+                loose
+            })
+        };
+        for i in 0..300 {
+            write_token_file(&path, &format!("token-{i}")).unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        assert!(watcher.join().unwrap().is_empty(), "a token file was observed with group/other bits");
     }
 }
