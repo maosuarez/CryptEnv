@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { copySecret } from '../lib/clipboard';
 import { Icon } from './ui/Icon';
 import { RelayCodeDisplay } from './ui/RelayCodeDisplay';
 import { RelaySchemaOutdatedNotice, isRelaySchemaOutdated } from './ui/RelaySql';
@@ -506,7 +506,7 @@ export function ShareModal({ selectedIds, onClose, onImportDone, onSendDone }: S
 
   const handleCopyPassphrase = async () => {
     try {
-      await writeText(exportPassphrase);
+      await copySecret(exportPassphrase);
       setCopiedPass(true);
       setTimeout(() => setCopiedPass(false), 2000);
     } catch { /* ignore */ }

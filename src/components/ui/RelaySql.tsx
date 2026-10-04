@@ -1,5 +1,6 @@
 import { Icon } from './Icon';
 import { useTranslation } from '../../i18n';
+import { copyPlain } from '../../lib/clipboard';
 
 /** Relay SQL v2: no anon table access; single-use and expiry enforced by the RPCs. */
 export const RELAY_SQL = `create table if not exists relay_packages_v2 (
@@ -44,7 +45,7 @@ export function RelaySqlBlock({ onCopied }: { onCopied?: () => void }) {
       <div className="flex items-center justify-between px-3 py-2 border-b border-bd">
         <span className="text-[11px] font-mono text-tx3 tracking-[0.06em]">{t('settings.relay.runInEditor')}</span>
         <button
-          onClick={() => navigator.clipboard.writeText(RELAY_SQL).then(() => onCopied?.())}
+          onClick={() => copyPlain(RELAY_SQL).then(() => onCopied?.())}
           className="text-tx3 hover:text-accent transition-colors"
           title={t('settings.relay.copySql')}
           aria-label={t('settings.relay.copySql')}

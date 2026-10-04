@@ -254,6 +254,8 @@ pub async fn lock_vault(shared: &SharedState) {
     // A share session holds its own copy of the vault key and may have a
     // listener open; locking ends it.
     crate::share::cancel_all(&share).await;
+    // A secret still on the clipboard must not outlive the session.
+    let _ = tokio::task::spawn_blocking(crate::clipboard::clear_if_ours).await;
 }
 
 #[tauri::command]

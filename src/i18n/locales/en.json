@@ -54,6 +54,9 @@
     "deleteTitle": "Delete \"{name}\"?",
     "deleteBody": "This category will be removed from all {n} items that use it."
   },
+  "clipboard": {
+    "secretCopied": "{label} · clears in 30 s"
+  },
   "common": {
     "back": "Back",
     "cancel": "CANCEL",

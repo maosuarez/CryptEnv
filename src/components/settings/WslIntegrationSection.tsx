@@ -1,5 +1,6 @@
 import { Icon } from '../ui/Icon';
 import { useVaultStore } from '../../store';
+import { copyPlain } from '../../lib/clipboard';
 import { useWslStore } from '../../store/wslStore';
 import { formatWslError, useWslConfigure, useWslDetect, useWslRemove } from '../../hooks/useWsl';
 import { t as tr, useTranslation } from '../../i18n';
@@ -86,7 +87,7 @@ function MirroredBanner() {
           {t('wsl.addTo')}
         </span>
         <button
-          onClick={() => navigator.clipboard.writeText(WSLCONFIG_SNIPPET).then(() => showToast(t('wsl.snippetCopied')))}
+          onClick={() => copyPlain(WSLCONFIG_SNIPPET).then(() => showToast(t('wsl.snippetCopied')))}
           className="text-tx3 hover:text-accent transition-colors"
           title={t('wsl.copySnippet')}
           aria-label={t('wsl.copySnippetAria')}

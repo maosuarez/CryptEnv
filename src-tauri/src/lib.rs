@@ -2,6 +2,7 @@ use tauri::{Emitter, Manager};
 
 pub mod api;
 pub mod biometric;
+pub mod clipboard;
 pub mod cli;
 pub mod crypto;
 pub mod db;
@@ -44,6 +45,7 @@ use project::{
     project_preview_delete, project_save, project_check_root, project_pick_root_dir, project_write_yaml,
 };
 use project::relay_commands::{project_relay_receive, project_relay_send};
+use clipboard::clipboard_write_secret;
 use wsl::{wsl_configure_client, wsl_detect, wsl_distro_home, wsl_list_distros, wsl_remove_client};
 
 struct PendingUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
@@ -236,6 +238,7 @@ pub fn run() {
             vault_is_setup,
             vault_unlock,
             vault_lock,
+            clipboard_write_secret,
             vault_touch,
             vault_list,
             vault_get_items,

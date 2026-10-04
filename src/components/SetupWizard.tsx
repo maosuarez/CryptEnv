@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Icon } from './ui/Icon';
 import { useTranslation } from '../i18n';
+import { copySecret } from '../lib/clipboard';
 
 interface SetupWizardProps {
   onClose: () => void;
@@ -122,10 +123,10 @@ export function SetupWizard({ onClose }: SetupWizardProps) {
                 {token && (
                   <button
                     onClick={() => {
-                      navigator.clipboard.writeText(token).then(() => {
+                      copySecret(token).then(() => {
                         setCopied(true);
                         setTimeout(() => setCopied(false), 2000);
-                      });
+                      }).catch(() => {});
                     }}
                     className="text-[10px] font-mono text-tx3 hover:text-tx transition-colors cursor-pointer bg-transparent border-none px-0"
                   >

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Icon } from './Icon';
 import { useTranslation } from '../../i18n';
+import { copySecret } from '../../lib/clipboard';
 
 /**
  * Two-box "code" + "passphrase" display with copy buttons, used after a
@@ -15,14 +16,16 @@ export function RelayCodeDisplay({ code, passphrase }: { code: string; passphras
   const [copiedPass, setCopiedPass] = useState(false);
 
   const copyCode = () => {
-    navigator.clipboard.writeText(code);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
+    copySecret(code).then(() => {
+      setCopiedCode(true);
+      setTimeout(() => setCopiedCode(false), 2000);
+    }).catch(() => {});
   };
   const copyPass = () => {
-    navigator.clipboard.writeText(passphrase);
-    setCopiedPass(true);
-    setTimeout(() => setCopiedPass(false), 2000);
+    copySecret(passphrase).then(() => {
+      setCopiedPass(true);
+      setTimeout(() => setCopiedPass(false), 2000);
+    }).catch(() => {});
   };
 
   return (

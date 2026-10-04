@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -65,7 +65,8 @@ function MainApp() {
     return () => { unlisten.then((f) => f()).catch(() => {}); };
   }, [lockedByBackend]);
 
-  const [showSetupWizard, setShowSetupWizard] = useState(false);
+  const showSetupWizard = useVaultStore((s) => s.wizardOpen);
+  const setWizardOpen   = useVaultStore((s) => s.setWizardOpen);
   const prevScreenRef = useRef<Screen>(screen);
 
   useEffect(() => {
@@ -73,12 +74,12 @@ function MainApp() {
     prevScreenRef.current = screen;
     if (prev === 'lock' && screen === 'projects') {
       invoke<boolean>('app_is_first_run')
-        .then((isFirst) => { if (isFirst) setShowSetupWizard(true); })
+        .then((isFirst) => { if (isFirst) setWizardOpen(true); })
         .catch(() => {});
     }
     // First unlock of this launch → background update check (no-op afterwards).
     if (prev === 'lock' && screen !== 'lock') checkForUpdate();
-  }, [screen, checkForUpdate]);
+  }, [screen, checkForUpdate, setWizardOpen]);
 
   return (
     <div className="flex flex-col w-full h-full bg-bg overflow-hidden">
@@ -106,14 +107,15 @@ function MainApp() {
       <ApprovalModal />
       {menu && <ContextMenu {...menu} onClose={closeMenu} />}
       {toast && <Toast msg={toast.type === 'error' ? toast.msg : `✓ ${toast.msg}`} type={toast.type} />}
-      {placeholder && placeholder.type === 'command' && (
+      {/* Secret-bearing overlays never render over the lock screen. */}
+      {screen !== 'lock' && placeholder && placeholder.type === 'command' && (
         <PlaceholderModal
           command={(placeholder as any).command}
           onClose={() => setPlaceholder(null)}
         />
       )}
-      {showSetupWizard && (
-        <SetupWizard onClose={() => setShowSetupWizard(false)} />
+      {screen !== 'lock' && showSetupWizard && (
+        <SetupWizard onClose={() => setWizardOpen(false)} />
       )}
     </div>
   );

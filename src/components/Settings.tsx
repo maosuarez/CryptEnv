@@ -10,6 +10,7 @@ import { ReceiveModal } from './ReceiveModal';
 import { WslIntegrationSection } from './settings/WslIntegrationSection';
 import { ApiStatusBanner } from './settings/ApiStatusBanner';
 import { useVaultStore } from '../store';
+import { copySecret } from '../lib/clipboard';
 import { useSystemInfo } from '../hooks/useSystemInfo';
 import { useThemeStore, type Theme } from '../store/themeStore';
 import { LANGUAGES, LANGUAGE_NAMES, useTranslation, type Language } from '../i18n';
@@ -755,7 +756,7 @@ export function Settings() {
               <Icon name={mcpTokenVisible ? 'eyeOff' : 'eye'} size={13} />
             </button>
             <button
-              onClick={() => { navigator.clipboard.writeText(mcpToken); showToast(t('settings.toast.tokenCopied')); }}
+              onClick={() => { copySecret(mcpToken, t('settings.toast.tokenCopied')).catch(() => {}); }}
               className="text-tx3 hover:text-tx transition-colors shrink-0"
               title={t('common.copy')}
               aria-label={t('settings.copyToken')}
