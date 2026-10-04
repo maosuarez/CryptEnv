@@ -6,7 +6,7 @@
 ## 2. CLI and GUI
 
 - [x] 2.1 Make `inject` validate the key and propagate `ShellFmtError` to exit ≠ 0 with nothing on stdout. Verify with CLI unit tests.
-- [x] 2.2 Add the Tauri command `shell_format_assignment` registered in `lib.rs`; `SecretRow.tsx` copy-as uses it (and the `.env` serializer for the env format). Verify with `pnpm build` and a manual copy of a value containing `$(...)` and `’`.
+- [ ] 2.2 Add the Tauri command `shell_format_assignment` registered in `lib.rs`; `SecretRow.tsx` copy-as uses it (and the `.env` serializer for the env format). Verify with `pnpm build` and a manual copy of a value containing `$(...)` and `’`. (code done; manual GUI check pending)
 
 ## 3. Docs and verification
 
