@@ -47,9 +47,9 @@ If any of these steps fails or the user declines, the vault SHALL remain unchang
 
 ### Requirement: Project initialization via init
 
-The CLI SHALL provide a `crypt-env init [NAME] [--path <PATH>]` subcommand that provisions a new project in the vault and generates a local configuration file `.crypt-env.yaml`. If `NAME` is omitted, the command SHALL use the folder name of the current working directory. The associated injection path SHALL default to the directory where `init` is run or the path provided by `--path`. The generated `.crypt-env.yaml` SHALL contain the project name, description, associated injection paths, tags/categories, and environments.
+The CLI SHALL provide a `crypt-env init [NAME] [--path <PATH>] [--yes]` subcommand that provisions a new project in the vault and generates a local configuration file `.crypt-env.yaml`. If `NAME` is omitted, the command SHALL use the folder name of the current working directory. The associated injection path SHALL default to the directory where `init` is run or the path provided by `--path`. The generated `.crypt-env.yaml` SHALL contain the project name, description, associated injection paths, tags/categories, and environments.
 
-When a vault project with the same name already exists and is bound to a different root, `init` MUST NOT change that project's root or paths. It SHALL fail with the same root-binding error as `config` and suggest `crypt-env config --relink`. When the existing project has no root, adopting the current directory SHALL be treated as a secret-routing change that requires consent (see *Bidirectional project configuration sync via config*).
+When a vault project with the same name already exists and is bound to a different root, `init` MUST NOT change that project's root or paths. It SHALL fail with the same root-binding error as `config` and suggest `crypt-env config --relink`. When the existing project has no root, adopting the current directory SHALL be treated as a secret-routing change that requires consent (see *Bidirectional project configuration sync via config*): `init` SHALL print the root diff, require a live session, and then ask an interactive `y`/`N` prompt that defaults to *no*, or accept `--yes` in its place. `--yes` answers only that adoption confirmation; it MUST NOT skip vault authentication.
 
 #### Scenario: Init with default parameters in current directory
 - **WHEN** user executes `crypt-env init` in directory `/workspace/my-service` without arguments
@@ -69,6 +69,14 @@ When a vault project with the same name already exists and is bound to a differe
 #### Scenario: Init in an unrelated folder with an existing project name
 - **WHEN** vault project `backend` is bound to `/home/u/backend` and the user runs `crypt-env init` in `/tmp/other/backend`
 - **THEN** the command fails with the root-binding error and the vault project is unchanged
+
+#### Scenario: Non-interactive init adopting a rootless project with --yes
+- **WHEN** vault project `backend` has no root and the user runs `crypt-env init backend --yes` with stdin not a terminal
+- **THEN** the command still requires a live session, skips the `y`/`N` prompt, binds the project to the current directory and writes `.crypt-env.yaml`
+
+#### Scenario: Non-interactive init adopting a rootless project without --yes
+- **WHEN** vault project `backend` has no root and the user runs `crypt-env init backend` with stdin not a terminal
+- **THEN** the command prints the diff and fails with an error that mentions `--yes`, and the vault project is unchanged
 
 ### Requirement: Environment and example file generation via fill
 

@@ -1,4 +1,4 @@
-//! `crypt-env init [NAME] [--path <PATH>]` — registers (or links) the vault
+//! `crypt-env init [NAME] [--path <PATH>] [--yes]` — registers (or links) the vault
 //! project for the current directory, records this directory as its root,
 //! and writes `.crypt-env.yaml` here.
 //!
@@ -25,6 +25,11 @@ pub struct InitArgs {
     /// is used) or a `.env*` file. Defaults to `.env` in this directory.
     #[arg(long)]
     pub path: Option<PathBuf>,
+
+    /// Confirm binding an existing, rootless project to this directory
+    /// without prompting (required when stdin is not a terminal)
+    #[arg(long)]
+    pub yes: bool,
 }
 
 pub struct InitReport {
@@ -44,22 +49,14 @@ pub fn run(args: InitArgs) -> Result<(), CliError> {
         return Ok(());
     }
     let api = &client::Live;
-    let mut adopt_confirmed = false;
-    if let Existing::Adopt { lines, .. } = check(api, &cwd, args.name.as_deref())? {
-        for line in &lines {
-            eprintln!("{line}");
-        }
-        if !std::io::stdin().is_terminal() {
-            return Err(CliError::Config(
-                "adopting this directory changes where secrets are written and needs an interactive confirmation".into(),
-            ));
-        }
-        api.ensure_session()?;
-        if !crate::prompts::confirm("Bind this project to the current directory?") {
-            return Err(CliError::Config("cancelled — the vault was not changed".into()));
-        }
-        adopt_confirmed = true;
-    }
+    let adopt_confirmed = adoption_consent(
+        api,
+        &cwd,
+        args.name.as_deref(),
+        args.yes,
+        std::io::stdin().is_terminal(),
+        &mut || Ok(crate::prompts::confirm("Bind this project to the current directory?")),
+    )?;
     let r = execute(api, &cwd, args.name.as_deref(), args.path.as_deref(), adopt_confirmed)?;
     eprintln!(
         "{} project '{}' (root {}), default environment → {}",
@@ -70,6 +67,36 @@ pub fn run(args: InitArgs) -> Result<(), CliError> {
     );
     eprintln!("Wrote {}", r.manifest_path.display());
     Ok(())
+}
+
+/// Consent flow for adopting a rootless project: show the diff, require a
+/// non-interactive `--yes` or a TTY, require a live session, then ask `y/N`
+/// unless `--yes`. Returns whether adoption was confirmed (false when no
+/// adoption is involved). `--yes` only answers the routing confirmation;
+/// the session is still required.
+fn adoption_consent(
+    api: &dyn VaultApi,
+    dir: &Path,
+    name: Option<&str>,
+    yes: bool,
+    interactive: bool,
+    confirm: &mut dyn FnMut() -> Result<bool, CliError>,
+) -> Result<bool, CliError> {
+    let Existing::Adopt { lines, .. } = check(api, dir, name)? else { return Ok(false) };
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    if !yes && !interactive {
+        return Err(CliError::Config(
+            "adopting this directory changes where secrets are written and needs confirmation — re-run interactively or pass --yes"
+                .into(),
+        ));
+    }
+    api.ensure_session()?;
+    if !yes && !confirm()? {
+        return Err(CliError::Config("cancelled — the vault was not changed".into()));
+    }
+    Ok(true)
 }
 
 /// What `init` would do about a same-name vault project.
@@ -266,6 +293,46 @@ mod tests {
         assert!(vault.mutations().is_empty());
         assert!(run_init(&vault, dir.path(), true).is_ok());
         assert!(vault.mutations().contains(&"save_project".to_string()));
+    }
+
+    fn rootless_vault() -> FakeVault {
+        FakeVault::new(vec![project("backend", None, vec![env(1, "default", true, &[".env"])])])
+    }
+
+    #[test]
+    fn yes_adopts_rootless_project_non_interactively() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = rootless_vault();
+        let mut no_prompt = || -> Result<bool, CliError> { Err(CliError::Config("must not prompt".into())) };
+        let confirmed = adoption_consent(&vault, dir.path(), Some("backend"), true, false, &mut no_prompt).unwrap();
+        assert!(confirmed);
+        assert!(vault.calls.borrow().contains(&"ensure_session".to_string()), "--yes does not skip authentication");
+        assert!(vault.mutations().is_empty(), "consent alone changes nothing");
+        assert!(run_init(&vault, dir.path(), confirmed).is_ok());
+        assert!(vault.mutations().contains(&"save_project".to_string()));
+    }
+
+    #[test]
+    fn non_tty_without_yes_fails_mentioning_flag_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = rootless_vault();
+        let err = adoption_consent(&vault, dir.path(), Some("backend"), false, false, &mut || Ok(true))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("--yes"), "{err}");
+        assert!(vault.mutations().is_empty());
+        assert!(!vault.calls.borrow().contains(&"ensure_session".to_string()));
+    }
+
+    #[test]
+    fn interactive_decline_cancels_and_non_adoption_needs_no_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = rootless_vault();
+        assert!(adoption_consent(&vault, dir.path(), Some("backend"), false, true, &mut || Ok(false)).is_err());
+        assert!(vault.mutations().is_empty());
+        let empty = FakeVault::new(vec![]);
+        assert!(!adoption_consent(&empty, dir.path(), Some("fresh"), false, false, &mut || Ok(true)).unwrap());
     }
 
     #[test]

@@ -34,6 +34,7 @@
   Note: reducer tests only; no interactive TUI run from this agent environment.
 - [x] 5.5 `init` (CLI and TUI `i`): run the binding check against an existing same-name project; mismatch → error; unbound existing project → consent flow. Verify with unit tests: an existing bound project in another directory is unchanged.
 - [x] 5.6 `fill`: call the binding check before any write, and derive `.env.example` directories from `InjectResult.paths` mapped with `paths::to_local`. Write the example through the no-follow opener. Verify with unit tests: mismatch → error and no files; example directories equal the parents of the written paths.
+- [x] 5.7 `init --yes`: add the flag (long only, mirroring `config --yes`) to `InitArgs`. Adopting a rootless project on a non-TTY without `--yes` fails with a message mentioning `--yes`; with `--yes` the `y/N` prompt is skipped but `ensure_session()` is still called. The TUI `InitAdopt` path is unchanged. Verify with unit tests on `adoption_consent` using `FakeVault`.
 
 ## 6. CLI: precise pruning (#7, D7)
 

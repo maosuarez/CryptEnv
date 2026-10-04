@@ -53,13 +53,13 @@ project:
 
 Sessions are per terminal: each terminal (Unix: session id + tty; Windows: console window, i.e. per Windows Terminal tab) keeps its own token file `<token path>.<hash>` next to `CRYPTENV_TOKEN_PATH`/the default path, so opening another terminal means entering the password there too, and terminals never log each other out. Subshells such as `eval "$(crypt-env inject X)"` count as the same terminal. The binding is enforced by the client (another process running as your user could read the files, as with any cached token); token files unused for a day are deleted (only files named exactly `<token path>.<16 hex>`; anything else next to them is never touched).
 
-### `crypt-env init [NAME] [--path PATH]`
+### `crypt-env init [NAME] [--path PATH] [--yes]`
 ```bash
 cd ~/code/my-service
 crypt-env init                       # project "my-service", default env → .env
 crypt-env init backend-api --path ./app   # default env → app/.env
 ```
-`NAME` defaults to the legacy `crypt-env.json` project, else the folder name. If a project with that name already exists and has no root, it is linked to this directory only after the same confirmation `config` uses (diff, session, `y/N`). If it is already bound to another directory, `init` fails with the bound root and suggests `config --relink`; the project is not touched. If `.crypt-env.yaml` already exists, `init` warns and changes nothing.
+`NAME` defaults to the legacy `crypt-env.json` project, else the folder name. If a project with that name already exists and has no root, it is linked to this directory only after the same confirmation `config` uses (diff, session, `y/N`). When stdin is not a terminal pass `--yes` to answer that confirmation (the session is still required); without it the command fails and the vault is unchanged. If it is already bound to another directory, `init` fails with the bound root and suggests `config --relink`; the project is not touched. If `.crypt-env.yaml` already exists, `init` warns and changes nothing.
 
 ### `crypt-env config`
 Compares the file's modification time with the vault's last change (project or any environment). File newer → the vault is updated (description, categories, environments, paths; missing categories are created). Vault newer → the file is rewritten. Vault environments missing from the file are **kept** (they may hold secrets) and reported — delete them from the GUI. A project renamed in the file is treated as a new project.
