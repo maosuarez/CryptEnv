@@ -2,9 +2,6 @@
 //! project for the current directory, records this directory as its root,
 //! and writes `.crypt-env.yaml` here.
 //!
-//! Inside a Git repository the manifest is added to that directory's
-//! `.gitignore` (additive only).
-//!
 //! An existing project bound to another directory is never taken over
 //! (use `config --relink`); an existing project without a root adopts this
 //! directory only after the same consent flow `config` uses.
@@ -40,20 +37,6 @@ pub struct InitReport {
     pub created: bool,
     pub manifest_path: PathBuf,
     pub target: String,
-    pub gitignore: GitignoreUpdate,
-}
-
-/// What `init` did about keeping the manifest out of Git.
-#[derive(Debug, PartialEq, Eq)]
-pub enum GitignoreUpdate {
-    /// Not inside a Git repository: nothing to do.
-    NotAGitRepo,
-    /// `.gitignore` already lists the manifest.
-    AlreadyIgnored,
-    /// The manifest entry was appended (the file was created if missing).
-    Added,
-    /// `.gitignore` could not be updated; the reason is shown as a warning.
-    Skipped(String),
 }
 
 pub fn run(args: InitArgs) -> Result<(), CliError> {
@@ -83,13 +66,6 @@ pub fn run(args: InitArgs) -> Result<(), CliError> {
         r.target
     );
     eprintln!("Wrote {}", r.manifest_path.display());
-    match &r.gitignore {
-        GitignoreUpdate::Added => eprintln!("Added {} to .gitignore", manifest::FILE_NAME),
-        GitignoreUpdate::Skipped(why) => {
-            eprintln!("warning: could not add {} to .gitignore: {why}", manifest::FILE_NAME)
-        }
-        GitignoreUpdate::NotAGitRepo | GitignoreUpdate::AlreadyIgnored => {}
-    }
     Ok(())
 }
 
@@ -220,64 +196,7 @@ pub fn execute(
     let project = fetch_by_id(api, project_id)?;
     let m = manifest::from_project(&project, &paths::to_local);
     let manifest_path = manifest::write_file(dir, &m).map_err(CliError::Config)?;
-    let gitignore = ensure_gitignored(dir);
-    Ok(InitReport { project: project.name, created, manifest_path, target, gitignore })
-}
-
-/// True when `dir` or any ancestor holds `.git` (a directory, or the file a
-/// worktree/submodule uses).
-fn inside_git_repo(dir: &Path) -> bool {
-    dir.ancestors().any(|d| d.join(".git").exists())
-}
-
-/// True when `.gitignore` content already has a rule for exactly the manifest.
-fn lists_manifest(gitignore: &str) -> bool {
-    gitignore.lines().map(str::trim).any(|l| {
-        matches!(l.strip_prefix("**/").or_else(|| l.strip_prefix('/')).unwrap_or(l), manifest::FILE_NAME)
-    })
-}
-
-/// Inside a Git repository, makes sure `dir/.gitignore` ignores the manifest:
-/// creates the file or appends one line, never rewriting or removing rules.
-/// Best effort — the manifest is already written, so a failure is reported
-/// rather than raised. A symlinked or non-regular `.gitignore` is left alone
-/// (the append must not be redirected elsewhere).
-pub fn ensure_gitignored(dir: &Path) -> GitignoreUpdate {
-    if !inside_git_repo(dir) {
-        return GitignoreUpdate::NotAGitRepo;
-    }
-    let path = dir.join(".gitignore");
-    let existing = match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_file() => match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(e) => return GitignoreUpdate::Skipped(e.kind().to_string()),
-        },
-        Ok(_) => return GitignoreUpdate::Skipped(".gitignore is not a regular file".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return GitignoreUpdate::Skipped(e.kind().to_string()),
-    };
-    if lists_manifest(&existing) {
-        return GitignoreUpdate::AlreadyIgnored;
-    }
-    let separator = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
-    match append_no_follow(&path, &format!("{separator}{}\n", manifest::FILE_NAME)) {
-        Ok(()) => GitignoreUpdate::Added,
-        Err(e) => GitignoreUpdate::Skipped(e.kind().to_string()),
-    }
-}
-
-/// Appends `text` to `path` (creating it), refusing a symlink at the final
-/// component on Unix via `O_NOFOLLOW`.
-fn append_no_follow(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options.open(path)?.write_all(text.as_bytes())
+    Ok(InitReport { project: project.name, created, manifest_path, target })
 }
 
 /// True when two stored relative targets inject into the same file for
@@ -372,82 +291,6 @@ mod tests {
         assert!(!same_file("default", "app/.env", "./"));
     }
 
-    fn git_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
-        dir
-    }
-
-    #[test]
-    fn gitignore_is_created_and_appended_once_inside_a_repo() {
-        let dir = git_repo();
-        let gi = dir.path().join(".gitignore");
-        assert_eq!(ensure_gitignored(dir.path()), GitignoreUpdate::Added);
-        assert_eq!(std::fs::read_to_string(&gi).unwrap(), ".crypt-env.yaml\n");
-        assert_eq!(ensure_gitignored(dir.path()), GitignoreUpdate::AlreadyIgnored);
-        assert_eq!(std::fs::read_to_string(&gi).unwrap(), ".crypt-env.yaml\n");
-    }
-
-    #[test]
-    fn gitignore_append_keeps_existing_rules_and_adds_a_missing_newline() {
-        let dir = git_repo();
-        let gi = dir.path().join(".gitignore");
-        std::fs::write(&gi, "target/\n*.log").unwrap();
-        assert_eq!(ensure_gitignored(dir.path()), GitignoreUpdate::Added);
-        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "target/\n*.log\n.crypt-env.yaml\n");
-    }
-
-    #[test]
-    fn gitignore_recognizes_anchored_and_glob_forms() {
-        for rule in [".crypt-env.yaml", "/.crypt-env.yaml", "**/.crypt-env.yaml", "  .crypt-env.yaml  "] {
-            let dir = git_repo();
-            std::fs::write(dir.path().join(".gitignore"), format!("a\n{rule}\n")).unwrap();
-            assert_eq!(ensure_gitignored(dir.path()), GitignoreUpdate::AlreadyIgnored, "{rule}");
-        }
-        let dir = git_repo();
-        std::fs::write(dir.path().join(".gitignore"), "#.crypt-env.yaml\n.crypt-env.yaml.bak\n").unwrap();
-        assert_eq!(ensure_gitignored(dir.path()), GitignoreUpdate::Added);
-    }
-
-    #[test]
-    fn gitignore_untouched_outside_a_repo_and_for_worktree_git_files() {
-        let plain = tempfile::tempdir().unwrap();
-        assert_eq!(ensure_gitignored(plain.path()), GitignoreUpdate::NotAGitRepo);
-        assert!(!plain.path().join(".gitignore").exists());
-
-        let worktree = tempfile::tempdir().unwrap();
-        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(ensure_gitignored(worktree.path()), GitignoreUpdate::Added);
-    }
-
-    #[test]
-    fn gitignore_found_from_a_subdirectory_of_the_repo() {
-        let repo = git_repo();
-        let sub = repo.path().join("apps/api");
-        std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(ensure_gitignored(&sub), GitignoreUpdate::Added);
-        assert!(sub.join(".gitignore").is_file());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_gitignore_is_never_written_through() {
-        let dir = git_repo();
-        let victim = dir.path().join("victim");
-        std::fs::write(&victim, "keep\n").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.path().join(".gitignore")).unwrap();
-        assert!(matches!(ensure_gitignored(dir.path()), GitignoreUpdate::Skipped(_)));
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
-    }
-
-    #[test]
-    fn init_in_a_repo_writes_manifest_and_gitignore() {
-        let dir = git_repo();
-        let vault = FakeVault::new(vec![]);
-        let r = execute(&vault, dir.path(), Some("backend"), None, false).unwrap();
-        assert_eq!(r.gitignore, GitignoreUpdate::Added);
-        assert!(dir.path().join(manifest::FILE_NAME).is_file());
-    }
 
     fn run_init(vault: &FakeVault, dir: &Path, adopt: bool) -> Result<InitReport, CliError> {
         execute(vault, dir, Some("backend"), None, adopt)

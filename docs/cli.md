@@ -6,7 +6,7 @@ CryptEnv provides a command-line interface (`crypt-env`) and an interactive term
 
 ## 📁 Projects on disk: `.crypt-env.yaml`
 
-A CryptEnv project is tied to a **root directory** — the directory holding `.crypt-env.yaml`. The CLI finds it by searching from the current directory upward (like `.git`). The file carries **metadata only** (never a secret value). Inside a Git repository `crypt-env init` adds it to `.gitignore` (remove that line if you want to share the file with your team):
+A CryptEnv project is tied to a **root directory** — the directory holding `.crypt-env.yaml`. The CLI finds it by searching from the current directory upward (like `.git`). The file carries **metadata only** (never a secret value) and is safe to commit:
 
 ```yaml
 # Managed by crypt-env (https://maosuarez.com). Contains NO secret values — safe to commit.
@@ -36,7 +36,7 @@ project:
 
 | Command | Password | What it does |
 |---------|:--------:|--------------|
-| `init [NAME] [--path PATH]` | — | Registers (or links) the project, records this directory as its root, writes `.crypt-env.yaml` and (inside a Git repository) ignores it in `.gitignore` |
+| `init [NAME] [--path PATH]` | — | Registers (or links) the project, records this directory as its root, writes `.crypt-env.yaml` |
 | `config [--relink] [--yes]` | on path changes | Syncs `.crypt-env.yaml` ⇄ vault; the most recently modified side wins. Changes to where secrets are written need a session and a confirmation |
 | `add KEY=value \| VARNAME \| FILE [--env NAME] [--global]` | on collision | Adds secrets; an existing key halts the whole addition |
 | `fill [--env NAME]` | ✔ | Writes every environment's target files + sanitized `.env.example` |
@@ -61,7 +61,6 @@ cd ~/code/my-service
 crypt-env init                       # project "my-service", default env → ./ (the root folder → .env)
 crypt-env init backend-api --path ./app   # default env → app/.env
 ```
-Inside a Git repository (the directory or any parent has `.git`, a worktree's `.git` file counts) `init` makes sure `.gitignore` in this directory lists `.crypt-env.yaml`: it creates the file or appends one line, never rewrites or removes rules, and does not add a duplicate on a second run. A symlinked `.gitignore` is left alone (a warning is printed; `init` still succeeds). Nothing is staged or committed.
 `NAME` defaults to the legacy `crypt-env.json` project, else the folder name. If a project with that name already exists and has no root, it is linked to this directory only after the same confirmation `config` uses (diff, session, `y/N`). When stdin is not a terminal pass `--yes` to answer that confirmation (the session is still required); without it the command fails and the vault is unchanged. If it is already bound to another directory, `init` fails with the bound root and suggests `config --relink`; the project is not touched. If `.crypt-env.yaml` already exists, `init` warns and changes nothing.
 
 ### `crypt-env config`

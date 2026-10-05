@@ -697,14 +697,13 @@ fn run_init(app: &mut App, name: &str, adopt_confirmed: bool) {
     match init::execute(&*app.api, &dir, Some(name), None, adopt_confirmed) {
         Ok(r) => {
             let verb = if r.created { "created" } else { "linked" };
-            let mut lines = vec![
-                (format!("{verb} project '{}' → {}", r.project, r.target), TX),
-                (format!("wrote {}", r.manifest_path.display()), TX2),
-            ];
-            if r.gitignore == init::GitignoreUpdate::Added {
-                lines.push((format!("added {} to .gitignore", scope::manifest::FILE_NAME), TX2));
-            }
-            app.report("init", lines);
+            app.report(
+                "init",
+                vec![
+                    (format!("{verb} project '{}' → {}", r.project, r.target), TX),
+                    (format!("wrote {}", r.manifest_path.display()), TX2),
+                ],
+            );
             let _ = app.reload();
         }
         Err(e) => app.fail(e, Gated::Init { name: name.to_string() }),
