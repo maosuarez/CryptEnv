@@ -2,16 +2,28 @@
 
 ### Requirement: Reactive Desktop GUI Synchronization on Vault Changes
 
-The desktop application MUST automatically synchronize its interface state whenever vault data (items, projects, environments, categories) is modified externally or internally. The backend MUST emit a `vault_changed` event over the Tauri event channel when mutations occur (including additions, updates, deletions through REST API, CLI, MCP, or Tauri commands). The desktop frontend MUST listen for `vault_changed` events and trigger a refetch of active query data and Zustand stores.
+The desktop application MUST automatically synchronize its interface state whenever vault data (items, projects, environments, categories) is modified by another client. The backend MUST emit a payload-free `vault_changed` event over the Tauri event channel (a) after an authenticated REST API request on a data-changing route has succeeded (additions, updates, deletions and imports made through the CLI, TUI or MCP) and (b) after a bulk GUI command has succeeded: backup restore, password-manager import, share-package import and relay receive (item and project). The event MUST NOT be emitted for failed, unauthenticated, policy-denied or pending-approval requests, and MUST NOT be emitted for ordinary single-item or single-environment GUI mutations, whose results the invoking window already applies. The desktop frontend MUST listen for `vault_changed` events, collapse bursts, and trigger a refetch of active query data and Zustand stores.
 
 #### Scenario: Vault item added via CLI while GUI is open
 - **WHEN** a secret or environment variable is added via `crypt-env add` or REST API while the desktop application is running
 - **THEN** the backend emits `vault_changed`
 - **AND** the GUI receives the event and automatically reloads project and item data without requiring application restart or manual page navigation
 
-#### Scenario: Environment or project modified via CLI or MCP
-- **WHEN** an environment or project is updated via CLI `crypt-env config` or MCP tools
+#### Scenario: Environment or project modified via CLI
+- **WHEN** an environment or project is updated via CLI `crypt-env config`
 - **THEN** the GUI receives `vault_changed` and updates the active project view to display the latest configuration
+
+#### Scenario: Rejected or pending request does not signal
+- **WHEN** a REST write fails, is rejected for authentication or MCP policy, or answers `202` pending approval
+- **THEN** no `vault_changed` event is emitted
+
+#### Scenario: Bulk import from the GUI signals
+- **WHEN** a backup restore, an import of items or a relay receive completes successfully from the GUI
+- **THEN** `vault_changed` is emitted with no payload
+
+#### Scenario: Single-item GUI edit does not signal
+- **WHEN** the user saves one item or one environment from the GUI
+- **THEN** no `vault_changed` event is emitted
 
 ### Requirement: Manual GUI Refresh Trigger
 
@@ -49,3 +61,16 @@ The GUI environment settings SHALL allow configuring multiple injection paths fo
 #### Scenario: Backward compatibility with explicit file paths
 - **WHEN** an environment contains an existing path ending with a `.env*` filename (e.g. `config/.env.local`)
 - **THEN** the system injects directly into that explicit file path without appending an extra `.env` suffix
+
+### Requirement: Customizable Initial Project Environment
+When creating a new project, the modal MUST prompt the user for an optional initial environment name. If left blank, the environment name MUST default to "default" and the project MUST also be created with the baseline environments `staging` and `production` (empty, targeting `./` when the project has a root). If a custom name is supplied, the project MUST be created with the specified initial environment instead of "default" and with no baseline environments added. Existing projects MUST NOT gain environments.
+
+#### Scenario: Default initial environment when omitted
+- **WHEN** the user creates a project without modifying or specifying an initial environment name
+- **THEN** the system creates the project with an initial environment named "default"
+- **AND** also creates the environments "staging" and "production"
+
+#### Scenario: Custom initial environment specified
+- **WHEN** the user enters a custom environment name (e.g., "production" or "staging") during project creation
+- **THEN** the system creates the project with an initial environment using the specified name
+- **AND** no baseline environments are added

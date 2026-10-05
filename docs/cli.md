@@ -61,6 +61,8 @@ cd ~/code/my-service
 crypt-env init                       # project "my-service", default env → ./ (the root folder → .env)
 crypt-env init backend-api --path ./app   # default env → app/.env
 ```
+A new project is created with the environments `default` (injects `.env`), `staging` and `production`, like a project created in the GUI without a custom initial environment; linking an existing project never adds environments.
+
 `NAME` defaults to the legacy `crypt-env.json` project, else the folder name. If a project with that name already exists and has no root, it is linked to this directory only after the same confirmation `config` uses (diff, session, `y/N`). When stdin is not a terminal pass `--yes` to answer that confirmation (the session is still required); without it the command fails and the vault is unchanged. If it is already bound to another directory, `init` fails with the bound root and suggests `config --relink`; the project is not touched. If `.crypt-env.yaml` already exists, `init` warns and changes nothing.
 
 ### `crypt-env config`

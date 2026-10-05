@@ -5,7 +5,7 @@ CryptEnv operates as a local-first desktop application with multiple client inte
 Currently:
 1. When mutations are performed via CLI/REST/MCP, the desktop GUI does not react because no mutation events are emitted, and the UI lacks a manual refresh button.
 2. In POSIX and Windows shells, running `crypt-env add $VARNAME` causes the shell to expand `$VARNAME` before `crypt-env` executes, passing the secret value as the first argument; `crypt-env` then rejects it with a configuration error. Passing `crypt-env add VARNAME` (without `$`) is also rejected.
-3. `crypt-env init` creates `.crypt-env.yaml` without ensuring it is ignored in `.gitignore`, and registers new projects with only a single generic `"default"` environment.
+3. `crypt-env init` registers new projects with only a single generic `"default"` environment.
 4. Environments require explicit paths and default to nothing. Paths are treated as file targets, whereas the target filename (`.env`, `.env.production`) is already implied by the environment name.
 
 ## Goals / Non-Goals
@@ -14,13 +14,12 @@ Currently:
 - Provide real-time UI synchronization via a Tauri `vault_changed` event emitted whenever the REST API or Tauri commands mutate vault items, projects, or environments.
 - Provide a manual refresh control and keyboard shortcut (`Ctrl+R` / `F5`) in the Desktop GUI.
 - Allow `crypt-env add` to accept `VARNAME` directly from active shell environment variables, accept escaped `\$VARNAME` / `'$VARNAME'`, and provide clear guidance when a shell expansion is detected.
-- In `crypt-env init`, automatically detect Git repositories and ensure `.crypt-env.yaml` is listed in `.gitignore`.
-- In `crypt-env init`, seed standard baseline environments (`development` [default], `staging`, `production`) when creating a new project.
+- Seed baseline environments (`default` [default], `staging`, `production`) when a user-facing flow (CLI `init`, GUI project modal) creates a new project.
 - Treat configured environment paths as folder directories relative to the project root (defaulting to `./`), automatically computing `<folder>/.env.<name>` (or `<folder>/.env` for default), while preserving full backward compatibility for explicit file paths.
 
 **Non-Goals:**
 - Modifying remote sync / internet relay protocols.
-- Automated `git commit` or `git push` operations for `.gitignore`.
+- Touching `.gitignore`: dropped by user decision; `.crypt-env.yaml` stays safe to commit.
 - Forcing a breaking change on existing stored projects: explicit `.env*` file paths will continue to resolve as direct file targets.
 
 ## Decisions
@@ -48,7 +47,7 @@ Currently:
 └───────────────────────────────────────────────┘
 ```
 
-- **Decision**: Pass `AppHandle` to `api::start_server`. When any write endpoint in `src-tauri/src/api/mod.rs` (`POST/PUT/DELETE /items`, `POST /projects`, `POST /environments`, `DELETE /projects`, etc.) successfully commits, emit `"vault_changed"`.
+- **Decision**: `ApiState` holds a `change_notifier` callback installed in `lib.rs` (same pattern as the approval notifier; no `AppHandle` is passed to `start_server`). A route layer (`api/changes.rs`) is attached only to the data-changing routes (`CHANGING_ROUTES`) and fires the callback after the handler answered 200/201/204. Authentication happens in the handler's extractor, so rejected tokens, MCP-forbidden calls, errors and `202` pending approvals never emit. The bulk GUI commands (`vault_import_backup`, `vault_import_backup_data`, `vault_import_items`, `share_import_file`, `share_relay_receive`, `project_relay_receive`) call `api::changes::emit_vault_changed` after success. Ordinary single-item GUI commands do not emit: the invoking window already applies their result and an echo would trigger a redundant full refetch (`vault_list` decrypts every item). LAN receive (`share_start_receive`) imports in a background task and is not covered.
 - **Frontend Handling**: In `src/App.tsx`, listen to `"vault_changed"` using Tauri's `listen()`. Debounce rapid consecutive triggers (100ms) and invalidate TanStack Query caches, re-fetching `projectStore.fetchProjects()` and `itemStore.fetchItems()`.
 - **Manual Refresh**: Add a refresh button in `WindowChrome.tsx` and register a global keydown handler for `F5` / `Ctrl+R` (`Cmd+R` on macOS) that calls the refresh method.
 - **Alternatives Considered**: Polling the database from frontend on a timer (rejected due to wasted CPU and SQLite locks) or SSE/WebSockets (rejected as Tauri's native `AppHandle::emit` already provides direct zero-overhead IPC).
@@ -63,20 +62,12 @@ Currently:
   5. Fallback diagnostic: If `input` does not match any of the above, inspect `std::env::vars()` to see if any variable currently holds `input` as its value. If found, print a targeted error explaining that `$VARNAME` was pre-expanded by the shell and instructing the user to run `crypt-env add <VARNAME>` without `$`. If not found, print a clear usage message detailing the valid formats and the shell expansion caveat.
 - **Alternatives Considered**: Attempting to hook into shell history or raw command line (rejected because `argv` receives pre-expanded tokens by POSIX shell specification; inspecting `std::env::vars()` safely detects pre-expansion without fragile platform hacks).
 
-### 3. Git Repository Detection and `.gitignore` Maintenance in `init`
+### 3. Baseline Environments for New Projects (user decision: option A)
 
-- **Decision**:
-  - In `commands/init.rs`, check if `dir.join(".git").exists()` or if any parent directory contains `.git`.
-  - If a Git repository is detected:
-    - Path to `.gitignore` is `dir.join(".gitignore")`.
-    - If `.gitignore` does not exist, create it with `.crypt-env.yaml\n`.
-    - If `.gitignore` exists, read lines. If `.crypt-env.yaml` is not present as a separate line or entry, append `\n.crypt-env.yaml\n`.
-- **Project Seeding**:
-  - When creating a new project during `init` (or when `client::save_project` creates a new project), create three baseline environments:
-    - `development`: `is_default: true`, `paths: ["./"]`
-    - `staging`: `is_default: false`, `paths: ["./"]`
-    - `production`: `is_default: false`, `paths: ["./"]`
-- **Alternatives Considered**: Leaving `.crypt-env.yaml` in git by default (rejected per user request and because manifest may contain paths and project IDs that developers may prefer isolated).
+- **Decision**: new projects get `default` (default, the unnamed root environment → `.env`), `staging` and `production`. `development` is not seeded: it is not a root environment, so as the default it would inject `.env.development` and contradict the `cli`, `desktop-ui` and `project-templates` specs and `init --path ./app` → `app/.env`.
+- **Where seeding happens**: `project::save_project` (single choke point behind REST `POST /projects`, the Tauri `project_save` and `project_create_from_templates`) honours an opt-in `ProjectInput.seedBaseline` (`seedBaseline` in JSON, default `false`). It applies only when the project is new and its initial environment is the default one (blank or `default`). The seeded environments get `["./"]` when the project has a root, none otherwise.
+- **Callers**: CLI `init` sets the flag when it creates a project; the GUI sets it from `projectStore.createFromTemplates` (the new-project modal). `config` (manifest-driven creation, which declares its own environments), project import, a custom initial environment, updates and all existing projects never set it, so nothing is altered retroactively and no environment name can collide with a manifest's.
+- **Alternatives Considered**: seeding unconditionally in `save_project` (rejected: breaks manifest-driven creation and adds environments nobody asked for); seeding only in the CLI (rejected: GUI and CLI projects would differ).
 
 ### 4. Folder-Based Environment Paths & Default `./`
 
@@ -89,6 +80,8 @@ Currently:
   - In GUI `ProjectManager.tsx`:
     - Display folder targets with their evaluated `.env` filename preview (e.g. `./ → .env.production`).
     - If no paths are configured, automatically default to `./`.
+- **Backward compatibility details**: a last component starting *or ending* with `.env` (`prod.env`) is a file; an existing regular file at a non-`.env*` relative path keeps its file meaning; absolute paths are always files. After `contain_relative` the lexical path is kept when its final component is a symlink so the inject gate refuses it (previously the link was resolved and written through).
+- **Root default**: an environment with no paths in a rooted project defaults to `./` only for session principals, only with no `output_path`/`output_dir` and no target subset, and as a `CallerSupplied` target (a Foreign file is refused, not written through). `inject_environment_for(.., root_default)` carries the flag; the REST handler passes `false` for the MCP principal, which still gets "no paths configured".
 - **Alternatives Considered**: Strict breaking migration converting all old paths to directories (rejected: would break existing setups with custom `.env.local` or existing configurations).
 
 ## Security & Threat Model
@@ -96,7 +89,6 @@ Currently:
 - **IPC Security**: The `vault_changed` event carries NO secret payload; it is an empty signal (`()`) indicating that vault state has changed. The frontend fetches data via existing authenticated Tauri invoke handlers.
 - **REST API Emission**: Emitting `vault_changed` from Axum occurs only after authentication tokens have been validated using constant-time comparison and after the database write succeeds.
 - **Environment Variable Reading**: When `crypt-env add VARNAME` reads `std::env::var(VARNAME)`, it reads only the specified variable from the current process environment and zeros/drops buffers according to existing vault memory hygiene rules.
-- **Gitignore Safety**: Modifying `.gitignore` is additive only (appends `.crypt-env.yaml`), never deleting or modifying existing rules.
 
 ## Risks / Trade-offs
 
@@ -104,5 +96,3 @@ Currently:
   → *Mitigation*: The frontend debounces `vault_changed` handlers by 100ms so a batch of CLI adds triggers a single UI re-render.
 - **[Risk] Ambiguity between directory path and file path**
   → *Mitigation*: Any path ending in `.env*` is treated as a file; any path ending in `/` or naming a directory without `.env*` is resolved as a directory and appended with `environment_filename(name)`.
-- **[Risk] Existing projects without `.gitignore` in non-root subdirectories**
-  → *Mitigation*: Check `.git` existence at current directory and climb upwards to identify the repo boundary if necessary.
