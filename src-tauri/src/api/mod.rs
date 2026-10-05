@@ -2371,7 +2371,10 @@ async fn handle_inject_environment(
         }
     };
 
-    match project::inject_environment(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite, None).await {
+    // The project-root default for an environment without paths is for the
+    // vault owner; MCP still needs a configured path (or a confined output).
+    let root_default = principal != Principal::Mcp;
+    match project::inject_environment_for(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite, None, root_default).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) if e == "environment not found" => {
             err_json(StatusCode::NOT_FOUND, &e, "NOT_FOUND").into_response()

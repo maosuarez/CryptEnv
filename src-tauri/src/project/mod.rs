@@ -678,12 +678,18 @@ async fn get_environment_full(db: &VaultDb, id: i64) -> Result<Option<Environmen
 /// (matched against the stored strings, e.g. the GUI's inject-target
 /// picker); naming a path that is not configured is an error. Relative
 /// configured paths are resolved against the project root first.
+///
+/// `root_default` lets an environment with no configured paths (and no
+/// caller-supplied destination) fall back to its project root. It is the
+/// vault owner's convenience: MCP callers pass `false` and still need a
+/// configured path.
 async fn resolve_and_inspect(
     db: &VaultDb,
     environment_id: i64,
     output_path: Option<String>,
     output_dir: Option<String>,
     targets: Option<&[String]>,
+    root_default: bool,
 ) -> Result<(crate::db::DbEnvironment, Vec<(String, PathOrigin)>, HashMap<String, envfile::Target>), String> {
     let env = db
         .get_environment(environment_id)
@@ -747,7 +753,7 @@ async fn resolve_and_inspect(
             let target = crate::fsguard::resolve_within(dir.as_str(), &environment_filename(&env.name))
                 .map_err(|e| format!("output_dir: {e}"))?;
             resolved.push((target.to_string_lossy().into_owned(), PathOrigin::CallerSupplied));
-        } else if let (None, true, Some(root)) = (targets, env.paths.is_empty(), root.as_deref()) {
+        } else if let (true, None, true, Some(root)) = (root_default, targets, env.paths.is_empty(), root.as_deref()) {
             // No path was ever configured: default to the project root (`./`).
             // Nobody consented to this file, so it is `CallerSupplied` — an
             // existing file crypt-env did not write is refused, not
@@ -781,7 +787,7 @@ pub async fn inject_environment_preview(
     environment_id: i64,
     targets: Option<&[String]>,
 ) -> Result<InjectPreview, String> {
-    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None, targets).await?;
+    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None, targets, true).await?;
 
     let paths: Vec<String> = resolved.iter().map(|(p, _)| p.clone()).collect();
     let foreign: Vec<String> = resolved
@@ -827,9 +833,25 @@ pub async fn inject_environment(
     overwrite: bool,
     targets: Option<&[String]>,
 ) -> Result<InjectResult, String> {
+    inject_environment_for(db, vault_key, environment_id, output_path, output_dir, overwrite, targets, true).await
+}
+
+/// `inject_environment` with an explicit `root_default` (see
+/// `resolve_and_inspect`): `false` for the MCP principal.
+#[allow(clippy::too_many_arguments)]
+pub async fn inject_environment_for(
+    db: &VaultDb,
+    vault_key: &VaultKey,
+    environment_id: i64,
+    output_path: Option<String>,
+    output_dir: Option<String>,
+    overwrite: bool,
+    targets: Option<&[String]>,
+    root_default: bool,
+) -> Result<InjectResult, String> {
     // Phase 1 — resolve, tracking provenance.
     let (env, resolved, mut cached) =
-        resolve_and_inspect(db, environment_id, output_path, output_dir, targets).await?;
+        resolve_and_inspect(db, environment_id, output_path, output_dir, targets, root_default).await?;
 
     if resolved.is_empty() {
         return Err("environment has no paths configured".into());
@@ -1716,6 +1738,17 @@ mod tests {
         let none: Vec<String> = vec![];
         let err = inject_environment(&db, &key, env_id, None, None, false, Some(&none)).await.unwrap_err();
         assert_eq!(err, "environment has no paths configured");
+    }
+
+    #[tokio::test]
+    async fn root_default_is_refused_for_callers_that_opt_out() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        let err = inject_environment_for(&db, &key, env_id, None, None, false, None, false).await.unwrap_err();
+        assert_eq!(err, "environment has no paths configured");
+        assert!(!dir.path().join(".env.production").exists());
+        assert!(inject_environment_for(&db, &key, env_id, None, None, false, None, true).await.is_ok());
     }
 
     #[tokio::test]

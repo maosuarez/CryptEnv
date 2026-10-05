@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The open window refreshes when the CLI, TUI or MCP change the vault (payload-free `vault_changed` event, emitted only after an authenticated successful write), plus a titlebar refresh button and `F5` / `Ctrl+R`.
   - `crypt-env add VARNAME` reads the variable from the shell (`$VARNAME` still works). An argument the shell pre-expanded from `$VARNAME` is diagnosed by variable name only; the error no longer echoes the argument.
   - `crypt-env init` targets `./` by default.
-  - Environment paths may be folders (`./`, `apps/web`) that receive `.env` / `.env.<name>`; explicit `.env*` file paths are unchanged. A rooted environment with no paths defaults to the root folder with `output_path`-style overwrite gating.
+  - Environment paths may be folders (`./`, `apps/web`) that receive `.env` / `.env.<name>`; explicit `.env*` file paths are unchanged. A rooted environment with no paths defaults to the root folder for session callers (never for the MCP token), with `output_path`-style overwrite gating.
 
 ### Fixed
 
