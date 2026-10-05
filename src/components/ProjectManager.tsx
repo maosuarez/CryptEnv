@@ -64,12 +64,42 @@ function envFileName(name: string): string {
   return isRootEnvName(name) ? '.env' : `.env.${name}`;
 }
 
+function isAbsoluteEnvPath(path: string): boolean {
+  return /^([A-Za-z]:[\\/]|[\\/])/.test(path);
+}
+
+/** Mirrors `names_env_file` in `src-tauri/src/project/mod.rs`: a path whose
+ *  last component starts or ends with `.env` is a file, anything else is a
+ *  folder that receives the environment's own `.env*` file. */
+export function namesEnvFile(path: string): boolean {
+  const last = path.split(/[\\/]/).filter(Boolean).pop();
+  return !!last && last !== '.' && (last.startsWith('.env') || last.endsWith('.env'));
+}
+
+/** The folder a relative stored path points at, or `null` when it is an
+ *  absolute path or an explicit env file (both are injected as-is). */
+export function folderTarget(path: string): string | null {
+  const p = path.trim();
+  return isAbsoluteEnvPath(p) || namesEnvFile(p) ? null : p;
+}
+
+/** Preview of the file a stored path injects into for `envName`: a folder
+ *  (`./`, `apps/web`) gets `.env[.<name>]`; anything else is shown as stored. */
+export function resolvedEnvTarget(path: string, envName: string): string {
+  const folder = folderTarget(path);
+  if (folder === null) return path;
+  const base = folder.replace(/[\\/]+$/, '').replace(/^\.\//, '');
+  return base === '' || base === '.' ? envFileName(envName) : `${base}/${envFileName(envName)}`;
+}
+
 /** Points a source environment's inject path at a target environment's file,
  *  when the path's filename is the source's own `.env[.<name>]` (same folder,
  *  new filename). Any other path returns `null`: it isn't obviously tied to
  *  the source environment, and copying it verbatim would make both
- *  environments inject into the same file. */
+ *  environments inject into the same file. Relative folder paths are kept. */
 export function retargetEnvPath(path: string, fromName: string, toName: string): string | null {
+  // A folder serves every environment: the new one just gets its own filename.
+  if (folderTarget(path) !== null) return path;
   const m = path.match(/^(.*[\\/])?([^\\/]+)$/);
   if (!m || m[2] !== envFileName(fromName)) return null;
   return (m[1] ?? '') + envFileName(toName);
@@ -528,10 +558,13 @@ function InjectConfirmModal({
 
 export function InjectTargetModal({
   paths,
+  envName,
   onCancel,
   onConfirm,
 }: {
   paths:     string[];
+  /** When given, folder targets show the file the environment injects into. */
+  envName?:  string;
   onCancel:  () => void;
   onConfirm: (targets: string[] | null) => void;
 }) {
@@ -559,6 +592,9 @@ export function InjectTargetModal({
               <label className="flex items-center gap-2 text-[11px] font-mono text-tx cursor-pointer">
                 <input type="checkbox" checked={selected.has(p)} onChange={() => toggle(p)} className="accent-accent" />
                 <span className="truncate">{p}</span>
+                {envName !== undefined && folderTarget(p) !== null && (
+                  <span className="text-tx3 shrink-0">→ {envFileName(envName)}</span>
+                )}
               </label>
             </li>
           ))}
@@ -1494,7 +1530,7 @@ function EnvironmentCard({
 
       <div className="flex items-center gap-2">
         <span className="flex-1 text-[10px] font-mono text-tx3 truncate">
-          {firstPath ? truncatePath(firstPath) : <span className="opacity-50">{t('projects.envCard.noPath')}</span>}
+          {firstPath ? truncatePath(resolvedEnvTarget(firstPath, env.name)) : <span className="opacity-50">{t('projects.envCard.noPath')}</span>}
         </span>
         <button
           onClick={handleInjectClick}
@@ -1540,7 +1576,7 @@ export function ProjectManager() {
   // re-renders without becoming React state itself.
   const [injectConfirm, setInjectConfirm] = useState<{ id: number; foreign: string[]; targets?: string[] } | null>(null);
   // Multi-path environments pick their inject target(s) first.
-  const [injectTargets, setInjectTargets] = useState<{ paths: string[] } | null>(null);
+  const [injectTargets, setInjectTargets] = useState<{ paths: string[]; envName: string } | null>(null);
   const pendingTargetsRef = useRef<{ resolve: (t: string[] | null) => void; reject: (e: unknown) => void } | null>(null);
   const pendingInjectRef = useRef<{ resolve: (r: InjectResult) => void; reject: (e: unknown) => void } | null>(null);
 
@@ -1553,7 +1589,7 @@ export function ProjectManager() {
     if (env && env.paths.length > 1) {
       const picked = await new Promise<string[] | null>((resolve, reject) => {
         pendingTargetsRef.current = { resolve, reject };
-        setInjectTargets({ paths: env.paths });
+        setInjectTargets({ paths: env.paths, envName: env.name });
       });
       targets = picked ?? undefined;
     }
@@ -1956,7 +1992,8 @@ export function ProjectManager() {
     setEnvName(firstFree);
     setEnvCustom(false);
     setEnvIsDefault(selectedProject.environments.length === 0);
-    setEnvPaths([]);
+    // Relative paths need a project root; the folder `./` is the root itself.
+    setEnvPaths(selectedProject.rootPath ? ['./'] : []);
     setNewPath('');
     setEnvVars([]);
     // Keep the project's stack templates: offer their variables for review.
@@ -2554,6 +2591,11 @@ export function ProjectManager() {
                         onBlur={() => setEnvPaths((prev) => prev.map((x) => x.trim()).filter((x, i, a) => x && a.indexOf(x) === i))}
                         className="flex-1 min-w-0 bg-bg border border-bd2 text-tx font-mono text-[11px] rounded-[3px] px-2 py-[5px] outline-none focus:border-accent-d transition-colors"
                       />
+                      {folderTarget(p) !== null && (
+                        <span className="text-[10px] font-mono text-tx3 shrink-0" title={t('projects.pathFolderTitle')}>
+                          → {envFileName(envName.trim().toLowerCase())}
+                        </span>
+                      )}
                       <button
                         onClick={() => removePath(idx)}
                         className="text-tx3 hover:text-danger transition-colors shrink-0"
@@ -2562,12 +2604,17 @@ export function ProjectManager() {
                       </button>
                     </div>
                   ))}
+                  {envPaths.length === 0 && selectedProject?.rootPath && (
+                    <div className="text-[10px] font-mono text-tx3 mb-1">
+                      {t('projects.pathsDefaultHint', { file: envFileName(envName.trim().toLowerCase()) })}
+                    </div>
+                  )}
                   <div className="flex gap-1.5 mt-1">
                     <input
                       value={newPath}
                       onChange={(e) => setNewPath(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addPath(); } }}
-                      placeholder={selectedProject?.rootPath ? 'apps/api/.env.production' : 'C:\\projects\\myapp\\.env.production'}
+                      placeholder={selectedProject?.rootPath ? 'apps/api' : 'C:\\projects\\myapp\\.env.production'}
                       className="flex-1 bg-bg border border-bd2 text-tx font-mono text-[12px] rounded-[3px] px-3 py-[6px] outline-none focus:border-accent-d transition-colors"
                     />
                     <button
@@ -2792,6 +2839,7 @@ export function ProjectManager() {
       {injectTargets && (
         <InjectTargetModal
           paths={injectTargets.paths}
+          envName={injectTargets.envName}
           onCancel={() => settleInjectTargets('cancel')}
           onConfirm={(targets) => settleInjectTargets(targets)}
         />
