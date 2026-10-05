@@ -22,6 +22,7 @@ async fn setup_project_with_one_var(db: &VaultDb) -> (VaultKey, i64) {
         categories: vec![],
         initial_environment: None,
         root_path: None,
+        seed_baseline: false,
     }).await.unwrap();
 
     let projects = project::list_projects(db).await.unwrap();

@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 pub mod approvals;
 mod auth;
+pub mod changes;
 mod confine;
 mod exec_routes;
 mod mcp_servers;
@@ -111,6 +112,8 @@ pub struct ApiState {
     approvals: Mutex<approvals::ApprovalStore>,
     /// Told about each new approval so the desktop app can show it.
     notifier: std::sync::OnceLock<approvals::Notifier>,
+    /// Told after each successful data-changing request (`vault_changed`).
+    change_notifier: std::sync::OnceLock<changes::ChangeNotifier>,
     /// Limits concurrent `POST /exec` commands.
     exec_slots: Arc<tokio::sync::Semaphore>,
     /// Requests currently queued for an exec slot.
@@ -140,6 +143,7 @@ impl ApiState {
             sessions: Mutex::new(SessionStore::default()),
             approvals: Mutex::new(approvals::ApprovalStore::default()),
             notifier: std::sync::OnceLock::new(),
+            change_notifier: std::sync::OnceLock::new(),
             exec_slots: Arc::new(tokio::sync::Semaphore::new(exec_routes::MAX_CONCURRENT_RUNS)),
             exec_waiting: std::sync::atomic::AtomicUsize::new(0),
             runs: std::sync::Mutex::new(HashMap::new()),
@@ -2367,7 +2371,10 @@ async fn handle_inject_environment(
         }
     };
 
-    match project::inject_environment(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite, None).await {
+    // The project-root default for an environment without paths is for the
+    // vault owner; MCP still needs a configured path (or a confined output).
+    let root_default = principal != Principal::Mcp;
+    match project::inject_environment_for(&vault.db, &vault_key, id, body.output_path, body.output_dir, body.overwrite, None, root_default).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) if e == "environment not found" => {
             err_json(StatusCode::NOT_FOUND, &e, "NOT_FOUND").into_response()
@@ -3354,7 +3361,11 @@ pub(crate) fn build_router(state: Arc<ApiState>) -> Router {
         .route("/unlock", post(handle_unlock));
     for (method, path, handler) in api_routes() {
         let policy = explicit_mcp_policy(method, path).unwrap_or(McpPolicy::Deny);
-        router = router.route(path, handler.layer(axum::Extension(policy)));
+        let mut handler = handler.layer(axum::Extension(policy));
+        if changes::changes_vault_data(method, path) {
+            handler = handler.layer(middleware::from_fn_with_state(state.clone(), changes::notify_on_success));
+        }
+        router = router.route(path, handler);
     }
     router.with_state(state).layer(middleware::from_fn(cors_guard))
 }

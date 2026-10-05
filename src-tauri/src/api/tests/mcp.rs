@@ -526,3 +526,23 @@ async fn a_command_over_the_time_limit_reports_timed_out_not_a_failure() {
     assert!(json["exitCode"].is_null());
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[tokio::test]
+async fn project_root_default_inject_is_for_the_user_not_mcp() {
+    let v = unlocked_vault().await;
+    let app = router(&v);
+    let root = tempfile::tempdir().unwrap();
+    set_root(&v, root.path()).await;
+    let uri = format!("/environments/{}/inject", v.env_id);
+    let target = root.path().join(".env.production");
+
+    // MCP: the environment has no configured path, so nothing is written.
+    let (status, json) = req(&app, "POST", &uri, Some(&v.mcp_token), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json:?}");
+    assert!(!target.exists());
+
+    // The vault owner's session defaults to the project root.
+    let (status, json) = req(&app, "POST", &uri, Some(&v.token), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{json:?}");
+    assert!(target.is_file());
+}

@@ -26,7 +26,7 @@ project:
     - apps/api/.env.production
 ```
 
-- Environment `paths` are the files an environment is materialized into. **Relative paths** are resolved against the project root (preferred — they work on every machine and across WSL ↔ Windows); absolute paths are used as-is.
+- Environment `paths` say where an environment is materialized. **Relative paths** are resolved against the project root (preferred — they work on every machine and across WSL ↔ Windows); absolute paths are used as-is. A relative path that names an env file (last component starts or ends with `.env`: `.env`, `apps/api/.env.local`) is that file. Any other relative path is a **folder** and receives the environment's own file: `./` → `.env.production`, `apps/web` → `apps/web/.env.production` (`.env` for the root/`default` environment). An environment can list several folders (`./`, `apps/api`, `apps/web`). A folder goes through the same containment, symlink and overwrite checks as a file path. An existing regular file at a path keeps its meaning of "that file".
 - The vault stores the root as the desktop app sees it. When the CLI is a native Linux binary inside WSL and the app runs on Windows, absolute paths are translated automatically (`/home/u/app` ↔ `\\wsl.localhost\<distro>\home\u\app`, `/mnt/c/x` ↔ `C:\x`). Set `CRYPTENV_PATH_TRANSLATION=off` if the app itself runs inside the distro.
 - A legacy `crypt-env.json` is still read (with a migration notice) when no `.crypt-env.yaml` exists; run `crypt-env init` to migrate.
 
@@ -38,7 +38,7 @@ project:
 |---------|:--------:|--------------|
 | `init [NAME] [--path PATH]` | — | Registers (or links) the project, records this directory as its root, writes `.crypt-env.yaml` |
 | `config [--relink] [--yes]` | on path changes | Syncs `.crypt-env.yaml` ⇄ vault; the most recently modified side wins. Changes to where secrets are written need a session and a confirmation |
-| `add KEY=value \| $VAR \| FILE [--env NAME] [--global]` | on collision | Adds secrets; an existing key halts the whole addition |
+| `add KEY=value \| VARNAME \| FILE [--env NAME] [--global]` | on collision | Adds secrets; an existing key halts the whole addition |
 | `fill [--env NAME]` | ✔ | Writes every environment's target files + sanitized `.env.example` |
 | `sync [--global] [--env NAME] [--example PATH]` | ✔ | Provisions keys from `.env.example` into the vault |
 | `inject KEY... [--env NAME] [--shell SHELL]` | ✔ | Prints shell assignments for `eval` |
@@ -58,9 +58,11 @@ Sessions are per terminal: each terminal (Unix: session id + tty; Windows: conso
 ### `crypt-env init [NAME] [--path PATH] [--yes]`
 ```bash
 cd ~/code/my-service
-crypt-env init                       # project "my-service", default env → .env
+crypt-env init                       # project "my-service", default env → ./ (the root folder → .env)
 crypt-env init backend-api --path ./app   # default env → app/.env
 ```
+A new project is created with the environments `default` (injects `.env`), `staging` and `production`, like a project created in the GUI without a custom initial environment; linking an existing project never adds environments.
+
 `NAME` defaults to the legacy `crypt-env.json` project, else the folder name. If a project with that name already exists and has no root, it is linked to this directory only after the same confirmation `config` uses (diff, session, `y/N`). When stdin is not a terminal pass `--yes` to answer that confirmation (the session is still required); without it the command fails and the vault is unchanged. If it is already bound to another directory, `init` fails with the bound root and suggests `config --relink`; the project is not touched. If `.crypt-env.yaml` already exists, `init` warns and changes nothing.
 
 ### `crypt-env config`
@@ -73,11 +75,14 @@ Compares the file's modification time with the vault's last change (project or a
 ### `crypt-env add`
 ```bash
 crypt-env add OPENAI_API_KEY=sk-...          # literal
-crypt-env add '$DATABASE_URL'                # from this shell's environment
+crypt-env add DATABASE_URL                   # from this shell's environment (name only)
+crypt-env add '$DATABASE_URL'                # same; quote the `$`
 crypt-env add .env.local                     # every entry of a dotenv file
 crypt-env add SHARED_URL=https://x --global  # reusable across projects
 crypt-env add STRIPE_KEY=sk_live --env production
 ```
+`add VARNAME` reads the variable from the shell that runs `crypt-env`; `$VARNAME` and `\$VARNAME` are accepted too. An unquoted `$VARNAME` is expanded by the shell *before* `crypt-env` starts, so the program receives the secret value instead of a name. When that argument equals the value of an environment variable, the error names the variable (never the value, and the argument is not echoed) and tells you to run `crypt-env add NAME` without the `$`. Any other unrecognized argument gets an error listing the accepted forms.
+
 If any key already exists in the target environment (or among global items with `--global`), nothing is added: the CLI prints `Error: Key 'K' already exists in environment 'E'. Addition aborted.` and offers to show the colliding value — only after `y` **and** the master password.
 
 `add` keeps going when one key's request fails, then lists the keys that were added and the keys that failed (names only, never values) and **exits with status 2**. Status 1 remains for errors where nothing was done (bad input, collision, unreachable vault).

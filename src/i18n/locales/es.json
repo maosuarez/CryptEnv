@@ -264,7 +264,9 @@
     "environmentHeader": "// ENTORNO",
     "defaultCheckbox": "predeterminado",
     "paths": "RUTAS",
-    "pathsHint": "rutas de archivos .env para inyectar",
+    "pathsHint": "carpetas o rutas de archivos .env para inyectar",
+    "pathsDefaultHint": "Sin rutas — se inyecta en la raíz del proyecto: {{file}}",
+    "pathFolderTitle": "Carpeta: el archivo del entorno se crea dentro",
     "browseEnv": "Buscar archivo .env",
     "browseWsl": "Explorar el sistema de archivos de una distro WSL para un archivo .env; inicia la distro si no está en ejecución, lo que puede tardar unos segundos",
     "variablesHeader": "// VARIABLES",
@@ -863,7 +865,8 @@
   },
   "window": {
     "lock": "BLOQUEAR",
-    "minimize": "Minimizar"
+    "minimize": "Minimizar",
+    "refresh": "Actualizar (F5)"
   },
   "wsl": {
     "title": "INTEGRACIÓN CON WSL",

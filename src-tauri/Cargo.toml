@@ -122,6 +122,8 @@ windows = { version = "0.58", features = [
 libc = "0.2"
 
 [dev-dependencies]
+# Mock runtime for the `vault_changed` emit test.
+tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 # Issue #12: integration tests need to seed a DB that already contains a

@@ -101,6 +101,14 @@ pub struct ProjectInput {
     /// clear it, anything else must be an absolute path (host view).
     #[serde(default, rename = "rootPath")]
     pub root_path: Option<String>,
+    /// Also create the baseline `staging` and `production` environments next
+    /// to the `default` one. Only honoured for a NEW project whose initial
+    /// environment is the default one: an explicitly named initial
+    /// environment, a manifest-driven project and every update are never
+    /// given extra environments. Set by the user-facing creation flows (CLI
+    /// `init`, GUI project modal) so both start from the same layout.
+    #[serde(default, rename = "seedBaseline")]
+    pub seed_baseline: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -339,8 +347,12 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Environments created next to `default` when `ProjectInput::seed_baseline` is set.
+const BASELINE_ENVIRONMENTS: [&str; 2] = ["staging", "production"];
+
 /// Creates (id = 0) or updates (id > 0) a project's metadata. A newly created
-/// project always gets one 'default' environment so it's immediately usable.
+/// project always gets one 'default' environment so it's immediately usable,
+/// plus `staging` and `production` when `seed_baseline` is set.
 pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, String> {
     validate_project_name(&input.name)?;
     let root = match input.root_path.as_deref().map(str::trim) {
@@ -374,6 +386,15 @@ pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, Stri
         // environment targets the conventional file at the root.
         if matches!(root, Some(Some(_))) {
             db.set_environment_paths(env_id, &[environment_filename(&initial_env)]).await?;
+        }
+        if input.seed_baseline && initial_env == "default" {
+            for name in BASELINE_ENVIRONMENTS {
+                let id = db.upsert_environment(0, project_id, name, false).await?;
+                // Relative folder target; needs a root to resolve.
+                if matches!(root, Some(Some(_))) {
+                    db.set_environment_paths(id, &["./".to_string()]).await?;
+                }
+            }
         }
     }
     if let Some(r) = &root {
@@ -430,6 +451,39 @@ pub fn resolve_env_path(root: Option<&str>, path: &str) -> Result<String, String
         return Err(format!("path '{path}' does not name a file"));
     }
     Ok(out.to_string_lossy().into_owned())
+}
+
+/// True when a stored relative path names an env file rather than a folder:
+/// its last component starts with `.env` (`.env`, `apps/api/.env.local`) or
+/// ends with `.env` (`prod.env`).
+fn names_env_file(path: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .find(|c| !c.is_empty())
+        .is_some_and(|last| last != "." && (last.starts_with(".env") || last.ends_with(".env")))
+}
+
+/// Turns a stored *relative* environment path into the file it injects into.
+/// A path naming an env file (see `names_env_file`) is that file, as before.
+/// Anything else is a folder under the project root and receives the
+/// environment's file: `./` → `.env.production` (or `.env` for the root
+/// environment), `apps/web` → `apps/web/.env.production`. An existing regular
+/// file (or symlink) at the path keeps its legacy meaning of "that file".
+/// Containment and no-follow checks happen on the returned path, not here.
+pub fn expand_relative_target(root: Option<&str>, path: &str, env_name: &str) -> String {
+    if names_env_file(path) {
+        return path.to_string();
+    }
+    let is_legacy_file = root.is_some_and(|root| {
+        !path.split(['/', '\\']).any(|c| c == "..")
+            && std::fs::symlink_metadata(Path::new(root).join(path.replace('\\', "/")))
+                .is_ok_and(|m| !m.is_dir())
+    });
+    if is_legacy_file {
+        return path.to_string();
+    }
+    let folder = path.trim_end_matches(['/', '\\']);
+    let file = environment_filename(env_name);
+    if folder.is_empty() { file } else { format!("{folder}/{file}") }
 }
 
 pub async fn delete_project(db: &VaultDb, id: i64) -> Result<ProjectDeleteImpact, String> {
@@ -645,12 +699,18 @@ async fn get_environment_full(db: &VaultDb, id: i64) -> Result<Option<Environmen
 /// (matched against the stored strings, e.g. the GUI's inject-target
 /// picker); naming a path that is not configured is an error. Relative
 /// configured paths are resolved against the project root first.
+///
+/// `root_default` lets an environment with no configured paths (and no
+/// caller-supplied destination) fall back to its project root. It is the
+/// vault owner's convenience: MCP callers pass `false` and still need a
+/// configured path.
 async fn resolve_and_inspect(
     db: &VaultDb,
     environment_id: i64,
     output_path: Option<String>,
     output_dir: Option<String>,
     targets: Option<&[String]>,
+    root_default: bool,
 ) -> Result<(crate::db::DbEnvironment, Vec<(String, PathOrigin)>, HashMap<String, envfile::Target>), String> {
     let env = db
         .get_environment(environment_id)
@@ -666,18 +726,31 @@ async fn resolve_and_inspect(
             env.paths.iter().filter(|p| t.contains(p)).collect()
         }
     };
-    let root = if configured.is_empty() { None } else { db.get_project_root(env.project_id).await? };
+    let root = db.get_project_root(env.project_id).await?;
     let mut resolved: Vec<(String, PathOrigin)> = Vec::with_capacity(configured.len());
     for p in configured {
-        let mut r = resolve_env_path(root.as_deref(), p)?;
+        // Absolute paths are files exactly as stored; relative ones may be a
+        // folder that receives this environment's `.env*` file.
+        let effective = if is_absolute_config_path(p) {
+            p.clone()
+        } else {
+            expand_relative_target(root.as_deref(), p, &env.name)
+        };
+        let mut r = resolve_env_path(root.as_deref(), &effective)?;
         // A relative path must stay inside the root even through symlinked
         // directories. Absolute paths are the owner's explicit choice and
         // keep their location (the final component is still no-follow).
         if !is_absolute_config_path(p) {
             if let Some(root) = root.as_deref() {
-                let contained = crate::fsguard::contain_relative(Path::new(root), p)
+                let contained = crate::fsguard::contain_relative(Path::new(root), &effective)
                     .map_err(|e| format!("path '{p}' must stay inside the project root ({e})"))?;
-                r = contained.to_string_lossy().into_owned();
+                // `contain_relative` resolves a symlink at the final component
+                // too. Keep the lexical path in that case so `inspect` sees the
+                // link and the write is refused instead of landing on its target.
+                let final_is_symlink = std::fs::symlink_metadata(&r).is_ok_and(|m| m.file_type().is_symlink());
+                if !final_is_symlink {
+                    r = contained.to_string_lossy().into_owned();
+                }
             }
         }
         if !resolved.iter().any(|(existing, _)| existing == &r) {
@@ -701,6 +774,15 @@ async fn resolve_and_inspect(
             let target = crate::fsguard::resolve_within(dir.as_str(), &environment_filename(&env.name))
                 .map_err(|e| format!("output_dir: {e}"))?;
             resolved.push((target.to_string_lossy().into_owned(), PathOrigin::CallerSupplied));
+        } else if let (true, None, true, Some(root)) = (root_default, targets, env.paths.is_empty(), root.as_deref()) {
+            // No path was ever configured: default to the project root (`./`).
+            // Nobody consented to this file, so it is `CallerSupplied` — an
+            // existing file crypt-env did not write is refused, not
+            // overwritten, exactly like an `output_path`.
+            let file = expand_relative_target(Some(root), "./", &env.name);
+            let contained = crate::fsguard::contain_relative(Path::new(root), &file)
+                .map_err(|e| format!("default path must stay inside the project root ({e})"))?;
+            resolved.push((contained.to_string_lossy().into_owned(), PathOrigin::CallerSupplied));
         }
     }
 
@@ -726,7 +808,7 @@ pub async fn inject_environment_preview(
     environment_id: i64,
     targets: Option<&[String]>,
 ) -> Result<InjectPreview, String> {
-    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None, targets).await?;
+    let (_, resolved, inspected) = resolve_and_inspect(db, environment_id, None, None, targets, true).await?;
 
     let paths: Vec<String> = resolved.iter().map(|(p, _)| p.clone()).collect();
     let foreign: Vec<String> = resolved
@@ -772,9 +854,25 @@ pub async fn inject_environment(
     overwrite: bool,
     targets: Option<&[String]>,
 ) -> Result<InjectResult, String> {
+    inject_environment_for(db, vault_key, environment_id, output_path, output_dir, overwrite, targets, true).await
+}
+
+/// `inject_environment` with an explicit `root_default` (see
+/// `resolve_and_inspect`): `false` for the MCP principal.
+#[allow(clippy::too_many_arguments)]
+pub async fn inject_environment_for(
+    db: &VaultDb,
+    vault_key: &VaultKey,
+    environment_id: i64,
+    output_path: Option<String>,
+    output_dir: Option<String>,
+    overwrite: bool,
+    targets: Option<&[String]>,
+    root_default: bool,
+) -> Result<InjectResult, String> {
     // Phase 1 — resolve, tracking provenance.
     let (env, resolved, mut cached) =
-        resolve_and_inspect(db, environment_id, output_path, output_dir, targets).await?;
+        resolve_and_inspect(db, environment_id, output_path, output_dir, targets, root_default).await?;
 
     if resolved.is_empty() {
         return Err("environment has no paths configured".into());
@@ -1284,7 +1382,56 @@ mod tests {
             categories: vec![],
             initial_environment: initial_environment.map(str::to_string),
             root_path: None,
+            seed_baseline: false,
         }
+    }
+
+    #[tokio::test]
+    async fn seed_baseline_adds_staging_and_production_only_for_a_new_default_project() {
+        let (_dir, db) = test_db().await;
+
+        let mut plain = new_project("plain", None);
+        plain.seed_baseline = true;
+        plain.root_path = Some("/work/plain".into());
+        let id = save_project(&db, plain).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["default", "staging", "production"]);
+        assert_eq!(envs.iter().filter(|e| e.is_default).count(), 1);
+        assert!(envs[0].is_default, "default stays the default environment");
+        assert_eq!(envs[0].paths, vec![".env".to_string()]);
+        assert_eq!(envs[1].paths, vec!["./".to_string()]);
+        assert_eq!(envs[2].paths, vec!["./".to_string()]);
+
+        // No root: nothing to resolve a relative path against.
+        let mut rootless = new_project("rootless", None);
+        rootless.seed_baseline = true;
+        let id = save_project(&db, rootless).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 3);
+        assert!(envs.iter().all(|e| e.paths.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn seed_baseline_is_off_by_default_for_custom_initial_environments_and_updates() {
+        let (_dir, db) = test_db().await;
+
+        let off = save_project(&db, new_project("off", None)).await.unwrap();
+        assert_eq!(db.list_environments(off).await.unwrap().len(), 1);
+
+        let mut custom = new_project("custom", Some("staging"));
+        custom.seed_baseline = true;
+        let id = save_project(&db, custom).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 1, "an explicit initial environment is the user's whole choice");
+        assert_eq!(envs[0].name, "staging");
+
+        // Updating an existing project never adds environments.
+        let mut update = new_project("off", None);
+        update.id = off;
+        update.seed_baseline = true;
+        save_project(&db, update).await.unwrap();
+        assert_eq!(db.list_environments(off).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1515,6 +1662,172 @@ mod tests {
         let all = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
         assert_eq!(all.paths.len(), 2);
         assert!(dir.path().join(".env").exists());
+    }
+
+    #[test]
+    fn expand_relative_target_rules() {
+        let none = None;
+        // Folders get the environment's file.
+        assert_eq!(expand_relative_target(none, "./", "production"), "./.env.production");
+        assert_eq!(expand_relative_target(none, "", "production"), ".env.production");
+        assert_eq!(expand_relative_target(none, "apps/web", "production"), "apps/web/.env.production");
+        assert_eq!(expand_relative_target(none, "./apps\\api\\", "Staging"), "./apps\\api/.env.staging");
+        assert_eq!(expand_relative_target(none, "apps/web", "default"), "apps/web/.env");
+        assert_eq!(expand_relative_target(none, "apps/web", ""), "apps/web/.env");
+        // Explicit env files are kept verbatim.
+        for file in [".env", "apps/api/.env", "config/.env.local", "prod.env", "a\\.env.test"] {
+            assert_eq!(expand_relative_target(none, file, "production"), file);
+        }
+        // `..` stays visible so containment can reject it.
+        assert_eq!(expand_relative_target(none, "..", "production"), "../.env.production");
+    }
+
+    #[test]
+    fn expand_relative_target_keeps_existing_legacy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("settings.conf"), "").unwrap();
+        std::fs::create_dir(dir.path().join("web")).unwrap();
+        assert_eq!(expand_relative_target(Some(root), "settings.conf", "production"), "settings.conf");
+        assert_eq!(expand_relative_target(Some(root), "web", "production"), "web/.env.production");
+        assert_eq!(expand_relative_target(Some(root), "missing", "production"), "missing/.env.production");
+    }
+
+    async fn rooted_env(dir: &tempfile::TempDir, db: &VaultDb, key: &VaultKey) -> i64 {
+        let env_id = seeded_env_with_item(db, key, "DB_HOST", "localhost").await;
+        let project_id = db.get_environment(env_id).await.unwrap().unwrap().project_id;
+        db.set_project_root(project_id, Some(dir.path().to_str().unwrap())).await.unwrap();
+        env_id
+    }
+
+    #[tokio::test]
+    async fn inject_folder_targets_get_the_environment_filename() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        std::fs::create_dir_all(dir.path().join("apps/api")).unwrap();
+        db.set_environment_paths(env_id, &["./".to_string(), "apps/web".to_string(), "apps/api/.env.custom".to_string()])
+            .await
+            .unwrap();
+
+        let result = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
+
+        assert_eq!(result.paths.len(), 3);
+        assert!(std::fs::read_to_string(dir.path().join(".env.production")).unwrap().contains("DB_HOST=localhost"));
+        assert!(dir.path().join("apps/web/.env.production").is_file());
+        assert!(dir.path().join("apps/api/.env.custom").is_file(), "explicit file path unchanged");
+    }
+
+    #[tokio::test]
+    async fn preview_lists_the_resolved_folder_targets() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        db.set_environment_paths(env_id, &["./".to_string()]).await.unwrap();
+
+        let preview = inject_environment_preview(&db, env_id, None).await.unwrap();
+        assert_eq!(preview.paths, vec![dir.path().join(".env.production").to_str().unwrap().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn folder_target_may_not_escape_the_root() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        db.set_environment_paths(env_id, &["../outside".to_string()]).await.unwrap();
+        assert!(inject_environment(&db, &key, env_id, None, None, false, None).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn folder_target_through_a_symlinked_directory_is_refused() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        db.set_environment_paths(env_id, &["link".to_string()]).await.unwrap();
+
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
+        assert!(err.contains("inside the project root"), "{err}");
+        assert!(!outside.path().join(".env.production").exists());
+    }
+
+    #[tokio::test]
+    async fn folder_target_onto_a_foreign_symlink_file_is_refused() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        db.set_environment_paths(env_id, &["./".to_string()]).await.unwrap();
+        #[cfg(unix)]
+        {
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, "keep\n").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.path().join(".env.production")).unwrap();
+            assert!(inject_environment(&db, &key, env_id, None, None, false, None).await.is_err());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_without_paths_defaults_to_the_project_root_with_strict_gating() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+
+        // A file crypt-env did not write is refused, not overwritten.
+        let target = dir.path().join(".env.production");
+        std::fs::write(&target, "FOREIGN=1\n").unwrap();
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
+        assert!(err.starts_with(envfile::TARGET_EXISTS_PREFIX), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "FOREIGN=1\n");
+        let preview = inject_environment_preview(&db, env_id, None).await.unwrap();
+        assert_eq!(preview.foreign, vec![target.to_str().unwrap().to_string()]);
+
+        // Absent: written.
+        std::fs::remove_file(&target).unwrap();
+        let ok = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap();
+        assert_eq!(ok.paths, vec![target.to_str().unwrap().to_string()]);
+        assert!(std::fs::read_to_string(&target).unwrap().contains("DB_HOST=localhost"));
+    }
+
+    #[tokio::test]
+    async fn default_root_target_yields_to_output_dir_and_an_empty_target_selection() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        let other = tempfile::tempdir().unwrap();
+
+        let by_dir = inject_environment(&db, &key, env_id, None, Some(other.path().to_str().unwrap().to_string()), false, None)
+            .await
+            .unwrap();
+        assert_eq!(by_dir.paths, vec![other.path().join(".env.production").to_str().unwrap().to_string()]);
+        assert!(!dir.path().join(".env.production").exists());
+
+        let none: Vec<String> = vec![];
+        let err = inject_environment(&db, &key, env_id, None, None, false, Some(&none)).await.unwrap_err();
+        assert_eq!(err, "environment has no paths configured");
+    }
+
+    #[tokio::test]
+    async fn root_default_is_refused_for_callers_that_opt_out() {
+        let (dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = rooted_env(&dir, &db, &key).await;
+        let err = inject_environment_for(&db, &key, env_id, None, None, false, None, false).await.unwrap_err();
+        assert_eq!(err, "environment has no paths configured");
+        assert!(!dir.path().join(".env.production").exists());
+        assert!(inject_environment_for(&db, &key, env_id, None, None, false, None, true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn environment_without_paths_or_root_still_has_no_target() {
+        let (_dir, db) = test_db().await;
+        let (_, _, key) = crate::crypto::init_vault_crypto(b"pw").unwrap();
+        let env_id = seeded_env_with_item(&db, &key, "DB_HOST", "localhost").await;
+        let err = inject_environment(&db, &key, env_id, None, None, false, None).await.unwrap_err();
+        assert_eq!(err, "environment has no paths configured");
     }
 
     #[test]

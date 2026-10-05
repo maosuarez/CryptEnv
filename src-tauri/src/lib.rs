@@ -172,6 +172,13 @@ pub fn run() {
                 }
             });
 
+            // Writes made through the REST API (CLI, TUI, MCP) tell the open
+            // window to re-read. The event carries no payload.
+            let change_handle = app.handle().clone();
+            api_state.set_change_notifier(move || {
+                api::changes::emit_vault_changed(&change_handle);
+            });
+
             let api_app_dir = app_dir.clone();
             tauri::async_runtime::spawn(api::start_server(api_state.clone(), api_app_dir));
 

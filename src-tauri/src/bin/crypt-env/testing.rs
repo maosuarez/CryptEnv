@@ -14,6 +14,8 @@ pub struct FakeVault {
     pub alive: Rc<Cell<bool>>,
     pub inject_paths: RefCell<Vec<String>>,
     pub inject_failed_keys: RefCell<Vec<String>>,
+    /// Every body passed to `save_project`.
+    pub project_bodies: RefCell<Vec<serde_json::Value>>,
 }
 
 impl FakeVault {
@@ -24,6 +26,7 @@ impl FakeVault {
             alive: Rc::new(Cell::new(true)),
             inject_paths: RefCell::new(Vec::new()),
             inject_failed_keys: RefCell::new(Vec::new()),
+            project_bodies: RefCell::new(Vec::new()),
         }
     }
 
@@ -65,6 +68,7 @@ impl VaultApi for FakeVault {
     }
     fn save_project(&self, body: &serde_json::Value) -> Result<i64, CliError> {
         self.record("save_project");
+        self.project_bodies.borrow_mut().push(body.clone());
         if let Some(id) = body.get("id").and_then(|i| i.as_i64()).filter(|i| *i != 0) {
             return Ok(id);
         }

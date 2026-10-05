@@ -84,6 +84,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
           categories:  input.categories,
           initialEnvironment: input.initialEnvironment ?? null,
           rootPath:    input.rootPath ?? null,
+          // New projects start with default + staging + production
+          // (ignored by the backend when an initial environment is named).
+          seedBaseline: true,
         },
         vars: input.vars,
       },
