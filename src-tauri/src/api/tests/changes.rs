@@ -81,3 +81,19 @@ fn every_signalling_route_exists_in_the_route_table() {
         );
     }
 }
+
+#[test]
+fn bulk_command_helper_emits_an_empty_vault_changed_event() {
+    use tauri::Listener;
+    let app = tauri::test::mock_app();
+    let payloads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = payloads.clone();
+    app.listen(super::super::changes::VAULT_CHANGED_EVENT, move |e| {
+        if let Ok(mut p) = sink.lock() {
+            p.push(e.payload().to_string());
+        }
+    });
+    super::super::changes::emit_vault_changed(app.handle());
+    let got = payloads.lock().unwrap().clone();
+    assert_eq!(got, vec!["null".to_string()], "one event, no data");
+}

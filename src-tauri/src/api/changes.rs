@@ -11,8 +11,19 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use std::sync::Arc;
+use tauri::Emitter;
 
 use super::ApiState;
+
+/// Name of the Tauri event the window listens for.
+pub const VAULT_CHANGED_EVENT: &str = "vault_changed";
+
+/// Tells the window that data changed. Empty payload, by design. Used by the
+/// REST layer and by the bulk GUI commands (import, restore, receive) whose
+/// results the window cannot see from its own store updates.
+pub fn emit_vault_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let _ = app.emit(VAULT_CHANGED_EVENT, ());
+}
 
 /// Callback the desktop shell installs to emit the `vault_changed` event.
 pub(crate) type ChangeNotifier = Arc<dyn Fn() + Send + Sync>;

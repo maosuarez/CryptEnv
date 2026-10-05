@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 pub mod approvals;
 mod auth;
-mod changes;
+pub mod changes;
 mod confine;
 mod exec_routes;
 mod mcp_servers;

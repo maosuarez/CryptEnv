@@ -184,6 +184,7 @@ pub async fn share_export_file(
 pub async fn share_import_file(
     passphrase: SecretString,
     vault_state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<ImportFileResponse, String> {
     let path = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new()
@@ -198,6 +199,7 @@ pub async fn share_import_file(
         .await
         .map_err(|e| e.to_string())?;
 
+    crate::api::changes::emit_vault_changed(&app);
     Ok(ImportFileResponse { names: outcome.names })
 }
 
@@ -316,6 +318,7 @@ pub async fn share_relay_receive(
     code: String,
     passphrase: SecretString,
     vault_state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
     let (vault_key, supabase_url, anon_key) = {
         let mut guard = vault_state.lock().await;
@@ -393,5 +396,7 @@ pub async fn share_relay_receive(
         names.push(plain.name.clone());
     }
 
+    drop(guard);
+    crate::api::changes::emit_vault_changed(&app);
     Ok(names)
 }

@@ -104,6 +104,7 @@ pub async fn project_relay_receive(
     passphrase: SecretString,
     project_name_override: Option<String>,
     vault_state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<ProjectReceiveResult, String> {
     let (vault_key, supabase_url, anon_key) = {
         let mut guard = vault_state.lock().await;
@@ -147,6 +148,8 @@ pub async fn project_relay_receive(
     guard.touch();
     let result = receive_project_bundle(&guard.db, &vault_key, bundle, project_name_override).await?;
 
+    drop(guard);
+    crate::api::changes::emit_vault_changed(&app);
     Ok(ProjectReceiveResult {
         project: result.project_name,
         environments: result.environment_names,

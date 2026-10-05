@@ -1082,17 +1082,20 @@ pub async fn vault_import_backup(
     merge: bool,
     current_password: Option<SecretString>,
     state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<backup::RestoreSummary, String> {
     let json = std::fs::read_to_string(&path)
         .map_err(|e| format!("read backup: {e}"))?;
-    backup::restore_shared(
+    let summary = backup::restore_shared(
         &state,
         &json,
         master_password.expose(),
         current_password.as_ref().map(|p| p.expose()),
         merge,
     )
-    .await
+    .await?;
+    crate::api::changes::emit_vault_changed(&app);
+    Ok(summary)
 }
 
 /// Restore a `.cenvbak` by passing its JSON content directly.
@@ -1104,15 +1107,18 @@ pub async fn vault_import_backup_data(
     merge: bool,
     current_password: Option<SecretString>,
     state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<backup::RestoreSummary, String> {
-    backup::restore_shared(
+    let summary = backup::restore_shared(
         &state,
         &data,
         master_password.expose(),
         current_password.as_ref().map(|p| p.expose()),
         merge,
     )
-    .await
+    .await?;
+    crate::api::changes::emit_vault_changed(&app);
+    Ok(summary)
 }
 
 // ─── Import from password managers ───────────────────────────────────────────
@@ -1153,6 +1159,7 @@ pub async fn vault_parse_import(args: ParseImportArgs) -> Result<Vec<ImportItem>
 pub async fn vault_import_items(
     items: Vec<ImportItem>,
     state: State<'_, SharedState>,
+    app: tauri::AppHandle,
 ) -> Result<usize, String> {
     let mut s = state.lock().await;
     let key = s.key.as_ref().ok_or("vault is locked")?.clone();
@@ -1228,6 +1235,8 @@ pub async fn vault_import_items(
     }
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    drop(s);
+    crate::api::changes::emit_vault_changed(&app);
     Ok(inserted)
 }
 
