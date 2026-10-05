@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { platform } from '@tauri-apps/plugin-os';
+import { useQueryClient } from '@tanstack/react-query';
 import { Icon } from './ui/Icon';
 import { useVaultStore } from '../store';
+import { manualRefresh, useRefreshing } from '../lib/vaultRefresh';
 import { useTranslation } from '../i18n';
 
 const win = getCurrentWindow();
@@ -24,6 +26,8 @@ export function WindowChrome() {
   const lock   = useVaultStore((s) => s.lock);
   const [chrome] = useState(() => chromeFor(platform()));
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refreshing  = useRefreshing((s) => s.refreshing);
 
   return (
     <div
@@ -37,6 +41,24 @@ export function WindowChrome() {
       </div>
 
       <div data-tauri-drag-region className="flex-1 h-full" />
+
+      {screen !== 'lock' && (
+        <button
+          onClick={() => { void manualRefresh(queryClient); }}
+          disabled={refreshing}
+          title={t('window.refresh')}
+          aria-label={t('window.refresh')}
+          className={[
+            'relative z-10 flex items-center justify-center w-7 h-7 mr-1 rounded-[3px]',
+            'bg-transparent border-none cursor-pointer text-tx3',
+            'hover:text-tx transition-colors duration-150 disabled:opacity-50',
+          ].join(' ')}
+        >
+          <span className={refreshing ? 'animate-spin inline-flex' : 'inline-flex'}>
+            <Icon name="refresh" size={14} />
+          </span>
+        </button>
+      )}
 
       {screen !== 'lock' && (
         <button

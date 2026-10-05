@@ -863,7 +863,8 @@
   },
   "window": {
     "lock": "BLOQUEAR",
-    "minimize": "Minimizar"
+    "minimize": "Minimizar",
+    "refresh": "Actualizar (F5)"
   },
   "wsl": {
     "title": "INTEGRACIÓN CON WSL",

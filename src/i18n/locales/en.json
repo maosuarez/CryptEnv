@@ -863,7 +863,8 @@
   },
   "window": {
     "lock": "LOCK",
-    "minimize": "Minimize"
+    "minimize": "Minimize",
+    "refresh": "Refresh (F5)"
   },
   "wsl": {
     "title": "WSL INTEGRATION",

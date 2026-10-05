@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { useQueryClient } from '@tanstack/react-query';
 import { AnimatePresence, motion } from 'framer-motion';
 import { WindowChrome } from './components/WindowChrome';
 import { LockScreen } from './components/LockScreen';
@@ -20,6 +21,7 @@ import { ApprovalModal } from './components/ApprovalModal';
 import { useVaultStore } from './store';
 import { useUpdateStore } from './store/updateStore';
 import { useAutoLock } from './hooks/useAutoLock';
+import { debounce, isRefreshShortcut, manualRefresh, refreshVault, REFRESH_DEBOUNCE_MS } from './lib/vaultRefresh';
 import type { Screen } from './types';
 
 const SCREENS: Record<Screen, React.ReactElement> = {
@@ -64,6 +66,29 @@ function MainApp() {
     const unlisten = listen('vault_locked', () => lockedByBackend());
     return () => { unlisten.then((f) => f()).catch(() => {}); };
   }, [lockedByBackend]);
+
+  // Another client (CLI, TUI, MCP) changed the vault: re-read what is shown.
+  // The event has no payload; a burst of events becomes one refetch.
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    const refresh = debounce(() => { void refreshVault(queryClient); }, REFRESH_DEBOUNCE_MS);
+    const unlisten = listen('vault_changed', () => refresh.call());
+    return () => {
+      refresh.cancel();
+      unlisten.then((f) => f()).catch(() => {});
+    };
+  }, [queryClient]);
+
+  // F5 / Ctrl+R / Cmd+R refresh the vault data instead of reloading the webview.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isRefreshShortcut(e)) return;
+      e.preventDefault();
+      void manualRefresh(queryClient);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [queryClient]);
 
   const showSetupWizard = useVaultStore((s) => s.wizardOpen);
   const setWizardOpen   = useVaultStore((s) => s.setWizardOpen);
