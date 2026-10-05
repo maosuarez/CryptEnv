@@ -101,6 +101,14 @@ pub struct ProjectInput {
     /// clear it, anything else must be an absolute path (host view).
     #[serde(default, rename = "rootPath")]
     pub root_path: Option<String>,
+    /// Also create the baseline `staging` and `production` environments next
+    /// to the `default` one. Only honoured for a NEW project whose initial
+    /// environment is the default one: an explicitly named initial
+    /// environment, a manifest-driven project and every update are never
+    /// given extra environments. Set by the user-facing creation flows (CLI
+    /// `init`, GUI project modal) so both start from the same layout.
+    #[serde(default, rename = "seedBaseline")]
+    pub seed_baseline: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -339,8 +347,12 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Environments created next to `default` when `ProjectInput::seed_baseline` is set.
+const BASELINE_ENVIRONMENTS: [&str; 2] = ["staging", "production"];
+
 /// Creates (id = 0) or updates (id > 0) a project's metadata. A newly created
-/// project always gets one 'default' environment so it's immediately usable.
+/// project always gets one 'default' environment so it's immediately usable,
+/// plus `staging` and `production` when `seed_baseline` is set.
 pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, String> {
     validate_project_name(&input.name)?;
     let root = match input.root_path.as_deref().map(str::trim) {
@@ -374,6 +386,15 @@ pub async fn save_project(db: &VaultDb, input: ProjectInput) -> Result<i64, Stri
         // environment targets the conventional file at the root.
         if matches!(root, Some(Some(_))) {
             db.set_environment_paths(env_id, &[environment_filename(&initial_env)]).await?;
+        }
+        if input.seed_baseline && initial_env == "default" {
+            for name in BASELINE_ENVIRONMENTS {
+                let id = db.upsert_environment(0, project_id, name, false).await?;
+                // Relative folder target; needs a root to resolve.
+                if matches!(root, Some(Some(_))) {
+                    db.set_environment_paths(id, &["./".to_string()]).await?;
+                }
+            }
         }
     }
     if let Some(r) = &root {
@@ -1361,7 +1382,56 @@ mod tests {
             categories: vec![],
             initial_environment: initial_environment.map(str::to_string),
             root_path: None,
+            seed_baseline: false,
         }
+    }
+
+    #[tokio::test]
+    async fn seed_baseline_adds_staging_and_production_only_for_a_new_default_project() {
+        let (_dir, db) = test_db().await;
+
+        let mut plain = new_project("plain", None);
+        plain.seed_baseline = true;
+        plain.root_path = Some("/work/plain".into());
+        let id = save_project(&db, plain).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["default", "staging", "production"]);
+        assert_eq!(envs.iter().filter(|e| e.is_default).count(), 1);
+        assert!(envs[0].is_default, "default stays the default environment");
+        assert_eq!(envs[0].paths, vec![".env".to_string()]);
+        assert_eq!(envs[1].paths, vec!["./".to_string()]);
+        assert_eq!(envs[2].paths, vec!["./".to_string()]);
+
+        // No root: nothing to resolve a relative path against.
+        let mut rootless = new_project("rootless", None);
+        rootless.seed_baseline = true;
+        let id = save_project(&db, rootless).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 3);
+        assert!(envs.iter().all(|e| e.paths.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn seed_baseline_is_off_by_default_for_custom_initial_environments_and_updates() {
+        let (_dir, db) = test_db().await;
+
+        let off = save_project(&db, new_project("off", None)).await.unwrap();
+        assert_eq!(db.list_environments(off).await.unwrap().len(), 1);
+
+        let mut custom = new_project("custom", Some("staging"));
+        custom.seed_baseline = true;
+        let id = save_project(&db, custom).await.unwrap();
+        let envs = db.list_environments(id).await.unwrap();
+        assert_eq!(envs.len(), 1, "an explicit initial environment is the user's whole choice");
+        assert_eq!(envs[0].name, "staging");
+
+        // Updating an existing project never adds environments.
+        let mut update = new_project("off", None);
+        update.id = off;
+        update.seed_baseline = true;
+        save_project(&db, update).await.unwrap();
+        assert_eq!(db.list_environments(off).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

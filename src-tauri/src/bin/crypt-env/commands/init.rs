@@ -177,6 +177,9 @@ pub fn execute(
                 "template": "generic",
                 "categories": [],
                 "rootPath": root_host,
+                // A brand-new project starts with default + staging + production,
+                // the same layout the GUI's project modal creates.
+                "seedBaseline": true,
             }))?;
             (id, true)
         }
@@ -291,6 +294,22 @@ mod tests {
         assert!(!same_file("default", "app/.env", "./"));
     }
 
+
+    #[test]
+    fn new_projects_ask_for_the_baseline_environments_and_existing_ones_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = FakeVault::new(vec![]);
+        execute(&empty, dir.path(), Some("fresh"), None, false).unwrap();
+        let bodies = empty.project_bodies.borrow();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["seedBaseline"], true);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let host = paths::to_host(dir2.path());
+        let existing = FakeVault::new(vec![project("backend", Some(&host), vec![env(1, "default", true, &[".env"])])]);
+        run_init(&existing, dir2.path(), false).unwrap();
+        assert!(existing.project_bodies.borrow().iter().all(|b| b.get("seedBaseline").is_none()));
+    }
 
     fn run_init(vault: &FakeVault, dir: &Path, adopt: bool) -> Result<InitReport, CliError> {
         execute(vault, dir, Some("backend"), None, adopt)

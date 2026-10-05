@@ -1673,6 +1673,7 @@ mod tests {
                 template: "node,postgres".to_string(),
                 categories: vec![],
                 initial_environment: None,
+                seed_baseline: false,
                 root_path: None,
             },
             vars: vars
@@ -1722,6 +1723,21 @@ mod tests {
             assert_eq!(item.value.as_deref(), Some(expected));
             assert_eq!(db.list_owning_projects(item_id).await.unwrap(), vec![id]);
         }
+    }
+
+    #[tokio::test]
+    async fn scaffold_with_baseline_seeds_empty_staging_and_production_beside_the_linked_default() {
+        let (_dir, db, key) = test_db().await;
+        let mut input = tpl_input("shop", &[("NODE_ENV", "development")]);
+        input.project.seed_baseline = true;
+        let id = create_project_from_templates(&db, &key, input).await.unwrap();
+
+        let envs = db.list_environments(id).await.unwrap();
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["default", "staging", "production"]);
+        assert_eq!(db.get_environment_vars(envs[0].id).await.unwrap().len(), 1);
+        assert!(db.get_environment_vars(envs[1].id).await.unwrap().is_empty());
+        assert!(db.get_environment_vars(envs[2].id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
