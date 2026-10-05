@@ -1,4 +1,4 @@
-//! `crypt-env add KEY=value | $VAR | <file.env>` — adds secrets to the
+//! `crypt-env add KEY=value | VARNAME | $VARNAME | <file.env>` — adds secrets to the
 //! workspace project's environment. A key that already exists halts the
 //! whole addition (nothing is saved); the colliding value can be inspected
 //! only after re-entering the master password.
@@ -12,8 +12,9 @@ use crate::commands::scope;
 
 #[derive(Args)]
 pub struct AddArgs {
-    /// KEY=value, $VARNAME (read from this shell's environment), or a path
-    /// to a .env file
+    /// KEY=value, VARNAME or $VARNAME (read from this shell's environment —
+    /// prefer the bare name or quote it, or the shell expands it first), or
+    /// a path to a .env file
     pub input: String,
 
     /// Target environment (defaults to the project's default environment)
@@ -155,12 +156,13 @@ pub fn add_all(
     outcome
 }
 
-/// `$VAR` → that variable; `KEY=value` → literal; anything else → a dotenv
-/// file path.
+/// `$VAR` / `\$VAR` → that variable; an existing file → dotenv entries;
+/// `KEY=value` → literal; a bare `VAR` naming a set environment variable →
+/// that variable. Anything else is an error that never echoes the argument
+/// (it may be a secret value the shell expanded from `$VAR`).
 pub fn parse_input(input: &str) -> Result<Vec<(String, String)>, CliError> {
-    if let Some(var) = input.strip_prefix('$') {
-        let value = std::env::var(var).map_err(|_| CliError::NotFound(format!("environment variable ${var}")))?;
-        return Ok(vec![(var.to_string(), value)]);
+    if let Some(var) = input.strip_prefix("\\$").or_else(|| input.strip_prefix('$')) {
+        return from_environment(var);
     }
     if !Path::new(input).is_file() {
         if let Some((k, v)) = input.split_once('=') {
@@ -170,14 +172,59 @@ pub fn parse_input(input: &str) -> Result<Vec<(String, String)>, CliError> {
             }
             return Ok(vec![(k.to_string(), v.to_string())]);
         }
-        return Err(CliError::Config(format!(
-            "'{input}' is not KEY=value, $VARNAME, or an existing .env file"
-        )));
+        if crypt_env_lib::envfile::is_valid_key(input) && std::env::var_os(input).is_some() {
+            return from_environment(input);
+        }
+        return Err(CliError::Config(unrecognized_input_message(&names_holding_value(
+            input,
+            std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        ))));
     }
     // Same grammar crypt-env writes (`envfile::serialize_value`), so a file
     // it produced reads back exactly.
     let content = std::fs::read_to_string(input).map_err(|e| CliError::Config(format!("{input}: {}", e.kind())))?;
     Ok(crypt_env_lib::envfile::parse_dotenv(&content))
+}
+
+/// `NAME` → `(NAME, value)` from this process's environment.
+fn from_environment(name: &str) -> Result<Vec<(String, String)>, CliError> {
+    if !crypt_env_lib::envfile::is_valid_key(name) {
+        return Err(CliError::Config(format!("'{name}' is not a valid environment variable name")));
+    }
+    let value = std::env::var(name)
+        .map_err(|_| CliError::Config(format!("environment variable {name} is not set in this shell")))?;
+    Ok(vec![(name.to_string(), value)])
+}
+
+/// Names (never values) of the variables whose value is exactly `token`.
+/// A hit means the shell already replaced `$NAME` by its value before
+/// `crypt-env` started.
+fn names_holding_value(token: &str, vars: impl Iterator<Item = (String, String)>) -> Vec<String> {
+    if token.is_empty() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = vars.filter(|(_, v)| v == token).map(|(k, _)| k).collect();
+    names.sort();
+    names
+}
+
+/// Error text for an argument that is none of the accepted forms. Mentions
+/// variable names only.
+fn unrecognized_input_message(expanded_from: &[String]) -> String {
+    const FORMATS: &str = "expected KEY=value, VARNAME (read from this shell's environment), or a .env file path";
+    match expanded_from.split_first() {
+        None => format!(
+            "the argument is not recognized — {FORMATS}. If you meant an environment variable, pass its name \
+             without `$` (a bare `$VAR` is expanded by the shell before crypt-env runs)"
+        ),
+        Some((first, rest)) => {
+            let others = if rest.is_empty() { String::new() } else { format!(" (or {} other variable(s))", rest.len()) };
+            format!(
+                "the argument equals the value of environment variable {first}{others} — your shell expanded `$` \
+                 before crypt-env ran. Run `crypt-env add {first}` without the `$` (or quote it: '${first}'); {FORMATS}"
+            )
+        }
+    }
 }
 
 /// Keys of `pairs` already present in `existing` (case-sensitive, like the
@@ -204,6 +251,10 @@ mod tests {
         assert!(parse_input("=x").is_err());
         assert!(parse_input("nothing").is_err());
         std::env::set_var("CRYPTENV_ADD_TEST", "v");
+        assert_eq!(parse_input("CRYPTENV_ADD_TEST").unwrap(), vec![("CRYPTENV_ADD_TEST".into(), "v".into())]);
+        assert_eq!(parse_input("\\$CRYPTENV_ADD_TEST").unwrap(), vec![("CRYPTENV_ADD_TEST".into(), "v".into())]);
+        assert!(parse_input("$CRYPTENV_ADD_UNSET_VAR").is_err());
+        assert!(parse_input("$not-a-name").is_err());
         assert_eq!(parse_input("$CRYPTENV_ADD_TEST").unwrap(), vec![("CRYPTENV_ADD_TEST".into(), "v".into())]);
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join(".env");
@@ -212,6 +263,24 @@ mod tests {
             parse_input(f.to_str().unwrap()).unwrap(),
             vec![("X".into(), "1".into()), ("Y".into(), "two".into())]
         );
+    }
+
+    #[test]
+    fn unrecognized_input_error_never_echoes_the_argument() {
+        std::env::set_var("CRYPTENV_ADD_EXPANDED", "HolaSecreto-9f3");
+        let Err(CliError::Config(msg)) = parse_input("HolaSecreto-9f3") else { panic!("expected a config error") };
+        assert!(msg.contains("CRYPTENV_ADD_EXPANDED") && msg.contains("without the `$`"), "{msg}");
+        assert!(!msg.contains("HolaSecreto-9f3"), "{msg}");
+        let Err(CliError::Config(msg)) = parse_input("no-such-value-anywhere-0d41") else { panic!("expected a config error") };
+        assert!(msg.contains("KEY=value") && msg.contains("without `$`"), "{msg}");
+        assert!(!msg.contains("no-such-value-anywhere-0d41"), "{msg}");
+    }
+
+    #[test]
+    fn names_holding_value_lists_names_only() {
+        let vars = vec![("B".to_string(), "x".to_string()), ("A".to_string(), "x".to_string()), ("C".to_string(), "y".to_string())];
+        assert_eq!(names_holding_value("x", vars.clone().into_iter()), vec!["A", "B"]);
+        assert!(names_holding_value("", vars.into_iter()).is_empty());
     }
 
     #[test]
