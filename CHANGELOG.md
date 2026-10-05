@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [1.1.0] - 2026-10-04
 
 ### Added
 
@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PUT /items/:id` holds the vault lock and a transaction across read-merge-write, so concurrent updates no longer overwrite each other.
   - Un-globaling a multi-owner item and the legacy literal-variable migration are atomic.
   - `foreign_keys`, `secure_delete` and WAL are now set on every pooled SQLite connection (5 s busy timeout).
+
+### Removed (Breaking)
+
+- **Deprecated MCP environment `id` alias** (issue #10): Calls to `crypt_env_inject_environment` and `crypt_env_generate_example_env` using the `id` parameter instead of `environment_id` are no longer accepted. Use `environment_id` in all calls. The deprecation window from 1.0.2 has ended.
+
+### Action Required (Upgrade Notes)
+
+- **Windows Hello / Biometric unlock users** must re-enroll in Settings after upgrading. The encryption key storage mechanism has changed from DPAPI to Hello-derived keys; existing enrollments are automatically removed on upgrade, and a one-time notice will prompt re-enablement.
+- **Internet relay users** (Supabase deployment): Apply the security-definer RPC migration (`sql/v2-security-definer.sql`) to your Supabase project. The relay now uses row-level security and PostgreSQL functions instead of direct table access for stricter permission enforcement. See the deployment guide for details.
+- **MCP server users**: Tools that can exfiltrate secrets (`crypt_env_reveal_item`, `crypt_env_list_items`, `crypt_env_inject_environment`) now require explicit GUI approval before use. A modal in the app grants or denies access per connected MCP session.
+
+---
+
+## [Unreleased]
 
 ---
 
