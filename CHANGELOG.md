@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+---
+
 ## [1.1.0] - 2026-10-04
 
 ### Added
@@ -30,19 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Un-globaling a multi-owner item and the legacy literal-variable migration are atomic.
   - `foreign_keys`, `secure_delete` and WAL are now set on every pooled SQLite connection (5 s busy timeout).
 
-### Removed (Breaking)
+### Deprecated
 
-- **Deprecated MCP environment `id` alias** (issue #10): Calls to `crypt_env_inject_environment` and `crypt_env_generate_example_env` using the `id` parameter instead of `environment_id` are no longer accepted. Use `environment_id` in all calls. The deprecation window from 1.0.2 has ended.
+- **MCP environment `id` alias** (issue #10): still accepted by `crypt_env_inject_environment` and `crypt_env_generate_example_env` (with a deprecation notice in the response). Its removal, planned for 1.1.0, is postponed to a later release; use `environment_id`.
 
 ### Action Required (Upgrade Notes)
 
 - **Windows Hello / Biometric unlock users** must re-enroll in Settings after upgrading. The encryption key storage mechanism has changed from DPAPI to Hello-derived keys; existing enrollments are automatically removed on upgrade, and a one-time notice will prompt re-enablement.
-- **Internet relay users** (Supabase deployment): Apply the security-definer RPC migration (`sql/v2-security-definer.sql`) to your Supabase project. The relay now uses row-level security and PostgreSQL functions instead of direct table access for stricter permission enforcement. See the deployment guide for details.
-- **MCP server users**: Tools that can exfiltrate secrets (`crypt_env_reveal_item`, `crypt_env_list_items`, `crypt_env_inject_environment`) now require explicit GUI approval before use. A modal in the app grants or denies access per connected MCP session.
-
----
-
-## [Unreleased]
+- **Internet relay users** (Supabase): apply the relay SQL v2 (security-definer RPCs on a new `_v2` table; server-enforced single use and 24-hour expiry) to your Supabase project. The SQL is shown in Settings → Internet relay (use **Check schema**) and in the docs' "Internet relay (Supabase SQL v2)" section. In-flight v1 shares are not migrated; drop the old `relay_packages` table afterwards.
+- **MCP server users**: the MCP token can no longer reveal values. Exfiltration-capable operations (relay send, share export, `crypt_env_generate_env`, MCP host config edits) return `pending_approval` and run only after you approve them in the desktop app (poll with `crypt_env_approval_status`); relay codes and passphrases are shown only in the app. Commands now run in the backend (`POST /exec`) with a cleared environment and redacted output.
 
 ---
 
