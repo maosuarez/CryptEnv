@@ -25,7 +25,7 @@ pub struct InitArgs {
     pub name: Option<String>,
 
     /// Injection target for the default environment: a directory (its `.env`
-    /// is used) or a `.env*` file. Defaults to `.env` in this directory.
+    /// is used) or a `.env*` file. Defaults to `./` (this directory).
     #[arg(long)]
     pub path: Option<PathBuf>,
 
@@ -209,7 +209,8 @@ pub fn execute(
     // Ensure the default environment targets `target`.
     let project = fetch_by_id(api, project_id)?;
     if let Some(env) = project.environments.iter().find(|e| e.is_default).or(project.environments.first()) {
-        if !env.paths.iter().any(|p| p == &target) {
+        let already = env.paths.iter().any(|p| p == &target || same_file(&env.name, p, &target));
+        if created || !already {
             let mut paths = if created { Vec::new() } else { env.paths.clone() };
             paths.push(target.clone());
             api.save_environment(&client::environment_body(env, env.is_default, &paths))?;
@@ -279,6 +280,16 @@ fn append_no_follow(path: &Path, text: &str) -> std::io::Result<()> {
     options.open(path)?.write_all(text.as_bytes())
 }
 
+/// True when two stored relative targets inject into the same file for
+/// `env_name` (`.env` and `./` for the root environment, for example).
+fn same_file(env_name: &str, a: &str, b: &str) -> bool {
+    let file = |p: &str| {
+        let expanded = crypt_env_lib::project::expand_relative_target(None, p, env_name);
+        expanded.trim_start_matches("./").to_string()
+    };
+    file(a) == file(b)
+}
+
 /// Body that updates `p` in place, only (re)setting its root.
 pub fn project_body(p: &Project, root_host: &str) -> serde_json::Value {
     serde_json::json!({
@@ -300,8 +311,9 @@ fn fetch_by_id(api: &dyn VaultApi, id: i64) -> Result<Project, CliError> {
 
 /// `--path` → the stored target: relative to `root` with `/` separators when
 /// inside it (a directory gets `/.env` appended), else a host absolute path.
+/// Without `--path` the target is the project root folder, `./`.
 pub fn default_target(root: &Path, path: Option<&Path>) -> String {
-    let Some(p) = path else { return ".env".to_string() };
+    let Some(p) = path else { return "./".to_string() };
     let abs = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
     let is_file = abs
         .file_name()
@@ -341,7 +353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("app")).unwrap();
-        assert_eq!(default_target(root, None), ".env");
+        assert_eq!(default_target(root, None), "./");
         assert_eq!(default_target(root, Some(Path::new("./app"))), "app/.env");
         assert_eq!(default_target(root, Some(Path::new("app/.env.local"))), "app/.env.local");
         assert_eq!(default_target(root, Some(Path::new("new-dir"))), "new-dir/.env");
@@ -350,6 +362,15 @@ mod tests {
     }
 
     use crate::testing::{env, project, FakeVault};
+
+    #[test]
+    fn same_file_treats_root_folder_and_env_file_as_equal_for_the_root_environment() {
+        assert!(same_file("default", ".env", "./"));
+        assert!(same_file("default", "./.env", "./"));
+        assert!(!same_file("production", ".env", "./"), "`./` is .env.production there");
+        assert!(same_file("production", ".env.production", "./"));
+        assert!(!same_file("default", "app/.env", "./"));
+    }
 
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
