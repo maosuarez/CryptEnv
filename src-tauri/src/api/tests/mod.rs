@@ -9,3 +9,4 @@ mod fill;
 mod projects;
 mod sessions;
 mod mcp;
+mod changes;
