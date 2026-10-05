@@ -85,13 +85,13 @@ mod platform {
     use super::{ClipboardBackend, Marker};
     use std::time::Duration;
     use windows::core::w;
-    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
         RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
     };
 
     const CF_UNICODETEXT: u32 = 13;

@@ -131,7 +131,6 @@ pub async fn wsl_distro_home(distro: String) -> Result<String, String> {
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{parse_distro_list, unc_root, unc_root_legacy};
-    use std::os::windows::process::CommandExt as _;
     use std::time::Duration;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
